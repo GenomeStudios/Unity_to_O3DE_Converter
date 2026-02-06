@@ -200,7 +200,30 @@ class AssetDatabase:
                     b = color_data.get('b', 1.0)
                     a = color_data.get('a', 1.0)
                     extracted['properties'][o3de_prop] = [r, g, b, a]
-        
+
+        # ---------------------------------------------------------------
+        # Transparency Detection
+        # Unity: _Surface=1 (URP/HDRP) or _Mode>=2 (Standard) = Transparent
+        #        _AlphaClip=1 or _Mode==1 (Standard) = Alpha Clipping
+        #        _Cutoff = clip threshold (0..1)
+        # O3DE:  opacity.mode "Blended", opacity.factor (0=clear, 1=opaque)
+        # ---------------------------------------------------------------
+        raw_floats = {}
+        for float_prop in floats:
+            for prop_name, value in float_prop.items():
+                if prop_name in ('_Mode', '_Surface', '_Blend', '_AlphaClip', '_Cutoff'):
+                    raw_floats[prop_name] = float(value)
+
+        is_transparent = (raw_floats.get('_Surface', 0) == 1
+                          or raw_floats.get('_Mode', 0) >= 2)
+        has_alpha_clip = (raw_floats.get('_AlphaClip', 0) == 1
+                          or raw_floats.get('_Mode', 0) == 1)
+
+        if is_transparent or has_alpha_clip:
+            extracted['properties']['opacity.mode'] = "Blended"
+            if has_alpha_clip:
+                extracted['properties']['opacity.factor'] = raw_floats.get('_Cutoff', 0.5)
+
         return extracted
 
 
@@ -231,6 +254,10 @@ class IntegratedAssetProcessor:
         self.processed_textures: Dict[str, str] = {}  # guid -> output_path
         self.processed_meshes: Dict[str, str] = {}  # guid -> output_path
         self.processed_prefabs: Set[str] = set()  # Track processed prefab GUIDs
+
+        # Physics stats
+        self.total_colliders = 0
+        self.total_rigidbodies = 0
         
         # Get project folder name for asset hints (lowercase)
         self.project_name = output_root.name.lower()
@@ -272,8 +299,13 @@ class IntegratedAssetProcessor:
                 if go.mesh_guid:
                     all_mesh_guids.add(go.mesh_guid)
             
+            # Count colliders and rigidbodies in this prefab
+            prefab_collider_count = sum(len(go.colliders) for go in game_objects.values())
+            prefab_rigidbody_count = sum(1 for go in game_objects.values() if go.has_rigidbody)
+
             self.log(f"  Found {len(all_material_guids)} unique material references")
             self.log(f"  Found {len(all_mesh_guids)} unique mesh references")
+            self.log(f"  Found {prefab_collider_count} colliders, {prefab_rigidbody_count} rigidbodies")
             
             material_mapping = {}
             for mat_guid in all_material_guids:
@@ -660,18 +692,21 @@ class IntegratedAssetProcessor:
             
             o3de_material["propertyValues"][property_name] = relative_texture_path
         
-        # Add scalar/color properties
+        # Add scalar/color/enum properties
         for o3de_prop, value in material_data.get('properties', {}).items():
             if isinstance(value, list):
-                # Color property - ensure 4 components with proper float formatting
+                # Color property - ensure 4 components
                 color = value[:3] if len(value) >= 3 else [1.0, 1.0, 1.0]
                 alpha = value[3] if len(value) >= 4 else 1.0
                 o3de_material["propertyValues"][o3de_prop] = [
-                    float(color[0]), 
-                    float(color[1]), 
-                    float(color[2]), 
+                    float(color[0]),
+                    float(color[1]),
+                    float(color[2]),
                     float(alpha)
                 ]
+            elif isinstance(value, str):
+                # Enum property (e.g. opacity.mode = "Blended")
+                o3de_material["propertyValues"][o3de_prop] = value
             else:
                 # Scalar property
                 o3de_material["propertyValues"][o3de_prop] = float(value)
@@ -919,6 +954,140 @@ class IntegratedAssetProcessor:
             "Patches": patches
         }
     
+    # ===================================================================
+    #  PhysX Component Generation
+    # ===================================================================
+
+    def _create_physx_components(self, go: GameObject, entity: Dict,
+                                 mesh_mapping: Dict) -> None:
+        """Add PhysX collider and rigidbody components to an entity.
+
+        Rules:
+          - BoxCollider / SphereCollider / CapsuleCollider
+              -> matching Shape component  +  PhysX Shape Collider
+          - MeshCollider
+              -> PhysX Mesh Collider
+          - Unity Rigidbody present
+              -> PhysX Dynamic Rigid Body
+          - Colliders present but NO Rigidbody
+              -> PhysX Static Rigid Body
+          Multiple colliders on the same GO each get their own pair.
+        """
+        if not go.colliders and not go.has_rigidbody:
+            return
+
+        components = entity["Components"]
+
+        # ---------------------------------------------------------------
+        #  Colliders (one pair per Unity collider)
+        # ---------------------------------------------------------------
+        for idx, collider in enumerate(go.colliders):
+            suffix = "" if idx == 0 else f" [{idx}]"
+            col_type = collider['type']
+
+            # Convert centre offset: Unity (x, y, z) -> O3DE (-x, z, y)
+            cx, cy, cz = collider.get('center', (0, 0, 0))
+            offset = [-cx, cz, cy]
+            is_trigger = collider.get('is_trigger', False)
+
+            # --- Mesh Collider ---
+            if col_type == 'MeshCollider':
+                mesh_collider = {
+                    "$type": "PhysX Mesh Collider",
+                    "Id": self._generate_component_id(),
+                    "ColliderConfiguration": {
+                        "Offset": offset,
+                        "IsTrigger": is_trigger
+                    }
+                }
+                if collider.get('convex', False):
+                    mesh_collider["IsConvex"] = True
+                # Asset hint – use explicit mesh GUID when available,
+                # otherwise the engine picks up the entity's render mesh.
+                mesh_guid = collider.get('mesh_guid', '')
+                if mesh_guid and mesh_guid in mesh_mapping:
+                    hint = mesh_mapping[mesh_guid].replace('.azmodel', '.pxmesh')
+                    mesh_collider["ShapeConfiguration"] = {
+                        "Asset": {"assetHint": hint}
+                    }
+                elif go.mesh_guid and go.mesh_guid in mesh_mapping:
+                    hint = mesh_mapping[go.mesh_guid].replace('.azmodel', '.pxmesh')
+                    mesh_collider["ShapeConfiguration"] = {
+                        "Asset": {"assetHint": hint}
+                    }
+                components[f"PhysX Mesh Collider{suffix}"] = mesh_collider
+                self.total_colliders += 1
+                continue
+
+            # --- Shape Colliders (Box / Sphere / Capsule) ---
+            if col_type == 'BoxCollider':
+                sx, sy, sz = collider.get('size', (1, 1, 1))
+                components[f"Box Shape{suffix}"] = {
+                    "$type": "Box Shape",
+                    "Id": self._generate_component_id(),
+                    "Box Shape Configuration": {
+                        "Dimensions": [sx, sz, sy]       # swap Y / Z
+                    }
+                }
+
+            elif col_type == 'SphereCollider':
+                components[f"Sphere Shape{suffix}"] = {
+                    "$type": "Sphere Shape",
+                    "Id": self._generate_component_id(),
+                    "Sphere Shape Configuration": {
+                        "Radius": collider.get('radius', 0.5)
+                    }
+                }
+
+            elif col_type == 'CapsuleCollider':
+                components[f"Capsule Shape{suffix}"] = {
+                    "$type": "Capsule Shape",
+                    "Id": self._generate_component_id(),
+                    "Capsule Shape Configuration": {
+                        "Height": collider.get('height', 2.0),
+                        "Radius": collider.get('radius', 0.5)
+                    }
+                }
+
+            # Pair each shape with a PhysX Shape Collider
+            components[f"PhysX Shape Collider{suffix}"] = {
+                "$type": "PhysX Shape Collider",
+                "Id": self._generate_component_id(),
+                "ColliderConfiguration": {
+                    "Offset": offset,
+                    "IsTrigger": is_trigger
+                }
+            }
+            self.total_colliders += 1
+
+        # ---------------------------------------------------------------
+        #  Rigid Body
+        # ---------------------------------------------------------------
+        if go.has_rigidbody:
+            rb = go.rigidbody_data or {}
+            components["PhysX Dynamic Rigid Body"] = {
+                "$type": "PhysX Dynamic Rigid Body",
+                "Id": self._generate_component_id(),
+                "Configuration": {
+                    "Mass": rb.get('mass', 1.0),
+                    "Linear damping": rb.get('drag', 0.0),
+                    "Angular damping": rb.get('angular_drag', 0.05),
+                    "Gravity enabled": rb.get('use_gravity', True),
+                    "Kinematic": rb.get('is_kinematic', False)
+                }
+            }
+            self.total_rigidbodies += 1
+
+        elif go.colliders:
+            # Colliders without a Rigidbody -> static rigid body
+            components["PhysX Static Rigid Body"] = {
+                "$type": "PhysX Static Rigid Body",
+                "Id": self._generate_component_id()
+            }
+            self.total_rigidbodies += 1
+
+    # ===================================================================
+
     def _create_entity_recursive(self, go: GameObject, all_game_objects: Dict,
                                  entities_dict: Dict, instances_dict: Dict,
                                  entity_id_map: Dict,
@@ -1036,19 +1205,22 @@ class IntegratedAssetProcessor:
                     }
                 }
         
+        # ---------------------------------------------------------------
+        # Material Component - map each Unity material to an O3DE slot
+        # Slot "{0}" = mesh material index 0, "{1}" = index 1, etc.
+        # ---------------------------------------------------------------
         if go.material_guids:
             materials_config = {}
             for idx, mat_guid in enumerate(go.material_guids):
                 mat_path = material_mapping.get(mat_guid)
                 if mat_path:
-                    # First material uses "{}", subsequent use "{1}", "{2}", etc.
-                    slot_id = "{}" if idx == 0 else f"{{{idx}}}"
+                    slot_id = f"{{{idx}}}"
                     materials_config[slot_id] = {
                         "MaterialAsset": {
                             "assetHint": mat_path
                         }
                     }
-            
+
             if materials_config:
                 entity["Components"]["EditorMaterialComponent"] = {
                     "$type": "EditorMaterialComponent",
@@ -1059,7 +1231,12 @@ class IntegratedAssetProcessor:
                         }
                     }
                 }
-        
+
+        # ---------------------------------------------------------------
+        # PhysX Colliders + Rigid Bodies
+        # ---------------------------------------------------------------
+        self._create_physx_components(go, entity, mesh_mapping)
+
         if go.children_ids:
             child_order = []
             for child_id in go.children_ids:
@@ -1083,15 +1260,19 @@ class IntegratedAssetProcessor:
         return entity_id
 
 
+SETTINGS_FILE = Path(__file__).parent / "converter_settings.json"
+
+
 class IntegratedProcessorGUI:
     """GUI for integrated Unity asset processing"""
-    
+
     def __init__(self, root):
         self.root = root
         self.root.title("Unity to O3DE Integrated Asset Processor")
         self.root.geometry("700x600")
-        
+
         self._create_widgets()
+        self._load_settings()
     
     def _create_widgets(self):
         main_frame = ttk.Frame(self.root, padding="10")
@@ -1168,17 +1349,53 @@ class IntegratedProcessorGUI:
         
         self._log("Ready. Select Unity assets folder and O3DE output folder to begin.")
     
+    # ---------------------------------------------------------------
+    #  Settings persistence
+    # ---------------------------------------------------------------
+
+    def _load_settings(self):
+        try:
+            if SETTINGS_FILE.exists():
+                with open(SETTINGS_FILE, 'r') as f:
+                    data = json.load(f)
+                cfg = data.get("asset_processor", {})
+                if cfg.get("source_path"):
+                    self.source_path_var.set(cfg["source_path"])
+                if cfg.get("output_path"):
+                    self.output_path_var.set(cfg["output_path"])
+        except Exception:
+            pass
+
+    def _save_settings(self):
+        try:
+            data = {}
+            if SETTINGS_FILE.exists():
+                with open(SETTINGS_FILE, 'r') as f:
+                    data = json.load(f)
+            data["asset_processor"] = {
+                "source_path": self.source_path_var.get(),
+                "output_path": self.output_path_var.get(),
+            }
+            with open(SETTINGS_FILE, 'w') as f:
+                json.dump(data, f, indent=4)
+        except Exception:
+            pass
+
+    # ---------------------------------------------------------------
+
     def _browse_source(self):
         directory = filedialog.askdirectory(title="Select Unity Assets Folder")
         if directory:
             self.source_path_var.set(directory)
             self._log(f"Source: {directory}")
-    
+            self._save_settings()
+
     def _browse_output(self):
         directory = filedialog.askdirectory(title="Select O3DE Output Folder")
         if directory:
             self.output_path_var.set(directory)
             self._log(f"Output: {directory}")
+            self._save_settings()
     
     def _log(self, message: str):
         self.status_text.config(state='normal')
@@ -1234,16 +1451,20 @@ class IntegratedProcessorGUI:
             self._log(f"Materials created: {len(processor.processed_materials)}")
             self._log(f"Textures copied: {len(processor.processed_textures)}")
             self._log(f"Meshes copied: {len(processor.processed_meshes)}")
+            self._log(f"Colliders created: {processor.total_colliders}")
+            self._log(f"Rigid bodies created: {processor.total_rigidbodies}")
             self._log(f"\nOutput location: {output_path}")
             self._log("="*60)
-            
+
             self.root.after(0, lambda: messagebox.showinfo(
                 "Success",
                 f"Processing complete!\n\n"
                 f"Prefabs: {success_count}/{len(prefab_files)}\n"
                 f"Materials: {len(processor.processed_materials)}\n"
                 f"Textures: {len(processor.processed_textures)}\n"
-                f"Meshes: {len(processor.processed_meshes)}"
+                f"Meshes: {len(processor.processed_meshes)}\n"
+                f"Colliders: {processor.total_colliders}\n"
+                f"Rigid bodies: {processor.total_rigidbodies}"
             ))
         
         except Exception as e:

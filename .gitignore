@@ -1,1 +1,6 @@
 Gems/*
+TestObjects/*
+.vscode/*
+__pycache__/*
+converter_settings.json
+.claude/*

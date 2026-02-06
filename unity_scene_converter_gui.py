@@ -773,20 +773,24 @@ class UnitySceneConverter:
         return entity_id
 
 
+SETTINGS_FILE = Path(__file__).parent / "converter_settings.json"
+
+
 class SceneConverterGUI:
     """GUI for Unity to O3DE Scene Converter"""
-    
+
     def __init__(self, root):
         self.root = root
         self.root.title("Unity to O3DE Scene Converter")
         self.root.geometry("800x700")
-        
+
         self.prefab_db = PrefabDatabase()
         self.converter = UnitySceneConverter(self.prefab_db)
-        
+
         self.prefab_dirs: List[str] = []
-        
+
         self._create_widgets()
+        self._load_settings()
     
     def _create_widgets(self):
         """Create GUI widgets"""
@@ -861,6 +865,47 @@ class SceneConverterGUI:
         
         self._log("Ready. Add Unity scene file and prefab directories to begin.")
     
+    # ---------------------------------------------------------------
+    #  Settings persistence
+    # ---------------------------------------------------------------
+
+    def _load_settings(self):
+        try:
+            if SETTINGS_FILE.exists():
+                with open(SETTINGS_FILE, 'r') as f:
+                    data = json.load(f)
+                cfg = data.get("scene_converter", {})
+                if cfg.get("scene_path"):
+                    self.scene_path_var.set(cfg["scene_path"])
+                if cfg.get("output_path"):
+                    self.output_path_var.set(cfg["output_path"])
+                for directory in cfg.get("prefab_dirs", []):
+                    if os.path.isdir(directory) and directory not in self.prefab_dirs:
+                        self.prefab_dirs.append(directory)
+                        count = self.prefab_db.add_search_directory(directory)
+                        display_text = f"{Path(directory).name} ({count} prefabs)"
+                        self.prefab_listbox.insert(tk.END, display_text)
+        except Exception:
+            pass
+
+    def _save_settings(self):
+        try:
+            data = {}
+            if SETTINGS_FILE.exists():
+                with open(SETTINGS_FILE, 'r') as f:
+                    data = json.load(f)
+            data["scene_converter"] = {
+                "scene_path": self.scene_path_var.get(),
+                "output_path": self.output_path_var.get(),
+                "prefab_dirs": list(self.prefab_dirs),
+            }
+            with open(SETTINGS_FILE, 'w') as f:
+                json.dump(data, f, indent=4)
+        except Exception:
+            pass
+
+    # ---------------------------------------------------------------
+
     def _browse_scene(self):
         """Browse for Unity scene file"""
         filename = filedialog.askopenfilename(
@@ -870,25 +915,28 @@ class SceneConverterGUI:
         if filename:
             self.scene_path_var.set(filename)
             self._log(f"Selected scene: {Path(filename).name}")
-    
+            self._save_settings()
+
     def _browse_output(self):
         """Browse for output directory"""
         directory = filedialog.askdirectory(title="Select Output Directory")
         if directory:
             self.output_path_var.set(directory)
             self._log(f"Output directory: {directory}")
-    
+            self._save_settings()
+
     def _add_prefab_directory(self):
         """Add prefab directory to search list"""
         directory = filedialog.askdirectory(title="Select O3DE Prefab Directory")
         if directory and directory not in self.prefab_dirs:
             self.prefab_dirs.append(directory)
             count = self.prefab_db.add_search_directory(directory)
-            
+
             display_text = f"{Path(directory).name} ({count} prefabs)"
             self.prefab_listbox.insert(tk.END, display_text)
             self._log(f"Added directory: {directory} - Found {count} prefabs")
-    
+            self._save_settings()
+
     def _remove_prefab_directory(self):
         """Remove selected prefab directory"""
         selection = self.prefab_listbox.curselection()
@@ -897,13 +945,14 @@ class SceneConverterGUI:
             removed_dir = self.prefab_dirs.pop(index)
             self.prefab_listbox.delete(index)
             self._log(f"Removed directory: {removed_dir}")
-            
+
             # Rebuild prefab database
             self.prefab_db = PrefabDatabase()
             for directory in self.prefab_dirs:
                 self.prefab_db.add_search_directory(directory)
             self.converter.prefab_db = self.prefab_db
-    
+            self._save_settings()
+
     def _clear_prefab_directories(self):
         """Clear all prefab directories"""
         self.prefab_dirs.clear()
@@ -911,6 +960,7 @@ class SceneConverterGUI:
         self.prefab_db = PrefabDatabase()
         self.converter.prefab_db = self.prefab_db
         self._log("Cleared all prefab directories")
+        self._save_settings()
     
     def _log(self, message: str):
         """Add message to status log"""
