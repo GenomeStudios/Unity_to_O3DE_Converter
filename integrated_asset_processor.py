@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import math
+import subprocess
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Set
 from dataclasses import dataclass, field
@@ -227,14 +228,101 @@ class AssetDatabase:
         return extracted
 
 
+# ===================================================================
+#  Blender Integration — FBX Transform Baking
+# ===================================================================
+
+# Common Blender install locations (Windows)
+_BLENDER_SEARCH_PATHS = [
+    Path(os.environ.get("PROGRAMFILES", "C:/Program Files")) / "Blender Foundation",
+    Path(os.environ.get("PROGRAMFILES(X86)", "C:/Program Files (x86)")) / "Blender Foundation",
+    Path(os.environ.get("LOCALAPPDATA", "")) / "Blender Foundation",
+]
+
+# Path to the bake script shipped alongside this file
+_BAKE_SCRIPT = Path(__file__).parent / "bake_fbx_transforms.py"
+
+
+def find_blender() -> Optional[Path]:
+    """Auto-detect a Blender installation on this machine.
+
+    Checks PATH first, then common install directories.
+    Returns the full path to blender.exe or None.
+    """
+    # 1. Check PATH
+    path_dirs = os.environ.get("PATH", "").split(os.pathsep)
+    for d in path_dirs:
+        candidate = Path(d) / "blender.exe"
+        if candidate.is_file():
+            return candidate
+
+    # 2. Search common install folders (pick newest version)
+    candidates: list[Path] = []
+    for search_root in _BLENDER_SEARCH_PATHS:
+        if not search_root.is_dir():
+            continue
+        for version_dir in search_root.iterdir():
+            exe = version_dir / "blender.exe"
+            if exe.is_file():
+                candidates.append(exe)
+
+    if candidates:
+        candidates.sort(key=lambda p: p.parent.name, reverse=True)
+        return candidates[0]
+
+    return None
+
+
+def validate_blender(blender_path: Optional[str]) -> Optional[Path]:
+    """Return a valid Path to blender.exe, or None."""
+    if not blender_path:
+        return None
+    p = Path(blender_path)
+    if p.is_file() and p.name.lower() in ("blender.exe", "blender"):
+        return p
+    return None
+
+
+def bake_fbx_with_blender(blender_exe: Path, input_fbx: Path,
+                           output_fbx: Path, log=print) -> bool:
+    """Run the Blender bake script on a single FBX file.
+
+    Returns True on success.
+    """
+    cmd = [
+        str(blender_exe),
+        "--background",
+        "--python", str(_BAKE_SCRIPT),
+        "--",
+        str(input_fbx),
+        str(output_fbx),
+    ]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=120
+        )
+        if result.returncode != 0:
+            log(f"      [Blender] stderr: {result.stderr.strip()}")
+            return False
+        return True
+    except subprocess.TimeoutExpired:
+        log("      [Blender] Timed out after 120 s")
+        return False
+    except FileNotFoundError:
+        log(f"      [Blender] Executable not found: {blender_exe}")
+        return False
+
+
 class IntegratedAssetProcessor:
     """Processes Unity prefabs with materials to O3DE format"""
     
-    def __init__(self, unity_assets_root: Path, output_root: Path, log_callback=None):
+    def __init__(self, unity_assets_root: Path, output_root: Path,
+                 log_callback=None, blender_path: Optional[Path] = None):
         self.unity_assets_root = unity_assets_root
         self.output_root = output_root
         self.log = log_callback or print
-        
+        self.blender_path = blender_path
+
         self.asset_db = AssetDatabase(unity_assets_root)
         
         # Output structure
@@ -749,34 +837,45 @@ class IntegratedAssetProcessor:
             return None
     
     def _process_mesh(self, mesh_guid: str) -> Optional[str]:
-        """Process mesh - copy model file to output directory"""
+        """Process mesh — copy to output, optionally bake transforms via Blender."""
         if mesh_guid in self.processed_meshes:
             return self.processed_meshes[mesh_guid]
-        
+
         mesh_path = self.asset_db.resolve_guid(mesh_guid)
         if not mesh_path or mesh_path.suffix.lower() not in self.asset_db.mesh_extensions:
             return None
-        
+
         self.log(f"    Processing mesh: {mesh_path.name}")
-        
-        # Copy mesh to output
+
         output_path = self.meshes_dir / mesh_path.name
-        
+
         try:
             if not output_path.exists():
-                shutil.copy2(mesh_path, output_path)
-                self.log(f"      ✓ Copied mesh file")
+                # Blender bake: import → apply transforms → re-export
+                if (self.blender_path
+                        and mesh_path.suffix.lower() == '.fbx'):
+                    self.log(f"      Baking transforms via Blender...")
+                    ok = bake_fbx_with_blender(
+                        self.blender_path, mesh_path, output_path, self.log
+                    )
+                    if ok:
+                        self.log(f"      ✓ Baked and exported mesh")
+                    else:
+                        # Fallback: raw copy so the pipeline continues
+                        shutil.copy2(mesh_path, output_path)
+                        self.log(f"      ⚠ Bake failed — raw copy used")
+                else:
+                    shutil.copy2(mesh_path, output_path)
+                    self.log(f"      ✓ Copied mesh file")
             else:
                 self.log(f"      → Mesh already exists")
-            
-            # Generate gem-style asset hint: projectname/meshes/filename.fbx.azmodel
+
             asset_hint = f"{self.project_name}/meshes/{output_path.name}.azmodel"
             self.processed_meshes[mesh_guid] = asset_hint
-            
             return asset_hint
-        
+
         except Exception as e:
-            self.log(f"      ⚠ Failed to copy mesh {mesh_path.name}: {e}")
+            self.log(f"      ⚠ Failed to process mesh {mesh_path.name}: {e}")
             return None
     
     
@@ -959,105 +1058,63 @@ class IntegratedAssetProcessor:
     # ===================================================================
 
     def _create_physx_components(self, go: GameObject, entity: Dict,
-                                 mesh_mapping: Dict) -> None:
+                                 mesh_mapping: Dict,
+                                 entities_dict: Dict) -> List[str]:
         """Add PhysX collider and rigidbody components to an entity.
 
-        Rules:
-          - BoxCollider / SphereCollider / CapsuleCollider
-              -> matching Shape component  +  PhysX Shape Collider
-          - MeshCollider
-              -> PhysX Mesh Collider
-          - Unity Rigidbody present
-              -> PhysX Dynamic Rigid Body
-          - Colliders present but NO Rigidbody
-              -> PhysX Static Rigid Body
-          Multiple colliders on the same GO each get their own pair.
+        O3DE allows only ONE collider per entity. When a Unity GO has
+        multiple colliders, extras become child entities named
+        '{ParentName}_Collider_{N}'.
+
+        Mapping:
+          BoxCollider    -> EditorBoxShapeComponent     + EditorShapeColliderComponent
+          SphereCollider -> EditorSphereShapeComponent   + EditorShapeColliderComponent
+          CapsuleCollider-> EditorCapsuleShapeComponent  + EditorShapeColliderComponent
+          MeshCollider   -> EditorMeshColliderComponent
+          Rigidbody      -> EditorRigidBodyComponent     (dynamic)
+          No Rigidbody   -> EditorStaticRigidBodyComponent (static companion)
+
+        Returns list of child entity IDs created for multi-collider setups.
         """
         if not go.colliders and not go.has_rigidbody:
-            return
+            return []
 
         components = entity["Components"]
+        child_entity_ids = []
 
         # ---------------------------------------------------------------
-        #  Colliders (one pair per Unity collider)
+        #  Colliders — first on main entity, extras as child entities
         # ---------------------------------------------------------------
         for idx, collider in enumerate(go.colliders):
-            suffix = "" if idx == 0 else f" [{idx}]"
-            col_type = collider['type']
 
-            # Convert centre offset: Unity (x, y, z) -> O3DE (-x, z, y)
+            if idx == 0:
+                target = components
+            else:
+                child_id = self._generate_entity_id()
+                child = self._make_bare_entity(
+                    child_id,
+                    f"{go.name}_Collider_{idx}",
+                    entity["Id"]
+                )
+                child["Components"]["EditorStaticRigidBodyComponent"] = {
+                    "$type": "EditorStaticRigidBodyComponent",
+                    "Id": self._generate_component_id()
+                }
+                entities_dict[child_id] = child
+                child_entity_ids.append(child_id)
+                target = child["Components"]
+
+            col_type = collider['type']
             cx, cy, cz = collider.get('center', (0, 0, 0))
-            offset = [-cx, cz, cy]
+            offset = [-cx, cz, cy]  # Unity (x,y,z) -> O3DE (-x,z,y)
             is_trigger = collider.get('is_trigger', False)
 
-            # --- Mesh Collider ---
             if col_type == 'MeshCollider':
-                mesh_collider = {
-                    "$type": "PhysX Mesh Collider",
-                    "Id": self._generate_component_id(),
-                    "ColliderConfiguration": {
-                        "Offset": offset,
-                        "IsTrigger": is_trigger
-                    }
-                }
-                if collider.get('convex', False):
-                    mesh_collider["IsConvex"] = True
-                # Asset hint – use explicit mesh GUID when available,
-                # otherwise the engine picks up the entity's render mesh.
-                mesh_guid = collider.get('mesh_guid', '')
-                if mesh_guid and mesh_guid in mesh_mapping:
-                    hint = mesh_mapping[mesh_guid].replace('.azmodel', '.pxmesh')
-                    mesh_collider["ShapeConfiguration"] = {
-                        "Asset": {"assetHint": hint}
-                    }
-                elif go.mesh_guid and go.mesh_guid in mesh_mapping:
-                    hint = mesh_mapping[go.mesh_guid].replace('.azmodel', '.pxmesh')
-                    mesh_collider["ShapeConfiguration"] = {
-                        "Asset": {"assetHint": hint}
-                    }
-                components[f"PhysX Mesh Collider{suffix}"] = mesh_collider
-                self.total_colliders += 1
-                continue
-
-            # --- Shape Colliders (Box / Sphere / Capsule) ---
-            if col_type == 'BoxCollider':
-                sx, sy, sz = collider.get('size', (1, 1, 1))
-                components[f"Box Shape{suffix}"] = {
-                    "$type": "Box Shape",
-                    "Id": self._generate_component_id(),
-                    "Box Shape Configuration": {
-                        "Dimensions": [sx, sz, sy]       # swap Y / Z
-                    }
-                }
-
-            elif col_type == 'SphereCollider':
-                components[f"Sphere Shape{suffix}"] = {
-                    "$type": "Sphere Shape",
-                    "Id": self._generate_component_id(),
-                    "Sphere Shape Configuration": {
-                        "Radius": collider.get('radius', 0.5)
-                    }
-                }
-
-            elif col_type == 'CapsuleCollider':
-                components[f"Capsule Shape{suffix}"] = {
-                    "$type": "Capsule Shape",
-                    "Id": self._generate_component_id(),
-                    "Capsule Shape Configuration": {
-                        "Height": collider.get('height', 2.0),
-                        "Radius": collider.get('radius', 0.5)
-                    }
-                }
-
-            # Pair each shape with a PhysX Shape Collider
-            components[f"PhysX Shape Collider{suffix}"] = {
-                "$type": "PhysX Shape Collider",
-                "Id": self._generate_component_id(),
-                "ColliderConfiguration": {
-                    "Offset": offset,
-                    "IsTrigger": is_trigger
-                }
-            }
+                self._add_mesh_collider(target, collider, is_trigger,
+                                        mesh_mapping, go)
+            else:
+                self._add_shape_collider(target, collider, col_type,
+                                         offset, is_trigger)
             self.total_colliders += 1
 
         # ---------------------------------------------------------------
@@ -1065,26 +1122,204 @@ class IntegratedAssetProcessor:
         # ---------------------------------------------------------------
         if go.has_rigidbody:
             rb = go.rigidbody_data or {}
-            components["PhysX Dynamic Rigid Body"] = {
-                "$type": "PhysX Dynamic Rigid Body",
+            config = {
+                "Mass": float(rb.get('mass', 1.0)),
+                "Linear damping": float(rb.get('drag', 0.0)),
+                "Angular damping": float(rb.get('angular_drag', 0.05)),
+                "Gravity Enabled": rb.get('use_gravity', True),
+            }
+            if rb.get('is_kinematic', False):
+                config["Kinematic"] = True
+
+            # Unity constraint bitmask -> O3DE lock flags
+            # Unity: PosX=2 PosY=4 PosZ=8 RotX=16 RotY=32 RotZ=64
+            # Axis swap: Unity Y -> O3DE Z, Unity Z -> O3DE Y
+            constraints = rb.get('constraints', 0)
+            if constraints:
+                if constraints & 2:  config["Lock Linear X"] = True
+                if constraints & 4:  config["Lock Linear Z"] = True   # Y->Z
+                if constraints & 8:  config["Lock Linear Y"] = True   # Z->Y
+                if constraints & 16: config["Lock Angular X"] = True
+                if constraints & 32: config["Lock Angular Z"] = True  # Y->Z
+                if constraints & 64: config["Lock Angular Y"] = True  # Z->Y
+
+            components["EditorRigidBodyComponent"] = {
+                "$type": "EditorRigidBodyComponent",
                 "Id": self._generate_component_id(),
-                "Configuration": {
-                    "Mass": rb.get('mass', 1.0),
-                    "Linear damping": rb.get('drag', 0.0),
-                    "Angular damping": rb.get('angular_drag', 0.05),
-                    "Gravity enabled": rb.get('use_gravity', True),
-                    "Kinematic": rb.get('is_kinematic', False)
-                }
+                "Configuration": config
             }
             self.total_rigidbodies += 1
 
         elif go.colliders:
-            # Colliders without a Rigidbody -> static rigid body
-            components["PhysX Static Rigid Body"] = {
-                "$type": "PhysX Static Rigid Body",
+            components["EditorStaticRigidBodyComponent"] = {
+                "$type": "EditorStaticRigidBodyComponent",
                 "Id": self._generate_component_id()
             }
             self.total_rigidbodies += 1
+
+        return child_entity_ids
+
+    # ===================================================================
+    #  Collider Helpers
+    # ===================================================================
+
+    def _make_bare_entity(self, entity_id: str, name: str,
+                          parent_entity_id: str) -> Dict:
+        """Create a minimal O3DE entity (for child collider entities)."""
+        return {
+            "Id": entity_id,
+            "Name": name,
+            "Components": {
+                "TransformComponent": {
+                    "$type": "{27F1E1A1-8D9D-4C3B-BD3A-AFB9762449C0} TransformComponent",
+                    "Id": self._generate_component_id(),
+                    "Parent Entity": parent_entity_id
+                },
+                "EditorDisabledCompositionComponent": {
+                    "$type": "EditorDisabledCompositionComponent",
+                    "Id": self._generate_component_id()
+                },
+                "EditorEntityIconComponent": {
+                    "$type": "EditorEntityIconComponent",
+                    "Id": self._generate_component_id()
+                },
+                "EditorInspectorComponent": {
+                    "$type": "EditorInspectorComponent",
+                    "Id": self._generate_component_id()
+                },
+                "EditorLockComponent": {
+                    "$type": "EditorLockComponent",
+                    "Id": self._generate_component_id()
+                },
+                "EditorOnlyEntityComponent": {
+                    "$type": "EditorOnlyEntityComponent",
+                    "Id": self._generate_component_id()
+                },
+                "EditorPendingCompositionComponent": {
+                    "$type": "EditorPendingCompositionComponent",
+                    "Id": self._generate_component_id()
+                },
+                "EditorVisibilityComponent": {
+                    "$type": "EditorVisibilityComponent",
+                    "Id": self._generate_component_id()
+                }
+            }
+        }
+
+    def _add_mesh_collider(self, components: Dict, collider: Dict,
+                           is_trigger: bool, mesh_mapping: Dict,
+                           go: GameObject) -> None:
+        """Add an EditorMeshColliderComponent to *components*."""
+        collider_cfg = {
+            "MaterialSlots": {
+                "Slots": [{"Name": "Entire object"}]
+            }
+        }
+        if is_trigger:
+            collider_cfg["Trigger"] = True
+
+        mesh_comp = {
+            "$type": "EditorMeshColliderComponent",
+            "Id": self._generate_component_id(),
+            "ColliderConfiguration": collider_cfg
+        }
+
+        # Resolve .pxmesh asset hint from collider mesh or render mesh
+        hint = None
+        mesh_guid = collider.get('mesh_guid', '')
+        if mesh_guid and mesh_guid in mesh_mapping:
+            hint = mesh_mapping[mesh_guid].replace('.azmodel', '.pxmesh')
+        elif go.mesh_guid and go.mesh_guid in mesh_mapping:
+            hint = mesh_mapping[go.mesh_guid].replace('.azmodel', '.pxmesh')
+
+        if hint:
+            mesh_comp["ShapeConfiguration"] = {
+                "PhysicsAsset": {
+                    "Asset": {
+                        "assetHint": hint
+                    },
+                    "Configuration": {
+                        "PhysicsAsset": {
+                            "loadBehavior": "QueueLoad",
+                            "assetHint": hint
+                        }
+                    }
+                }
+            }
+
+        components["EditorMeshColliderComponent"] = mesh_comp
+
+    def _add_shape_collider(self, components: Dict, collider: Dict,
+                            col_type: str, offset: List[float],
+                            is_trigger: bool) -> None:
+        """Add Editor{Shape}ShapeComponent + EditorShapeColliderComponent."""
+        has_offset = any(abs(v) > 0.0001 for v in offset)
+        shape_config = {}  # entry for ShapeConfigs array
+
+        # ----- Box -----
+        if col_type == 'BoxCollider':
+            sx, sy, sz = collider.get('size', (1, 1, 1))
+            dims = [sx, sz, sy]  # swap Y/Z
+            shape_config = {"$type": "BoxShapeConfiguration", "Configuration": dims}
+
+            box_cfg = {"Dimensions": dims}
+            if has_offset:
+                box_cfg["TranslationOffset"] = offset
+            components["EditorBoxShapeComponent"] = {
+                "$type": "EditorBoxShapeComponent",
+                "Id": self._generate_component_id(),
+                "BoxShape": {"Configuration": box_cfg}
+            }
+
+        # ----- Sphere -----
+        elif col_type == 'SphereCollider':
+            radius = collider.get('radius', 0.5)
+            shape_config = {"$type": "SphereShapeConfiguration", "Radius": radius}
+
+            sphere_cfg = {"Radius": radius}
+            if has_offset:
+                sphere_cfg["TranslationOffset"] = offset
+            components["EditorSphereShapeComponent"] = {
+                "$type": "EditorSphereShapeComponent",
+                "Id": self._generate_component_id(),
+                "SphereShape": {"Configuration": sphere_cfg}
+            }
+
+        # ----- Capsule -----
+        elif col_type == 'CapsuleCollider':
+            height = collider.get('height', 2.0)
+            radius = collider.get('radius', 0.5)
+            shape_config = {
+                "$type": "CapsuleShapeConfiguration",
+                "Height": height, "Radius": radius
+            }
+
+            capsule_cfg = {"Height": height, "Radius": radius}
+            if has_offset:
+                capsule_cfg["TranslationOffset"] = offset
+            components["EditorCapsuleShapeComponent"] = {
+                "$type": "EditorCapsuleShapeComponent",
+                "Id": self._generate_component_id(),
+                "CapsuleShape": {"Configuration": capsule_cfg}
+            }
+
+        # Paired EditorShapeColliderComponent
+        collider_cfg = {
+            "MaterialSlots": {
+                "Slots": [{"Name": "Entire object"}]
+            }
+        }
+        if is_trigger:
+            collider_cfg["Trigger"] = True
+        if has_offset:
+            collider_cfg["Position"] = offset
+
+        components["EditorShapeColliderComponent"] = {
+            "$type": "EditorShapeColliderComponent",
+            "Id": self._generate_component_id(),
+            "ColliderConfiguration": collider_cfg,
+            "ShapeConfigs": [shape_config]
+        }
 
     # ===================================================================
 
@@ -1235,27 +1470,33 @@ class IntegratedAssetProcessor:
         # ---------------------------------------------------------------
         # PhysX Colliders + Rigid Bodies
         # ---------------------------------------------------------------
-        self._create_physx_components(go, entity, mesh_mapping)
+        collider_child_ids = self._create_physx_components(
+            go, entity, mesh_mapping, entities_dict
+        )
 
-        if go.children_ids:
-            child_order = []
-            for child_id in go.children_ids:
-                if child_id in all_game_objects:
-                    child_entity_id = self._create_entity_recursive(
-                        all_game_objects[child_id], all_game_objects,
-                        entities_dict, instances_dict, entity_id_map,
-                        material_mapping, mesh_mapping, entity_id
-                    )
-                    if child_entity_id:
-                        child_order.append(child_entity_id)
-            
-            if child_order:
-                entity["Components"]["EditorEntitySortComponent"] = {
-                    "$type": "EditorEntitySortComponent",
-                    "Id": self._generate_component_id(),
-                    "Child Entity Order": child_order
-                }
-        
+        # ---------------------------------------------------------------
+        # Child entities: GO children + any collider sub-entities
+        # ---------------------------------------------------------------
+        child_order = []
+        for child_id in go.children_ids:
+            if child_id in all_game_objects:
+                child_entity_id = self._create_entity_recursive(
+                    all_game_objects[child_id], all_game_objects,
+                    entities_dict, instances_dict, entity_id_map,
+                    material_mapping, mesh_mapping, entity_id
+                )
+                if child_entity_id:
+                    child_order.append(child_entity_id)
+
+        child_order.extend(collider_child_ids)
+
+        if child_order:
+            entity["Components"]["EditorEntitySortComponent"] = {
+                "$type": "EditorEntitySortComponent",
+                "Id": self._generate_component_id(),
+                "Child Entity Order": child_order
+            }
+
         entities_dict[entity_id] = entity
         return entity_id
 
@@ -1269,10 +1510,11 @@ class IntegratedProcessorGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Unity to O3DE Integrated Asset Processor")
-        self.root.geometry("700x600")
+        self.root.geometry("700x650")
 
         self._create_widgets()
         self._load_settings()
+        self._check_blender_on_startup()
     
     def _create_widgets(self):
         main_frame = ttk.Frame(self.root, padding="10")
@@ -1312,41 +1554,65 @@ class IntegratedProcessorGUI:
             row=0, column=1, padx=(5, 0))
         
         output_frame.columnconfigure(0, weight=1)
-        
+
+        # Blender path (for FBX transform baking)
+        ttk.Label(main_frame, text="Blender Path (optional):",
+                  font=('', 10, 'bold')).grid(
+            row=5, column=0, sticky=tk.W, pady=(0, 5))
+
+        blender_frame = ttk.Frame(main_frame)
+        blender_frame.grid(row=6, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
+
+        self.blender_path_var = tk.StringVar()
+        ttk.Entry(blender_frame, textvariable=self.blender_path_var,
+                  width=50).grid(row=0, column=0, sticky=(tk.W, tk.E))
+        ttk.Button(blender_frame, text="Browse...",
+                   command=self._browse_blender).grid(row=0, column=1, padx=(5, 0))
+        ttk.Button(blender_frame, text="Auto-detect",
+                   command=self._autodetect_blender).grid(row=0, column=2, padx=(5, 0))
+        blender_frame.columnconfigure(0, weight=1)
+
+        self.blender_status_var = tk.StringVar(value="")
+        self.blender_status_label = ttk.Label(
+            main_frame, textvariable=self.blender_status_var,
+            foreground="gray")
+        self.blender_status_label.grid(row=7, column=0, sticky=tk.W, pady=(0, 10))
+
         # Info frame
         info_frame = ttk.LabelFrame(main_frame, text="Output Structure", padding="10")
-        info_frame.grid(row=5, column=0, sticky=(tk.W, tk.E), pady=(0, 15))
+        info_frame.grid(row=8, column=0, sticky=(tk.W, tk.E), pady=(0, 15))
         
         info_text = """This will create:
   • Prefabs/    - O3DE prefabs with correct material references
   • Materials/  - O3DE PBR materials with textures
   • Textures/   - All textures in one location
-  • Meshes/     - Copied FBX/model files (ready for O3DE import)"""
-        
+  • Meshes/     - FBX models (baked via Blender when available)"""
+
         ttk.Label(info_frame, text=info_text, justify=tk.LEFT).pack()
-        
+
         # Status log
         ttk.Label(main_frame, text="Processing Log:", font=('', 10, 'bold')).grid(
-            row=6, column=0, sticky=tk.W, pady=(0, 5))
-        
-        self.status_text = scrolledtext.ScrolledText(main_frame, height=15, width=70, 
+            row=9, column=0, sticky=tk.W, pady=(0, 5))
+
+        self.status_text = scrolledtext.ScrolledText(main_frame, height=15, width=70,
                                                      state='disabled')
-        self.status_text.grid(row=7, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 15))
-        
+        self.status_text.grid(row=10, column=0, sticky=(tk.W, tk.E, tk.N, tk.S),
+                              pady=(0, 15))
+
         # Process button
         process_frame = ttk.Frame(main_frame)
-        process_frame.grid(row=8, column=0, sticky=(tk.W, tk.E))
-        
-        self.process_btn = ttk.Button(process_frame, text="Process Assets", 
+        process_frame.grid(row=11, column=0, sticky=(tk.W, tk.E))
+
+        self.process_btn = ttk.Button(process_frame, text="Process Assets",
                                       command=self._process_assets)
         self.process_btn.pack(side=tk.RIGHT)
-        
+
         # Configure grid weights
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         main_frame.columnconfigure(0, weight=1)
-        main_frame.rowconfigure(7, weight=1)
-        
+        main_frame.rowconfigure(10, weight=1)
+
         self._log("Ready. Select Unity assets folder and O3DE output folder to begin.")
     
     # ---------------------------------------------------------------
@@ -1363,6 +1629,9 @@ class IntegratedProcessorGUI:
                     self.source_path_var.set(cfg["source_path"])
                 if cfg.get("output_path"):
                     self.output_path_var.set(cfg["output_path"])
+                if cfg.get("blender_path"):
+                    self.blender_path_var.set(cfg["blender_path"])
+                    self._update_blender_status()
         except Exception:
             pass
 
@@ -1375,11 +1644,76 @@ class IntegratedProcessorGUI:
             data["asset_processor"] = {
                 "source_path": self.source_path_var.get(),
                 "output_path": self.output_path_var.get(),
+                "blender_path": self.blender_path_var.get(),
             }
             with open(SETTINGS_FILE, 'w') as f:
                 json.dump(data, f, indent=4)
         except Exception:
             pass
+
+    # ---------------------------------------------------------------
+    #  Blender path helpers
+    # ---------------------------------------------------------------
+
+    def _update_blender_status(self):
+        """Refresh the status label under the Blender path field."""
+        path = validate_blender(self.blender_path_var.get())
+        if path:
+            self.blender_status_var.set(f"Blender found: {path.parent.name}")
+            self.blender_status_label.config(foreground="green")
+        elif self.blender_path_var.get():
+            self.blender_status_var.set("Invalid path — blender.exe not found")
+            self.blender_status_label.config(foreground="red")
+        else:
+            self.blender_status_var.set(
+                "Not set — FBX meshes will be copied without transform baking")
+            self.blender_status_label.config(foreground="gray")
+
+    def _browse_blender(self):
+        path = filedialog.askopenfilename(
+            title="Select blender.exe",
+            filetypes=[("Blender", "blender.exe"), ("All files", "*.*")])
+        if path:
+            self.blender_path_var.set(path)
+            self._update_blender_status()
+            self._save_settings()
+
+    def _autodetect_blender(self):
+        found = find_blender()
+        if found:
+            self.blender_path_var.set(str(found))
+            self._update_blender_status()
+            self._save_settings()
+            self._log(f"Blender auto-detected: {found}")
+        else:
+            self._update_blender_status()
+            messagebox.showwarning(
+                "Blender Not Found",
+                "Could not find a Blender installation.\n\n"
+                "FBX meshes will still be copied, but mesh pivot points\n"
+                "may appear offset in O3DE.\n\n"
+                "To fix this, install Blender (free) from:\n"
+                "https://www.blender.org/download/\n\n"
+                "After installing, click Auto-detect or Browse to set the path.")
+
+    def _check_blender_on_startup(self):
+        """On first launch, auto-detect Blender. Prompt if missing."""
+        if self.blender_path_var.get():
+            self._update_blender_status()
+            return
+
+        found = find_blender()
+        if found:
+            self.blender_path_var.set(str(found))
+            self._update_blender_status()
+            self._save_settings()
+            self._log(f"Blender auto-detected: {found}")
+        else:
+            self._update_blender_status()
+            self._log(
+                "Blender not found. FBX meshes will be copied without "
+                "transform baking. Install Blender from "
+                "https://www.blender.org/download/ for proper mesh pivots.")
 
     # ---------------------------------------------------------------
 
@@ -1424,10 +1758,12 @@ class IntegratedProcessorGUI:
     
     def _do_processing(self, source_path: str, output_path: str):
         try:
+            blender = validate_blender(self.blender_path_var.get())
             processor = IntegratedAssetProcessor(
-                Path(source_path), 
+                Path(source_path),
                 Path(output_path),
-                log_callback=self._log
+                log_callback=self._log,
+                blender_path=blender,
             )
             
             self._log("\n" + "="*60)
@@ -1450,7 +1786,8 @@ class IntegratedProcessorGUI:
             self._log(f"Prefabs processed: {success_count}/{len(prefab_files)}")
             self._log(f"Materials created: {len(processor.processed_materials)}")
             self._log(f"Textures copied: {len(processor.processed_textures)}")
-            self._log(f"Meshes copied: {len(processor.processed_meshes)}")
+            mesh_verb = "baked" if blender else "copied"
+            self._log(f"Meshes {mesh_verb}: {len(processor.processed_meshes)}")
             self._log(f"Colliders created: {processor.total_colliders}")
             self._log(f"Rigid bodies created: {processor.total_rigidbodies}")
             self._log(f"\nOutput location: {output_path}")
