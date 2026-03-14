@@ -70,7 +70,8 @@ Last-used paths are automatically saved and restored between sessions via `conve
 | Uniform transform | TransformComponent | Working |
 | Non-uniform scale | EditorNonUniformScaleComponent | Working |
 | MeshFilter + MeshRenderer | EditorMeshComponent | Working |
-| Multi-material slots | EditorMaterialComponent `{0}`, `{1}`... | Working |
+| Multi-material slots | EditorMaterialComponent `{}` default + `{0}`, `{1}`... | Working |
+| FBX .assetinfo per-entity MeshGroups | Named, predictable `.azmodel` asset hints | Working |
 | Texture maps (albedo, normal, metallic, roughness, occlusion, emissive) | StandardPBR properties | Working |
 | Transparency / alpha clip | `opacity.mode = Blended` | Working |
 | BoxCollider | EditorBoxShapeComponent + EditorShapeColliderComponent | Working |
@@ -89,7 +90,7 @@ Last-used paths are automatically saved and restored between sessions via `conve
 ## Known Issues
 
 **Mesh coordinate system**
-Unity internally rebakes mesh coordinates in a way that does not match the raw FBX on disk. The converter applies the standard Unity → O3DE axis swap (`-x, z, y` for position; `-qx, qz, qy, qw` for rotation) but cannot correct for Unity's internal mesh rebake. A Blender transform-bake pass was attempted and abandoned as ineffectual. This remains the primary visual accuracy issue.
+Unity internally rebakes mesh coordinates in a way that does not match the raw FBX on disk. The converter applies the Unity → O3DE axis swap — position `(x, z, y)`, rotation `(qx, qz, qy, qw)`, scale `(sx, sz, sy)` — but cannot correct for Unity's internal mesh pivot bake. A Blender transform-bake pass was attempted and abandoned as ineffectual. This remains the primary visual accuracy issue on some assets.
 
 **Material pipeline**
 Texture, normal, metallic, roughness, and opacity conversions are functional. Specular workflow, detail maps, and some edge-case shader properties are not yet mapped.
@@ -116,8 +117,8 @@ unity_to_o3de_converter/
     capsule_collider.py weight=150 CapsuleCollider
     mesh_collider.py    weight=175 MeshCollider
 
-  legacy_unity_prefab_to_o3de.py   Legacy — pending removal
-  bake_fbx_transforms.py           Legacy — pending removal
+  legacy_unity_prefab_to_o3de.py   Legacy — ignore
+  bake_fbx_transforms.py           Legacy — ignore
 ```
 
 ---
@@ -315,6 +316,12 @@ Save this as `components/light.py` with `WEIGHT = 200` and it will be live on th
 ---
 
 ## Change Log
+
+**2026-03-14**
+- Removed X-axis inversion from coordinate conversion — position is now `(x, z, y)`, rotation `(qx, qz, qy, qw)`; same fix applied to all shape collider center offsets
+- FBX `.assetinfo` generation: per-entity named MeshGroups, `selectedNodes` always begins with `"RootNode"`, binary FBX parser (`read_fbx_hierarchy`) extracts sub-objects (UV channels, vertex color layers, material nodes)
+- Multi-material slot format confirmed: `EditorMaterialComponent` emits `{}` default slot followed by indexed `{0}`, `{1}`, ... slots preserving Unity MeshRenderer order
+- Material `assetHint` paths now preserve source file case (e.g. `Door_MetalDark.azmaterial`)
 
 **2026-03-13**
 - Unified PySide6 GUI with Catppuccin dark theme, replacing separate tkinter windows

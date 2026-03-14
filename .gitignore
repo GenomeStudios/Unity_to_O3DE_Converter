@@ -5,4 +5,4 @@ __pycache__/*
 converter_settings.json
 .claude/*
 EvaluationAssets/*
-__pycache__/*
+*/__pycache__/*

@@ -1,6 +1,6 @@
 """
 =============================================================================
-DIRECTIONAL LIGHT COMPONENT PROCESSOR  (WEIGHT = 60)
+DIRECTIONAL LIGHT COMPONENT PROCESSOR  (WEIGHT = 500)
 
 Handles:  Light  (Unity type 1 = Directional)
 Emits:    AZ::Render::EditorDirectionalLightComponent
@@ -24,11 +24,18 @@ class DirectionalLightComponentProcessor(ComponentProcessor):
       Intensity is passed through directly from Unity (lux).
     """
 
-    WEIGHT  = 60
+    WEIGHT  = 500
     HANDLES = ['Light']
     EMITS   = ['AZ::Render::EditorDirectionalLightComponent']
 
     UNITY_TYPE_DIRECTIONAL = 1
+
+    @staticmethod
+    def _to_int(value) -> int:
+        """Safely convert a value to int — handles Unity scene dicts (e.g. m_Shadows struct)."""
+        if isinstance(value, dict):
+            return int(value.get('m_Type', value.get('value', 0)))
+        return int(value)
 
     # -------------------------------------------------------------------------
     # PARSE
@@ -37,14 +44,14 @@ class DirectionalLightComponentProcessor(ComponentProcessor):
     def parse(self, comp_type: str, comp_data: Dict,
               go, log: Callable[[str], None]) -> None:
 
-        light_type = int(comp_data.get('m_Type', -1))
+        light_type = self._to_int(comp_data.get('m_Type', -1))
 
         if light_type != self.UNITY_TYPE_DIRECTIONAL:
             log(f"    [Light] Skipping non-directional light (m_Type={light_type}) on '{go.name}'")
             return
 
-        intensity      = float(comp_data.get('m_Intensity', 1.0))
-        shadows_on     = int(comp_data.get('m_Shadows', 0)) != 0
+        intensity  = float(comp_data.get('m_Intensity', 1.0))
+        shadows_on = self._to_int(comp_data.get('m_Shadows', 0)) != 0
 
         go.component_data['directional_light'] = {
             'intensity':  intensity,
@@ -60,6 +67,15 @@ class DirectionalLightComponentProcessor(ComponentProcessor):
         light_data = go.component_data.get('directional_light')
         if not light_data:
             return []
+
+        # Invert the light direction — Unity and O3DE directional lights face
+        # opposite directions after coordinate conversion, so apply a 180° pitch flip.
+        tc = entity['Components'].get('TransformComponent', {})
+        td = tc.setdefault('Transform Data', {})
+        rotate = list(td.get('Rotate', [0.0, 0.0, 0.0]))
+        rotate[0] = ((rotate[0] + 180.0 + 180.0) % 360.0) - 180.0  # add 180°, normalize to [-180, 180]
+        td['Rotate'] = rotate
+        ctx.log(f"  [Light] Inverted pitch to {rotate[0]:.2f}° for directional light on '{go.name}'")
 
         entity['Components']['AZ::Render::EditorDirectionalLightComponent'] = {
             '$type': 'AZ::Render::EditorDirectionalLightComponent',

@@ -660,7 +660,7 @@ class SceneConverterTab(QWidget):
         for d in prefab_dirs:
             prefab_db.add_search_directory(Path(d))
 
-        converter = UnitySceneConverter(prefab_db)
+        converter = UnitySceneConverter(prefab_db, log_callback=log)
 
         log("\nParsing Unity scene…")
         converter.parse_unity_scene(scene_path)

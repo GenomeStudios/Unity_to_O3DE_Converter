@@ -16,8 +16,11 @@ import re
 import math
 import random
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Set
+from typing import Any, Dict, List, Tuple, Optional, Set
 from dataclasses import dataclass, field
+
+from components import load_component_processors, build_dispatch_table
+from components.base import ProcessingContext
 
 
 @dataclass
@@ -43,6 +46,13 @@ class GameObject:
     is_prefab_instance: bool = False
     prefab_source_guid: Optional[str] = None
     prefab_name: Optional[str] = None
+    # --- Component processor fields (populated during parse dispatch) ---
+    has_rigidbody: bool = False
+    rigidbody_data: Optional[Dict] = None
+    colliders: List[Dict] = field(default_factory=list)
+    mesh_guid: Optional[str] = None
+    material_guids: List[str] = field(default_factory=list)
+    component_data: Dict[str, Any] = field(default_factory=dict)
 
 
 class PrefabDatabase:
@@ -132,21 +142,29 @@ class PrefabDatabase:
 
 class UnitySceneConverter:
     """Converts Unity scenes to O3DE levels with prefab support"""
-    
-    def __init__(self, prefab_db: PrefabDatabase):
+
+    def __init__(self, prefab_db: PrefabDatabase, log_callback=None):
         self.prefab_db = prefab_db
+        self.log = log_callback or print
         self.game_objects: Dict[str, GameObject] = {}
         self.transforms: Dict[str, Transform] = {}
         self.transform_to_gameobject: Dict[str, str] = {}
         self.entity_counter = 1000000
         self.instance_counter = 1000000
-        
+
         # Track which GameObjects will use prefab references
         self.prefab_references: Dict[str, Path] = {}  # go_id -> prefab_path
         self.missing_prefabs: Set[str] = set()  # Names of prefabs not found
-        
+
         # Track prefab instances from scene
         self.prefab_instances: List[Dict] = []  # List of prefab instance data
+
+        # Component processor pipeline — auto-discovered from components/
+        self.component_processors = load_component_processors()
+        self.component_dispatch   = build_dispatch_table(self.component_processors)
+
+        # Collected component blocks from the scene (anchor -> {type, data})
+        self.components_data: Dict[str, Dict] = {}
     
     def parse_unity_scene(self, scene_path: str) -> None:
         """Parse Unity scene file"""
@@ -156,6 +174,7 @@ class UnitySceneConverter:
         self.prefab_references.clear()
         self.missing_prefabs.clear()
         self.prefab_instances.clear()
+        self.components_data.clear()
         
         with open(scene_path, 'r', encoding='utf-8') as f:
             content = f.read()
@@ -186,11 +205,21 @@ class UnitySceneConverter:
                     self._parse_game_object(doc['GameObject'], anchor, prefab_instance_guids)
                 elif 'PrefabInstance' in doc:
                     self._parse_prefab_instance(doc['PrefabInstance'])
+                else:
+                    # Collect component blocks for the processor pipeline
+                    for known_type in self.component_dispatch:
+                        if known_type in doc:
+                            self.components_data[anchor] = {
+                                'type': known_type,
+                                'data': doc[known_type],
+                            }
+                            break
             
             except yaml.YAMLError:
                 continue
         
         self._build_hierarchy()
+        self._dispatch_component_processors()
         self._resolve_prefab_references()
         self._process_prefab_instances()
     
@@ -387,6 +416,23 @@ class UnitySceneConverter:
                 if child_id in self.game_objects:
                     self.game_objects[child_id].parent_id = file_id
     
+    def _dispatch_component_processors(self) -> None:
+        """Dispatch collected component blocks to processor parse() methods."""
+        for comp_info in self.components_data.values():
+            comp_type = comp_info['type']
+            comp_data = comp_info['data']
+
+            go_ref = comp_data.get('m_GameObject', {})
+            go_id  = str(go_ref.get('fileID', ''))
+
+            if go_id not in self.game_objects:
+                continue
+
+            go = self.game_objects[go_id]
+            processor = self.component_dispatch.get(comp_type)
+            if processor:
+                processor.parse(comp_type, comp_data, go, self.log)
+
     def _resolve_prefab_references(self) -> None:
         """Find existing O3DE prefabs for Unity prefab instances"""
         for go_id, go in self.game_objects.items():
@@ -643,11 +689,53 @@ class UnitySceneConverter:
     def _generate_component_id(self) -> int:
         """Generate unique component ID"""
         return random.randint(1000000000000000, 9999999999999999)
-    
+
     def _generate_entity_id(self) -> str:
         """Generate unique entity ID"""
         self.entity_counter += 1
         return f"Entity_[{self.entity_counter}]"
+
+    def _make_bare_entity(self, entity_id: str, name: str, parent_entity_id: str) -> Dict:
+        """Create a minimal O3DE entity (used by collider processors for overflow child entities)."""
+        return {
+            "Id": entity_id,
+            "Name": name,
+            "Components": {
+                "TransformComponent": {
+                    "$type": "{27F1E1A1-8D9D-4C3B-BD3A-AFB9762449C0} TransformComponent",
+                    "Id": self._generate_component_id(),
+                    "Parent Entity": parent_entity_id
+                },
+                "EditorDisabledCompositionComponent": {
+                    "$type": "EditorDisabledCompositionComponent",
+                    "Id": self._generate_component_id()
+                },
+                "EditorEntityIconComponent": {
+                    "$type": "EditorEntityIconComponent",
+                    "Id": self._generate_component_id()
+                },
+                "EditorInspectorComponent": {
+                    "$type": "EditorInspectorComponent",
+                    "Id": self._generate_component_id()
+                },
+                "EditorLockComponent": {
+                    "$type": "EditorLockComponent",
+                    "Id": self._generate_component_id()
+                },
+                "EditorOnlyEntityComponent": {
+                    "$type": "EditorOnlyEntityComponent",
+                    "Id": self._generate_component_id()
+                },
+                "EditorPendingCompositionComponent": {
+                    "$type": "EditorPendingCompositionComponent",
+                    "Id": self._generate_component_id()
+                },
+                "EditorVisibilityComponent": {
+                    "$type": "EditorVisibilityComponent",
+                    "Id": self._generate_component_id()
+                }
+            }
+        }
     
     def _quaternion_to_euler(self, quaternion: Tuple[float, float, float, float]) -> List[float]:
         """Convert quaternion to Euler angles in degrees"""
@@ -748,26 +836,48 @@ class UnitySceneConverter:
                 "Id": self._generate_component_id(),
                 "Scale": list(o3de_transform.scale)
             }
-        
-        if go.children_ids:
-            child_order = []
-            for child_id in go.children_ids:
-                if child_id in all_game_objects:
-                    child_entity_id = self._create_entity_recursive(
-                        all_game_objects[child_id], all_game_objects,
-                        entities_dict, instances_dict, entity_id_map,
-                        output_base, entity_id
-                    )
-                    if child_entity_id:
-                        child_order.append(child_entity_id)
-            
-            if child_order:
-                entity["Components"]["EditorEntitySortComponent"] = {
-                    "$type": "EditorEntitySortComponent",
-                    "Id": self._generate_component_id(),
-                    "Child Entity Order": child_order
-                }
-        
+
+        # ---------------------------------------------------------------
+        # Component Processors — emit phase (physics, mesh, material, ...)
+        # ---------------------------------------------------------------
+        ctx = ProcessingContext(
+            material_mapping      = {},
+            mesh_mapping          = {},
+            entities_dict         = entities_dict,
+            entity_id_map         = entity_id_map,
+            generate_component_id = self._generate_component_id,
+            generate_entity_id    = self._generate_entity_id,
+            make_bare_entity      = self._make_bare_entity,
+            log                   = self.log,
+        )
+        collider_child_ids: List[str] = []
+        for processor in self.component_processors:
+            child_ids = processor.emit(go, entity, ctx)
+            collider_child_ids.extend(child_ids)
+
+        # ---------------------------------------------------------------
+        # Child entities: GO children + any collider overflow sub-entities
+        # ---------------------------------------------------------------
+        child_order = []
+        for child_id in go.children_ids:
+            if child_id in all_game_objects:
+                child_entity_id = self._create_entity_recursive(
+                    all_game_objects[child_id], all_game_objects,
+                    entities_dict, instances_dict, entity_id_map,
+                    output_base, entity_id
+                )
+                if child_entity_id:
+                    child_order.append(child_entity_id)
+
+        child_order.extend(collider_child_ids)
+
+        if child_order:
+            entity["Components"]["EditorEntitySortComponent"] = {
+                "$type": "EditorEntitySortComponent",
+                "Id": self._generate_component_id(),
+                "Child Entity Order": child_order
+            }
+
         entities_dict[entity_id] = entity
         return entity_id
 
