@@ -4,3 +4,5 @@ TestObjects/*
 __pycache__/*
 converter_settings.json
 .claude/*
+EvaluationAssets/*
+__pycache__/*
