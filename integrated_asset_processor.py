@@ -555,7 +555,7 @@ class IntegratedAssetProcessor:
 
                 for go in entity_list:
                     if go.file_id in node_paths:
-                        group_name = f"{fbx_stem}-{go.name}".lower()
+                        group_name = f"{fbx_stem}-{go.name}"
                         mesh_mapping[go.file_id] = (
                             f"{self.project_name}/meshes/{group_name}.fbx.azmodel"
                         )
