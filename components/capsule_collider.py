@@ -104,9 +104,10 @@ def _write_capsule_shape(components: Dict, collider: Dict,
         capsule_cfg['TranslationOffset'] = offset
 
     components['EditorCapsuleShapeComponent'] = {
-        '$type': 'EditorCapsuleShapeComponent',
-        'Id':    ctx.generate_component_id(),
-        'CapsuleShape': {'Configuration': capsule_cfg},
+        '$type':         'EditorCapsuleShapeComponent',
+        'Id':            ctx.generate_component_id(),
+        'DisplayFilled': False,
+        'CapsuleShape':  {'Configuration': capsule_cfg},
     }
 
     collider_cfg: Dict = {
@@ -118,9 +119,10 @@ def _write_capsule_shape(components: Dict, collider: Dict,
         collider_cfg['Position'] = offset
 
     components['EditorShapeColliderComponent'] = {
-        '$type': 'EditorShapeColliderComponent',
-        'Id':    ctx.generate_component_id(),
+        '$type':                 'EditorShapeColliderComponent',
+        'Id':                    ctx.generate_component_id(),
         'ColliderConfiguration': collider_cfg,
+        'DebugDrawSettings':     {'LocallyEnabled': False},
         'ShapeConfigs': [{
             '$type':  'CapsuleShapeConfiguration',
             'Height': height,

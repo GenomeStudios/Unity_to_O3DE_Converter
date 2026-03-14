@@ -96,9 +96,10 @@ def _write_sphere_shape(components: Dict, collider: Dict,
         sphere_cfg['TranslationOffset'] = offset
 
     components['EditorSphereShapeComponent'] = {
-        '$type': 'EditorSphereShapeComponent',
-        'Id':    ctx.generate_component_id(),
-        'SphereShape': {'Configuration': sphere_cfg},
+        '$type':         'EditorSphereShapeComponent',
+        'Id':            ctx.generate_component_id(),
+        'DisplayFilled': False,
+        'SphereShape':   {'Configuration': sphere_cfg},
     }
 
     collider_cfg: Dict = {
@@ -110,8 +111,9 @@ def _write_sphere_shape(components: Dict, collider: Dict,
         collider_cfg['Position'] = offset
 
     components['EditorShapeColliderComponent'] = {
-        '$type': 'EditorShapeColliderComponent',
-        'Id':    ctx.generate_component_id(),
+        '$type':                 'EditorShapeColliderComponent',
+        'Id':                    ctx.generate_component_id(),
         'ColliderConfiguration': collider_cfg,
+        'DebugDrawSettings':     {'LocallyEnabled': False},
         'ShapeConfigs': [{'$type': 'SphereShapeConfiguration', 'Radius': radius}],
     }

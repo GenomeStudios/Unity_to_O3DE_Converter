@@ -146,14 +146,15 @@ def _write_box_shape(components: Dict, collider: Dict,
     sx, sy, sz = collider.get('size', (1, 1, 1))
     dims       = [sx, sz, sy]           # swap Y/Z axes
 
-    box_cfg: Dict = {'Dimensions': dims}
+    box_cfg: Dict = {'IsFilled': False, 'Dimensions': dims}
     if has_offset:
         box_cfg['TranslationOffset'] = offset
 
     components['EditorBoxShapeComponent'] = {
-        '$type': 'EditorBoxShapeComponent',
-        'Id':    ctx.generate_component_id(),
-        'BoxShape': {'Configuration': box_cfg},
+        '$type':         'EditorBoxShapeComponent',
+        'Id':            ctx.generate_component_id(),
+        'DisplayFilled': False,
+        'BoxShape':      {'Configuration': box_cfg},
     }
 
     collider_cfg: Dict = {
@@ -165,8 +166,9 @@ def _write_box_shape(components: Dict, collider: Dict,
         collider_cfg['Position'] = offset
 
     components['EditorShapeColliderComponent'] = {
-        '$type': 'EditorShapeColliderComponent',
-        'Id':    ctx.generate_component_id(),
+        '$type':                 'EditorShapeColliderComponent',
+        'Id':                    ctx.generate_component_id(),
         'ColliderConfiguration': collider_cfg,
-        'ShapeConfigs': [{'$type': 'BoxShapeConfiguration', 'Configuration': dims}],
+        'DebugDrawSettings':     {'LocallyEnabled': False},
+        'ShapeConfigs':          [{'$type': 'BoxShapeConfiguration', 'Configuration': dims}],
     }

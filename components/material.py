@@ -46,9 +46,10 @@ class MaterialComponentProcessor(ComponentProcessor):
             slot_id  = f'{{{idx}}}'
 
             if mat_path:
-                materials_config[slot_id] = {
-                    'MaterialAsset': {'assetHint': mat_path}
-                }
+                slot_entry = {'MaterialAsset': {'assetHint': mat_path}}
+                if idx == 0:
+                    materials_config['{}'] = slot_entry
+                materials_config[slot_id] = slot_entry
                 ctx.log(f"  [Material] ✓ Slot {slot_id} → {mat_path}")
                 mapped += 1
             else:
