@@ -19,7 +19,7 @@ The converter operates in two stages, each accessible from a tab in the unified 
 Scrubs a Unity Assets folder for `.prefab` files. Each prefab serves as the dependency anchor for discovering every mesh, texture, and material it references. Those assets are converted into O3DE-ready equivalents and written to a clean output folder structure. The resulting `.prefab` files are pre-configured with correct material, mesh, and physics component references.
 
 **Stage 2 — Scene Converter**
-Takes a Unity `.unity` scene file and cross-references it against the library of converted O3DE prefabs. It populates an O3DE level with matching prefab instances, preserving placement transforms and hierarchy structure.
+Takes a Unity `.unity` scene file and cross-references it against the library of converted O3DE prefabs. It populates an O3DE level with matching prefab instances, preserving placement transforms and hierarchy structure. GameObjects that do not resolve to a known prefab ("unowned" entities) are written as plain O3DE entities and run through the same component processor pipeline as Stage 1 — physics colliders, rigidbodies, and directional lights are emitted directly onto those entities.
 
 ---
 
@@ -83,6 +83,9 @@ Last-used paths are automatically saved and restored between sessions via `conve
 | Multiple colliders on one GO | Overflow → child entities `{Name}_Collider_N` | Working |
 | Nested prefab instances | Nested instance references | Working |
 | Scene placement + rotation | Prefab instance transforms in level | Working |
+| Unowned scene entities — physics | BoxCollider / Rigidbody / StaticRigidBody emitted directly | Working |
+| Unowned scene entities — directional light | EditorDirectionalLightComponent emitted directly | Working |
+| Directional light (type=1) | EditorDirectionalLightComponent (intensity, shadows) + 180° pitch correction | Working |
 | Mesh pivot / coordinate rebake | — | Known issue (see below) |
 
 ---
@@ -115,7 +118,8 @@ unity_to_o3de_converter/
     box_collider.py  weight=100    BoxCollider
     sphere_collider.py  weight=125 SphereCollider
     capsule_collider.py weight=150 CapsuleCollider
-    mesh_collider.py    weight=175 MeshCollider
+    mesh_collider.py       weight=175 MeshCollider
+    directional_light.py   weight=500 Directional light (runs last; modifies transform)
 
   legacy_unity_prefab_to_o3de.py   Legacy — ignore
   bake_fbx_transforms.py           Legacy — ignore
@@ -317,7 +321,10 @@ Save this as `components/light.py` with `WEIGHT = 200` and it will be live on th
 
 ## Change Log
 
-**2026-03-14**
+**2026-03-14 (latest)**
+- **Scene converter — component processing for unowned entities**: GameObjects in a Unity scene that are not resolved as prefab instances now run the full component processor pipeline. Physics (colliders, rigidbodies) and directional lights are emitted onto those entities. `GameObject` dataclass extended with processor fields; `_dispatch_component_processors()` and `_make_bare_entity()` added to `UnitySceneConverter`
+- **Directional light processor** (`components/directional_light.py`, weight=500): converts Unity `Light` (type=1) to `EditorDirectionalLightComponent`; applies a 180° pitch flip to the entity transform on emit to correct the forward-axis mismatch between Unity and O3DE; `_to_int()` helper handles `m_Shadows`/`m_Type` being serialized as nested dicts in scene files vs plain ints in prefab files; runs at weight 500 (after all other processors) so it can safely modify the already-written TransformComponent
+- Shape components now emit with `DisplayFilled: false` / `IsFilled: false`; shape colliders emit with `DebugDrawSettings: {LocallyEnabled: false}`
 - Removed X-axis inversion from coordinate conversion — position is now `(x, z, y)`, rotation `(qx, qz, qy, qw)`; same fix applied to all shape collider center offsets
 - FBX `.assetinfo` generation: per-entity named MeshGroups, `selectedNodes` always begins with `"RootNode"`, binary FBX parser (`read_fbx_hierarchy`) extracts sub-objects (UV channels, vertex color layers, material nodes)
 - Multi-material slot format confirmed: `EditorMaterialComponent` emits `{}` default slot followed by indexed `{0}`, `{1}`, ... slots preserving Unity MeshRenderer order

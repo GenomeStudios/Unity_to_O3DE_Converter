@@ -18,7 +18,7 @@ Two-stage automated converter: Unity graphical assets/prefabs → O3DE prefabs, 
 - **YAML parsing**: parses Unity prefab multi-doc YAML (anchors pattern), extracts GameObject, Transform, MeshFilter, MeshRenderer, Rigidbody, BoxCollider, SphereCollider, CapsuleCollider, MeshCollider, PrefabInstance
 - **Hierarchy building**: resolves transform→GameObject IDs, builds bidirectional parent/child tree
 - **Component processor system**: auto-discovered, WEIGHT-ordered plugin modules in `components/` directory
-  - `mesh.py` (25), `material.py` (50), `rigidbody.py` (75), `box_collider.py` (100), `sphere_collider.py` (125), `capsule_collider.py` (150), `mesh_collider.py` (175)
+  - `mesh.py` (25), `material.py` (50), `rigidbody.py` (75), `box_collider.py` (100), `sphere_collider.py` (125), `capsule_collider.py` (150), `mesh_collider.py` (175), `directional_light.py` (500)
 - **Texture scraping**: copies textures to `Textures/` output dir, tracks by GUID
 - **Mesh scraping**: copies FBX/mesh files to `Meshes/` output dir
 - **Material pipeline**:
@@ -37,6 +37,14 @@ Two-stage automated converter: Unity graphical assets/prefabs → O3DE prefabs, 
   - `write_fbx_assetinfo`: writes Y-up CoordinateSystemRule, selectedNodes always starts with `"RootNode"`
   - `read_fbx_hierarchy` (binary FBX parser): extracts Model/Geometry/Material/LayerElement sub-objects (UV channels, vertex color layers) for full selectedNodes lists
   - Sub-object path detection wired; full integration of hierarchy sub-paths still in progress
+- **Shape component defaults**: `EditorBoxShapeComponent` emits `DisplayFilled: false` + `IsFilled: false`; all shape colliders emit `DebugDrawSettings: {LocallyEnabled: false}`
+
+### Directional Light (`directional_light.py`, weight=500)
+- Handles Unity `Light` component with `m_Type == 1` (Directional)
+- Emits `AZ::Render::EditorDirectionalLightComponent` with intensity and shadow enabled flag
+- **Runs at weight 500** (after all other processors) so it can safely modify the entity's TransformComponent
+- **Pitch inversion**: applies 180° pitch flip to the TransformComponent rotation on emit — corrects the forward-axis mismatch between Unity and O3DE directional lights (without this, light shines from below)
+- **Scene-safe parsing**: `m_Shadows` and `m_Type` may be plain ints (prefab files) or nested dicts (scene files); `_to_int()` helper handles both formats
 
 ### Coordinate Conversion (CORRECTED as of 2026-03-14)
 Unity → O3DE axis swap:
@@ -73,10 +81,19 @@ Previous versions negated X; this was incorrect and has been removed from:
 - **Level generation**: `create_o3de_level` builds O3DE `.prefab`-format level JSON, placing matched prefabs as instances with transforms
 - **Coordinate conversion**: same formula as Stage 1 (`x, z, y` / `qx, qz, qy, qw`)
 - **Settings persistence**: saves scene path, output path, prefab directory list
+- **Component processor pipeline on unowned entities**: scene entities that are NOT resolved as prefab instances now run the full component processor pipeline (same as Stage 1):
+  - During parse: component blocks (BoxCollider, Rigidbody, Light, etc.) collected and dispatched to `processor.parse()`
+  - During emit: `processor.emit()` called on every non-prefab entity; physics, directional light, and any other registered processor components are written
+  - `GameObject` dataclass extended with `has_rigidbody`, `colliders`, `mesh_guid`, `material_guids`, `component_data` fields
+  - Mesh and material emit silently skipped (no AssetDatabase in scene converter); physics and light fully functional
+  - `_make_bare_entity()` added to support overflow collider child entity creation
+  - Log callback wired through from GUI to convertor and into ProcessingContext
+- **Scene-file robustness**: `_to_int()` in `directional_light.py` handles Unity scene files serializing `m_Shadows` / `m_Type` as nested dicts instead of plain ints
 
 ### Known Issues ✗
 - **~Matches "nearly all"** prefabs — some prefabs go unmatched (tracked in `missing_prefabs` set)
 - Coordinate issue from Stage 1 propagates here
+- Mesh/material components not emitted for unowned entities (no asset DB; requires future integration)
 
 ---
 
@@ -102,3 +119,4 @@ GameObject: file_id, name, transform, components, parent_id, children_ids,
 2. Debug/verify collider shape offset pipeline end-to-end
 3. Finalize material pipeline (specular workflow, detail maps)
 4. Non-uniform scale end-to-end verification
+5. Add AssetDatabase support to scene converter for mesh/material emit on unowned entities
