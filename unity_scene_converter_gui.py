@@ -1,24 +1,23 @@
 #!/usr/bin/env python3
 """
-Unity to O3DE Scene Converter - GUI Edition
+Unity to O3DE Scene Converter — Core
 
 Converts Unity scenes to O3DE levels with prefab reference support.
 Searches provided directories for existing O3DE prefabs and references them.
+
+GUI has moved to main_app.py (PySide6 unified interface).
+Run:  python main_app.py
 """
 
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
 import yaml
 import json
 import os
 import re
 import math
+import random
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Set
 from dataclasses import dataclass, field
-import threading
-import queue
-import random
 
 
 @dataclass
@@ -466,13 +465,13 @@ class UnitySceneConverter:
     def convert_to_o3de_coordinates(self, unity_transform: Transform) -> Tuple[Transform, bool]:
         """Convert Unity transform to O3DE coordinate system"""
         o3de_pos = (
-            -unity_transform.position[0],
+            unity_transform.position[0],
             unity_transform.position[2],
             unity_transform.position[1]
         )
-        
+
         qx, qy, qz, qw = unity_transform.rotation
-        o3de_rot = (-qx, qz, qy, qw)
+        o3de_rot = (qx, qz, qy, qw)
         
         o3de_scale = (
             unity_transform.scale[0],
@@ -776,8 +775,12 @@ class UnitySceneConverter:
 SETTINGS_FILE = Path(__file__).parent / "converter_settings.json"
 
 
+# =============================================================================
+# GUI has moved to main_app.py (PySide6 unified interface).
+# =============================================================================
+
 class SceneConverterGUI:
-    """GUI for Unity to O3DE Scene Converter"""
+    """Retained for reference only — replaced by SceneConverterTab in main_app.py."""
 
     def __init__(self, root):
         self.root = root
@@ -1060,9 +1063,11 @@ class SceneConverterGUI:
 
 
 def main():
-    root = tk.Tk()
-    app = SceneConverterGUI(root)
-    root.mainloop()
+    """Launch the unified PySide6 GUI, opening directly on the Scene tab."""
+    import sys
+    from main_app import main as app_main
+    sys.argv.append('--tab=scene')
+    app_main()
 
 
 if __name__ == '__main__':

@@ -2,24 +2,26 @@
 """
 Integrated Unity Prefab + Material Asset Processor
 
-Reads Unity prefabs, finds referenced materials, generates O3DE materials with textures,
-and copies everything to a homogenized folder structure.
+Reads Unity prefabs, finds referenced materials, generates O3DE materials
+with textures, and copies everything to a homogenised folder structure.
+
+Component processing is handled by auto-discovered modules in components/.
+Add or remove processors by dropping files into that directory.
 """
 
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
 import yaml
 import json
 import os
 import re
 import shutil
 import math
-import subprocess
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Set
-from dataclasses import dataclass, field
-import threading
 import random
+from pathlib import Path
+from typing import Any, Dict, List, Tuple, Optional, Set
+from dataclasses import dataclass, field
+
+from components import load_component_processors, build_dispatch_table
+from components.base import ProcessingContext
 
 
 @dataclass
@@ -58,6 +60,7 @@ class GameObject:
     colliders: List[Dict] = field(default_factory=list)
     is_prefab_instance: bool = False
     prefab_source_guid: Optional[str] = None
+    component_data: Dict[str, Any] = field(default_factory=dict)  # processor-specific state
 
 
 class AssetDatabase:
@@ -228,100 +231,208 @@ class AssetDatabase:
         return extracted
 
 
-# ===================================================================
-#  Blender Integration — FBX Transform Baking
-# ===================================================================
 
-# Common Blender install locations (Windows)
-_BLENDER_SEARCH_PATHS = [
-    Path(os.environ.get("PROGRAMFILES", "C:/Program Files")) / "Blender Foundation",
-    Path(os.environ.get("PROGRAMFILES(X86)", "C:/Program Files (x86)")) / "Blender Foundation",
-    Path(os.environ.get("LOCALAPPDATA", "")) / "Blender Foundation",
-]
+# ---------------------------------------------------------------------------
+# FBX UTILITIES  (axis detection + mesh node name extraction)
+# ---------------------------------------------------------------------------
 
-# Path to the bake script shipped alongside this file
-_BAKE_SCRIPT = Path(__file__).parent / "bake_fbx_transforms.py"
+def read_fbx_mesh_node_names(fbx_path: Path) -> List[str]:
+    """Extract mesh node names from a binary FBX file.
 
+    In binary FBX, each scene object is stored as a Model property string
+    with the format  "NodeName\\x00\\x01Model".  Scanning backwards from
+    that separator gives the node name.
 
-def find_blender() -> Optional[Path]:
-    """Auto-detect a Blender installation on this machine.
-
-    Checks PATH first, then common install directories.
-    Returns the full path to blender.exe or None.
+    Returns a list of unique node names found, in file order.
+    Returns [] for non-binary or unreadable FBX files.
     """
-    # 1. Check PATH
-    path_dirs = os.environ.get("PATH", "").split(os.pathsep)
-    for d in path_dirs:
-        candidate = Path(d) / "blender.exe"
-        if candidate.is_file():
-            return candidate
-
-    # 2. Search common install folders (pick newest version)
-    candidates: list[Path] = []
-    for search_root in _BLENDER_SEARCH_PATHS:
-        if not search_root.is_dir():
-            continue
-        for version_dir in search_root.iterdir():
-            exe = version_dir / "blender.exe"
-            if exe.is_file():
-                candidates.append(exe)
-
-    if candidates:
-        candidates.sort(key=lambda p: p.parent.name, reverse=True)
-        return candidates[0]
-
-    return None
-
-
-def validate_blender(blender_path: Optional[str]) -> Optional[Path]:
-    """Return a valid Path to blender.exe, or None."""
-    if not blender_path:
-        return None
-    p = Path(blender_path)
-    if p.is_file() and p.name.lower() in ("blender.exe", "blender"):
-        return p
-    return None
-
-
-def bake_fbx_with_blender(blender_exe: Path, input_fbx: Path,
-                           output_fbx: Path, log=print) -> bool:
-    """Run the Blender bake script on a single FBX file.
-
-    Returns True on success.
-    """
-    cmd = [
-        str(blender_exe),
-        "--background",
-        "--python", str(_BAKE_SCRIPT),
-        "--",
-        str(input_fbx),
-        str(output_fbx),
-    ]
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=120
-        )
-        if result.returncode != 0:
-            log(f"      [Blender] stderr: {result.stderr.strip()}")
-            return False
-        return True
-    except subprocess.TimeoutExpired:
-        log("      [Blender] Timed out after 120 s")
-        return False
-    except FileNotFoundError:
-        log(f"      [Blender] Executable not found: {blender_exe}")
-        return False
+        with open(fbx_path, 'rb') as f:
+            data = f.read(262144)   # 256 KB covers node table for all common FBX files
+    except Exception:
+        return []
+
+    if data[:20] != b'Kaydara FBX Binary  ':
+        return []
+
+    names: List[str] = []
+    marker = b'\x00\x01Model'
+    pos = 0
+    while True:
+        idx = data.find(marker, pos)
+        if idx < 0:
+            break
+        # Walk backwards collecting printable ASCII bytes — that's the node name
+        end = idx
+        start = end
+        while start > 0 and 0x20 <= data[start - 1] <= 0x7E:
+            start -= 1
+        name = data[start:end].decode('ascii', errors='ignore').strip()
+        if len(name) >= 2 and name not in names:
+            names.append(name)
+        pos = idx + len(marker)
+
+    return names
+
+
+def read_fbx_up_axis(fbx_path: Path) -> int:
+    """Read UpAxis from an FBX binary file's GlobalSettings block.
+
+    FBX binary encodes: \x06\x00\x00\x00UpAxis ... I <int32 value>
+    Value 1 = Y-up (Maya-style), 2 = Z-up (Blender-style), -1 = unknown.
+
+    O3DE is Z-up.  Y-up FBX files need a coordinate correction sidecar so
+    that O3DE's asset processor imports them in the correct orientation.
+    """
+    try:
+        with open(fbx_path, 'rb') as f:
+            data = f.read(65536)  # GlobalSettings appears near the top
+
+        gs_pos = data.find(b'GlobalSettings')
+        if gs_pos < 0:
+            return -1
+
+        # Binary FBX stores string "UpAxis" as: uint32-length(6) + "UpAxis"
+        up_pos = data.find(b'\x06\x00\x00\x00UpAxis', gs_pos)
+        if up_pos < 0:
+            return -1
+
+        # After the 10-byte prefix, the P-record continues:
+        #   S + uint32(3) + "int" + S + uint32(7) + "Integer" + S + uint32(0)
+        # then type marker 'I' (0x49) + int32 little-endian value.
+        # Scan the next 60 bytes for: 0x49 + [0-2] + 0x00 0x00 0x00
+        chunk = data[up_pos + 10 : up_pos + 70]
+        for i in range(len(chunk) - 4):
+            if (chunk[i] == 0x49
+                    and chunk[i + 2] == 0
+                    and chunk[i + 3] == 0
+                    and chunk[i + 4] == 0):
+                val = chunk[i + 1]
+                if 0 <= val <= 2:
+                    return val
+        return -1
+
+    except Exception:
+        return -1
+
+
+def build_fbx_node_paths(mesh_entities: list, all_game_objects: dict,
+                          fbx_stem: str, fbx_node_names: List[str]) -> dict:
+    """Derive FBX node paths from the Unity prefab hierarchy.
+
+    Uses actual FBX node names (read from the binary FBX) for the path
+    segments, not GO names — GO names can differ from FBX node names.
+
+    Matching strategy per entity:
+      1. Exact name match between go.name and a known FBX node name.
+      2. Single-entity + single-node fallback: use the one available node.
+      3. No match: fall back to go.name with a warning (may not resolve in O3DE).
+
+    Returns {entity_file_id: "RootNode.ActualFBXNodeName[.Child...]"}.
+    """
+    mesh_ids = {go.file_id for go in mesh_entities}
+    fbx_node_set = set(fbx_node_names)
+
+    # Root of this FBX group = entity whose parent is not in the group
+    root_go = next(
+        (go for go in mesh_entities if go.parent_id not in mesh_ids),
+        mesh_entities[0]
+    )
+
+    result = {}
+
+    def resolve_node_name(go_name: str) -> str:
+        """Map a GO name to the best available FBX node name."""
+        if go_name in fbx_node_set:
+            return go_name
+        # Single entity, single FBX node — unambiguous fallback
+        if len(mesh_entities) == 1 and len(fbx_node_names) == 1:
+            return fbx_node_names[0]
+        return go_name   # best-effort; O3DE may not find it
+
+    def recurse(go, parent_path):
+        node_name = resolve_node_name(go.name)
+        node_path = f"{parent_path}.{node_name}"
+        result[go.file_id] = node_path
+        for child_id in go.children_ids:
+            child = all_game_objects.get(child_id)
+            if child and child.file_id in mesh_ids:
+                recurse(child, node_path)
+
+    recurse(root_go, "RootNode")
+    return result
+
+
+def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
+                         entity_node_map: dict, log=print) -> None:
+    """Write an O3DE .assetinfo with one named MeshGroup per mesh entity.
+
+    Group name format: "{fbx_stem}-{entity_name}"  e.g. "Closet_A-Glass_L"
+    O3DE lowercases the output: closet_a-glass_l.fbx.azmodel
+
+    Each group selects exactly its FBX node; all other mesh nodes are unselected.
+    Rules mirror O3DE's auto-generated defaults: StaticMeshAdvancedRule (vertex color Col0),
+    MaterialRule, CoordinateSystemRule (useAdvancedData=true), and LodRule.
+    Y-up FBX files (Maya-style, up_axis==1) get a 90° pitch rotation baked into
+    the CoordinateSystemRule so the mesh imports upright without a transform workaround.
+    """
+    import json as _json
+    import uuid as _uuid
+
+    # Detect Y-up FBX — up_axis==1 means Y-up (Maya), 2 means Z-up (matches O3DE)
+    up_axis = read_fbx_up_axis(fbx_dest_path)
+    is_y_up = (up_axis == 1)
+    if is_y_up:
+        log(f"    [Mesh] Y-up detected — adding 90° pitch to CoordinateSystemRule")
+
+    # Quaternion for 90° rotation around X axis (Y-up → Z-up correction)
+    Y_UP_ROTATION = [0.7071067690849304, 0.0, 0.0, 0.7071067094802856]
+
+    coordinate_rule = {"$type": "CoordinateSystemRule", "useAdvancedData": True}
+    if is_y_up:
+        coordinate_rule["rotation"] = Y_UP_ROTATION
+
+    all_node_paths = list(entity_node_map.values())
+    groups = []
+
+    for entity_name, node_path in entity_node_map.items():
+        group_name = f"{fbx_stem}-{entity_name}"
+        unselected = [p for p in all_node_paths if p != node_path]
+        groups.append({
+            "$type": "{07B356B7-3635-40B5-878A-FAC4EFD5AD86} MeshGroup",
+            "name": group_name,
+            "nodeSelectionList": {
+                "selectedNodes": ["RootNode", node_path],
+                "unselectedNodes": unselected
+            },
+            "rules": {
+                "rules": [
+                    {"$type": "StaticMeshAdvancedRule", "vertexColorStreamName": "Col0"},
+                    {"$type": "MaterialRule"},
+                    coordinate_rule,
+                    {"$type": "{6E796AC8-1484-4909-860A-6D3F22A7346F} LodRule"}
+                ]
+            },
+            "id": "{" + str(_uuid.uuid4()).upper() + "}"
+        })
+
+    sidecar = Path(str(fbx_dest_path) + ".assetinfo")
+    try:
+        with open(sidecar, 'w', encoding='utf-8') as f:
+            _json.dump({"values": groups}, f, indent=4)
+        log(f"    [Mesh] .assetinfo written — {len(groups)} group(s) ({sidecar.name})")
+    except Exception as e:
+        log(f"    [Mesh] WARNING: Could not write .assetinfo: {e}")
 
 
 class IntegratedAssetProcessor:
     """Processes Unity prefabs with materials to O3DE format"""
     
     def __init__(self, unity_assets_root: Path, output_root: Path,
-                 log_callback=None, blender_path: Optional[Path] = None):
+                 log_callback=None):
         self.unity_assets_root = unity_assets_root
         self.output_root = output_root
         self.log = log_callback or print
-        self.blender_path = blender_path
 
         self.asset_db = AssetDatabase(unity_assets_root)
         
@@ -340,17 +451,22 @@ class IntegratedAssetProcessor:
         # Track processed assets
         self.processed_materials: Dict[str, str] = {}  # guid -> output_path
         self.processed_textures: Dict[str, str] = {}  # guid -> output_path
-        self.processed_meshes: Dict[str, str] = {}  # guid -> output_path
+        self.processed_meshes: Dict[str, Path] = {}  # guid -> output Path
         self.processed_prefabs: Set[str] = set()  # Track processed prefab GUIDs
 
         # Physics stats
         self.total_colliders = 0
         self.total_rigidbodies = 0
-        
+
         # Get project folder name for asset hints (lowercase)
         self.project_name = output_root.name.lower()
-        
+
         self.entity_id_counter = 1000000
+
+        # Component processor registry — auto-discovered from components/
+        self.component_processors = load_component_processors(self.log)
+        self.component_dispatch   = build_dispatch_table(self.component_processors)
+        self.log(f"  Registered {len(self.component_processors)} component processor(s)")
     
     def process_prefab(self, prefab_path: Path) -> bool:
         """Process a single Unity prefab"""
@@ -402,12 +518,47 @@ class IntegratedAssetProcessor:
                     if o3de_mat_path:
                         material_mapping[mat_guid] = o3de_mat_path
             
-            mesh_mapping = {}
+            # --- Copy FBX files to output ---
+            fbx_output_paths = {}   # {mesh_guid: Path}
             for mesh_guid in all_mesh_guids:
                 if mesh_guid:
-                    o3de_mesh_path = self._process_mesh(mesh_guid)
-                    if o3de_mesh_path:
-                        mesh_mapping[mesh_guid] = o3de_mesh_path
+                    out_path = self._process_mesh(mesh_guid)
+                    if out_path:
+                        fbx_output_paths[mesh_guid] = out_path
+
+            # --- Build per-entity mesh hints + write .assetinfo ---
+            # mesh_mapping keyed by entity file_id (not guid) so each entity
+            # gets its own named sub-mesh rather than the combined FBX model.
+            mesh_mapping = {}   # {entity_file_id: assetHint}
+
+            from collections import defaultdict
+            entities_by_guid = defaultdict(list)
+            for go in game_objects.values():
+                if go.mesh_guid and go.mesh_guid in fbx_output_paths:
+                    entities_by_guid[go.mesh_guid].append(go)
+
+            for mesh_guid, entity_list in entities_by_guid.items():
+                fbx_path = fbx_output_paths[mesh_guid]
+                fbx_stem = fbx_path.name.rsplit('.', 1)[0]  # "Closet_A.FBX" → "Closet_A"
+
+                # Read actual mesh node names from the FBX binary
+                fbx_node_names = read_fbx_mesh_node_names(fbx_path)
+                self.log(f"    [Mesh] FBX nodes found: {fbx_node_names}")
+
+                node_paths = build_fbx_node_paths(entity_list, game_objects, fbx_stem, fbx_node_names)
+                entity_node_map = {
+                    go.name: node_paths[go.file_id]
+                    for go in entity_list if go.file_id in node_paths
+                }
+
+                write_fbx_assetinfo(fbx_path, fbx_stem, entity_node_map, self.log)
+
+                for go in entity_list:
+                    if go.file_id in node_paths:
+                        group_name = f"{fbx_stem}-{go.name}".lower()
+                        mesh_mapping[go.file_id] = (
+                            f"{self.project_name}/meshes/{group_name}.fbx.azmodel"
+                        )
             
             # Create O3DE prefab
             output_name = prefab_path.stem
@@ -456,23 +607,14 @@ class IntegratedAssetProcessor:
                 elif 'GameObject' in doc:
                     self._parse_game_object(doc['GameObject'], anchor, game_objects, transform_to_gameobject)
                 elif 'PrefabInstance' in doc:
-                    # In Unity prefabs, PrefabInstance blocks represent nested prefabs
-                    # We need to create a GameObject for each one
+                    # PrefabInstance blocks represent nested prefabs
                     self._parse_prefab_instance_in_prefab(doc['PrefabInstance'], anchor, game_objects, transform_to_gameobject)
-                elif 'MeshFilter' in doc:
-                    components_data[anchor] = {'type': 'MeshFilter', 'data': doc['MeshFilter']}
-                elif 'MeshRenderer' in doc:
-                    components_data[anchor] = {'type': 'MeshRenderer', 'data': doc['MeshRenderer']}
-                elif 'Rigidbody' in doc:
-                    components_data[anchor] = {'type': 'Rigidbody', 'data': doc['Rigidbody']}
-                elif 'BoxCollider' in doc:
-                    components_data[anchor] = {'type': 'BoxCollider', 'data': doc['BoxCollider']}
-                elif 'SphereCollider' in doc:
-                    components_data[anchor] = {'type': 'SphereCollider', 'data': doc['SphereCollider']}
-                elif 'CapsuleCollider' in doc:
-                    components_data[anchor] = {'type': 'CapsuleCollider', 'data': doc['CapsuleCollider']}
-                elif 'MeshCollider' in doc:
-                    components_data[anchor] = {'type': 'MeshCollider', 'data': doc['MeshCollider']}
+                else:
+                    # Dispatch to registered component processors
+                    for known_type in self.component_dispatch:
+                        if known_type in doc:
+                            components_data[anchor] = {'type': known_type, 'data': doc[known_type]}
+                            break
             
             except yaml.YAMLError:
                 continue
@@ -659,72 +801,27 @@ class IntegratedAssetProcessor:
                 if file_id not in parent_go.children_ids:
                     parent_go.children_ids.append(file_id)
         
-        # Assign component data (simplified - looking for material GUIDs)
+        # Dispatch each component to its registered processor's parse() method
         for comp_id, comp_info in components_data.items():
             comp_type = comp_info.get('type')
             comp_data = comp_info.get('data', {})
-            
-            # Find which GameObject this component belongs to
+
             go_ref = comp_data.get('m_GameObject', {})
-            go_id = str(go_ref.get('fileID', ''))
-            
-            if go_id in game_objects:
-                go = game_objects[go_id]
-                
-                if comp_type == 'MeshRenderer':
-                    materials = comp_data.get('m_Materials', [])
-                    for mat_ref in materials:
-                        guid = mat_ref.get('guid', '')
-                        if guid:
-                            go.material_guids.append(guid)
-                
-                elif comp_type == 'MeshFilter':
-                    mesh_ref = comp_data.get('m_Mesh', {})
-                    guid = mesh_ref.get('guid', '')
-                    if guid:
-                        go.mesh_guid = guid
-                
-                elif comp_type == 'Rigidbody':
-                    go.has_rigidbody = True
-                    go.rigidbody_data = {
-                        'mass': comp_data.get('m_Mass', 1.0),
-                        'drag': comp_data.get('m_Drag', 0.0),
-                        'angular_drag': comp_data.get('m_AngularDrag', 0.05),
-                        'use_gravity': comp_data.get('m_UseGravity', 1) == 1,
-                        'is_kinematic': comp_data.get('m_IsKinematic', 0) == 1,
-                        'constraints': comp_data.get('m_Constraints', 0),
-                    }
-                
-                elif comp_type in ['BoxCollider', 'SphereCollider', 'CapsuleCollider', 'MeshCollider']:
-                    collider_info = {'type': comp_type}
-                    collider_info.update(self._parse_collider_data(comp_data, comp_type))
-                    go.colliders.append(collider_info)
+            go_id  = str(go_ref.get('fileID', ''))
+
+            if go_id not in game_objects:
+                self.log(f"  [Hierarchy] ⚠ Component '{comp_type}' references unknown GO id={go_id}")
+                continue
+
+            go = game_objects[go_id]
+
+            processor = self.component_dispatch.get(comp_type)
+            if processor:
+                self.log(f"  [Hierarchy] Parsing {comp_type} on '{go.name}'")
+                processor.parse(comp_type, comp_data, go, self.log)
+            else:
+                self.log(f"  [Hierarchy] ⚠ No processor for component type '{comp_type}' — skipped")
     
-    def _parse_collider_data(self, comp_data: Dict, comp_type: str) -> Dict:
-        """Parse collider component data"""
-        result = {'is_trigger': comp_data.get('m_IsTrigger', 0) == 1}
-        
-        center = comp_data.get('m_Center', {'x': 0, 'y': 0, 'z': 0})
-        result['center'] = (float(center.get('x', 0)), float(center.get('y', 0)), float(center.get('z', 0)))
-        
-        if comp_type == 'BoxCollider':
-            size = comp_data.get('m_Size', {'x': 1, 'y': 1, 'z': 1})
-            result['size'] = (float(size.get('x', 1)), float(size.get('y', 1)), float(size.get('z', 1)))
-        
-        elif comp_type == 'SphereCollider':
-            result['radius'] = float(comp_data.get('m_Radius', 0.5))
-        
-        elif comp_type == 'CapsuleCollider':
-            result['radius'] = float(comp_data.get('m_Radius', 0.5))
-            result['height'] = float(comp_data.get('m_Height', 2.0))
-            result['direction'] = int(comp_data.get('m_Direction', 1))
-        
-        elif comp_type == 'MeshCollider':
-            mesh_ref = comp_data.get('m_Mesh', {})
-            result['mesh_guid'] = mesh_ref.get('guid', '')
-            result['convex'] = comp_data.get('m_Convex', 0) == 1
-        
-        return result
     
     def _process_material(self, material_guid: str) -> Optional[str]:
         """Process Unity material and create O3DE material"""
@@ -836,46 +933,32 @@ class IntegratedAssetProcessor:
             self.log(f"      ⚠ Failed to copy texture {texture_path.name}: {e}")
             return None
     
-    def _process_mesh(self, mesh_guid: str) -> Optional[str]:
-        """Process mesh — copy to output, optionally bake transforms via Blender."""
+    def _process_mesh(self, mesh_guid: str) -> Optional[Path]:
+        """Process mesh — copy to output directory. Returns output Path or None."""
         if mesh_guid in self.processed_meshes:
-            return self.processed_meshes[mesh_guid]
+            cached = self.processed_meshes[mesh_guid]
+            # Return Path if cached, or None
+            return cached if isinstance(cached, Path) else None
 
         mesh_path = self.asset_db.resolve_guid(mesh_guid)
         if not mesh_path or mesh_path.suffix.lower() not in self.asset_db.mesh_extensions:
             return None
 
         self.log(f"    Processing mesh: {mesh_path.name}")
-
         output_path = self.meshes_dir / mesh_path.name
 
         try:
             if not output_path.exists():
-                # Blender bake: import → apply transforms → re-export
-                if (self.blender_path
-                        and mesh_path.suffix.lower() == '.fbx'):
-                    self.log(f"      Baking transforms via Blender...")
-                    ok = bake_fbx_with_blender(
-                        self.blender_path, mesh_path, output_path, self.log
-                    )
-                    if ok:
-                        self.log(f"      ✓ Baked and exported mesh")
-                    else:
-                        # Fallback: raw copy so the pipeline continues
-                        shutil.copy2(mesh_path, output_path)
-                        self.log(f"      ⚠ Bake failed — raw copy used")
-                else:
-                    shutil.copy2(mesh_path, output_path)
-                    self.log(f"      ✓ Copied mesh file")
+                shutil.copy2(mesh_path, output_path)
+                self.log(f"      Copied mesh file")
             else:
-                self.log(f"      → Mesh already exists")
+                self.log(f"      Mesh already exists")
 
-            asset_hint = f"{self.project_name}/meshes/{output_path.name}.azmodel"
-            self.processed_meshes[mesh_guid] = asset_hint
-            return asset_hint
+            self.processed_meshes[mesh_guid] = output_path
+            return output_path
 
         except Exception as e:
-            self.log(f"      ⚠ Failed to process mesh {mesh_path.name}: {e}")
+            self.log(f"      Failed to process mesh {mesh_path.name}: {e}")
             return None
     
     
@@ -914,9 +997,9 @@ class IntegratedAssetProcessor:
     
     def _convert_to_o3de_coordinates(self, unity_transform: Transform) -> Tuple[Transform, bool]:
         """Convert Unity transform to O3DE coordinate system"""
-        o3de_pos = (-unity_transform.position[0], unity_transform.position[2], unity_transform.position[1])
+        o3de_pos = (unity_transform.position[0], unity_transform.position[2], unity_transform.position[1])
         qx, qy, qz, qw = unity_transform.rotation
-        o3de_rot = (-qx, qz, qy, qw)
+        o3de_rot = (qx, qz, qy, qw)
         o3de_scale = (unity_transform.scale[0], unity_transform.scale[2], unity_transform.scale[1])
         converted = Transform(o3de_pos, o3de_rot, o3de_scale)
         return converted, not converted.is_uniform_scale()
@@ -1054,113 +1137,7 @@ class IntegratedAssetProcessor:
         }
     
     # ===================================================================
-    #  PhysX Component Generation
-    # ===================================================================
-
-    def _create_physx_components(self, go: GameObject, entity: Dict,
-                                 mesh_mapping: Dict,
-                                 entities_dict: Dict) -> List[str]:
-        """Add PhysX collider and rigidbody components to an entity.
-
-        O3DE allows only ONE collider per entity. When a Unity GO has
-        multiple colliders, extras become child entities named
-        '{ParentName}_Collider_{N}'.
-
-        Mapping:
-          BoxCollider    -> EditorBoxShapeComponent     + EditorShapeColliderComponent
-          SphereCollider -> EditorSphereShapeComponent   + EditorShapeColliderComponent
-          CapsuleCollider-> EditorCapsuleShapeComponent  + EditorShapeColliderComponent
-          MeshCollider   -> EditorMeshColliderComponent
-          Rigidbody      -> EditorRigidBodyComponent     (dynamic)
-          No Rigidbody   -> EditorStaticRigidBodyComponent (static companion)
-
-        Returns list of child entity IDs created for multi-collider setups.
-        """
-        if not go.colliders and not go.has_rigidbody:
-            return []
-
-        components = entity["Components"]
-        child_entity_ids = []
-
-        # ---------------------------------------------------------------
-        #  Colliders — first on main entity, extras as child entities
-        # ---------------------------------------------------------------
-        for idx, collider in enumerate(go.colliders):
-
-            if idx == 0:
-                target = components
-            else:
-                child_id = self._generate_entity_id()
-                child = self._make_bare_entity(
-                    child_id,
-                    f"{go.name}_Collider_{idx}",
-                    entity["Id"]
-                )
-                child["Components"]["EditorStaticRigidBodyComponent"] = {
-                    "$type": "EditorStaticRigidBodyComponent",
-                    "Id": self._generate_component_id()
-                }
-                entities_dict[child_id] = child
-                child_entity_ids.append(child_id)
-                target = child["Components"]
-
-            col_type = collider['type']
-            cx, cy, cz = collider.get('center', (0, 0, 0))
-            offset = [-cx, cz, cy]  # Unity (x,y,z) -> O3DE (-x,z,y)
-            is_trigger = collider.get('is_trigger', False)
-
-            if col_type == 'MeshCollider':
-                self._add_mesh_collider(target, collider, is_trigger,
-                                        mesh_mapping, go)
-            else:
-                self._add_shape_collider(target, collider, col_type,
-                                         offset, is_trigger)
-            self.total_colliders += 1
-
-        # ---------------------------------------------------------------
-        #  Rigid Body
-        # ---------------------------------------------------------------
-        if go.has_rigidbody:
-            rb = go.rigidbody_data or {}
-            config = {
-                "Mass": float(rb.get('mass', 1.0)),
-                "Linear damping": float(rb.get('drag', 0.0)),
-                "Angular damping": float(rb.get('angular_drag', 0.05)),
-                "Gravity Enabled": rb.get('use_gravity', True),
-            }
-            if rb.get('is_kinematic', False):
-                config["Kinematic"] = True
-
-            # Unity constraint bitmask -> O3DE lock flags
-            # Unity: PosX=2 PosY=4 PosZ=8 RotX=16 RotY=32 RotZ=64
-            # Axis swap: Unity Y -> O3DE Z, Unity Z -> O3DE Y
-            constraints = rb.get('constraints', 0)
-            if constraints:
-                if constraints & 2:  config["Lock Linear X"] = True
-                if constraints & 4:  config["Lock Linear Z"] = True   # Y->Z
-                if constraints & 8:  config["Lock Linear Y"] = True   # Z->Y
-                if constraints & 16: config["Lock Angular X"] = True
-                if constraints & 32: config["Lock Angular Z"] = True  # Y->Z
-                if constraints & 64: config["Lock Angular Y"] = True  # Z->Y
-
-            components["EditorRigidBodyComponent"] = {
-                "$type": "EditorRigidBodyComponent",
-                "Id": self._generate_component_id(),
-                "Configuration": config
-            }
-            self.total_rigidbodies += 1
-
-        elif go.colliders:
-            components["EditorStaticRigidBodyComponent"] = {
-                "$type": "EditorStaticRigidBodyComponent",
-                "Id": self._generate_component_id()
-            }
-            self.total_rigidbodies += 1
-
-        return child_entity_ids
-
-    # ===================================================================
-    #  Collider Helpers
+    #  Entity Helpers
     # ===================================================================
 
     def _make_bare_entity(self, entity_id: str, name: str,
@@ -1204,121 +1181,6 @@ class IntegratedAssetProcessor:
                     "Id": self._generate_component_id()
                 }
             }
-        }
-
-    def _add_mesh_collider(self, components: Dict, collider: Dict,
-                           is_trigger: bool, mesh_mapping: Dict,
-                           go: GameObject) -> None:
-        """Add an EditorMeshColliderComponent to *components*."""
-        collider_cfg = {
-            "MaterialSlots": {
-                "Slots": [{"Name": "Entire object"}]
-            }
-        }
-        if is_trigger:
-            collider_cfg["Trigger"] = True
-
-        mesh_comp = {
-            "$type": "EditorMeshColliderComponent",
-            "Id": self._generate_component_id(),
-            "ColliderConfiguration": collider_cfg
-        }
-
-        # Resolve .pxmesh asset hint from collider mesh or render mesh
-        hint = None
-        mesh_guid = collider.get('mesh_guid', '')
-        if mesh_guid and mesh_guid in mesh_mapping:
-            hint = mesh_mapping[mesh_guid].replace('.azmodel', '.pxmesh')
-        elif go.mesh_guid and go.mesh_guid in mesh_mapping:
-            hint = mesh_mapping[go.mesh_guid].replace('.azmodel', '.pxmesh')
-
-        if hint:
-            mesh_comp["ShapeConfiguration"] = {
-                "PhysicsAsset": {
-                    "Asset": {
-                        "assetHint": hint
-                    },
-                    "Configuration": {
-                        "PhysicsAsset": {
-                            "loadBehavior": "QueueLoad",
-                            "assetHint": hint
-                        }
-                    }
-                }
-            }
-
-        components["EditorMeshColliderComponent"] = mesh_comp
-
-    def _add_shape_collider(self, components: Dict, collider: Dict,
-                            col_type: str, offset: List[float],
-                            is_trigger: bool) -> None:
-        """Add Editor{Shape}ShapeComponent + EditorShapeColliderComponent."""
-        has_offset = any(abs(v) > 0.0001 for v in offset)
-        shape_config = {}  # entry for ShapeConfigs array
-
-        # ----- Box -----
-        if col_type == 'BoxCollider':
-            sx, sy, sz = collider.get('size', (1, 1, 1))
-            dims = [sx, sz, sy]  # swap Y/Z
-            shape_config = {"$type": "BoxShapeConfiguration", "Configuration": dims}
-
-            box_cfg = {"Dimensions": dims}
-            if has_offset:
-                box_cfg["TranslationOffset"] = offset
-            components["EditorBoxShapeComponent"] = {
-                "$type": "EditorBoxShapeComponent",
-                "Id": self._generate_component_id(),
-                "BoxShape": {"Configuration": box_cfg}
-            }
-
-        # ----- Sphere -----
-        elif col_type == 'SphereCollider':
-            radius = collider.get('radius', 0.5)
-            shape_config = {"$type": "SphereShapeConfiguration", "Radius": radius}
-
-            sphere_cfg = {"Radius": radius}
-            if has_offset:
-                sphere_cfg["TranslationOffset"] = offset
-            components["EditorSphereShapeComponent"] = {
-                "$type": "EditorSphereShapeComponent",
-                "Id": self._generate_component_id(),
-                "SphereShape": {"Configuration": sphere_cfg}
-            }
-
-        # ----- Capsule -----
-        elif col_type == 'CapsuleCollider':
-            height = collider.get('height', 2.0)
-            radius = collider.get('radius', 0.5)
-            shape_config = {
-                "$type": "CapsuleShapeConfiguration",
-                "Height": height, "Radius": radius
-            }
-
-            capsule_cfg = {"Height": height, "Radius": radius}
-            if has_offset:
-                capsule_cfg["TranslationOffset"] = offset
-            components["EditorCapsuleShapeComponent"] = {
-                "$type": "EditorCapsuleShapeComponent",
-                "Id": self._generate_component_id(),
-                "CapsuleShape": {"Configuration": capsule_cfg}
-            }
-
-        # Paired EditorShapeColliderComponent
-        collider_cfg = {
-            "MaterialSlots": {
-                "Slots": [{"Name": "Entire object"}]
-            }
-        }
-        if is_trigger:
-            collider_cfg["Trigger"] = True
-        if has_offset:
-            collider_cfg["Position"] = offset
-
-        components["EditorShapeColliderComponent"] = {
-            "$type": "EditorShapeColliderComponent",
-            "Id": self._generate_component_id(),
-            "ColliderConfiguration": collider_cfg,
-            "ShapeConfigs": [shape_config]
         }
 
     # ===================================================================
@@ -1425,54 +1287,29 @@ class IntegratedAssetProcessor:
                 "Scale": list(o3de_transform.scale)
             }
         
-        if go.mesh_guid:
-            mesh_path = mesh_mapping.get(go.mesh_guid)
-            if mesh_path:
-                entity["Components"]["AZ::Render::EditorMeshComponent"] = {
-                    "$type": "AZ::Render::EditorMeshComponent",
-                    "Id": self._generate_component_id(),
-                    "Controller": {
-                        "Configuration": {
-                            "ModelAsset": {
-                                "assetHint": mesh_path
-                            }
-                        }
-                    }
-                }
-        
         # ---------------------------------------------------------------
-        # Material Component - map each Unity material to an O3DE slot
-        # Slot "{0}" = mesh material index 0, "{1}" = index 1, etc.
+        # Component Processors — emit phase (mesh, material, physics, ...)
+        # Each processor runs in WEIGHT order and may add child entities.
         # ---------------------------------------------------------------
-        if go.material_guids:
-            materials_config = {}
-            for idx, mat_guid in enumerate(go.material_guids):
-                mat_path = material_mapping.get(mat_guid)
-                if mat_path:
-                    slot_id = f"{{{idx}}}"
-                    materials_config[slot_id] = {
-                        "MaterialAsset": {
-                            "assetHint": mat_path
-                        }
-                    }
-
-            if materials_config:
-                entity["Components"]["EditorMaterialComponent"] = {
-                    "$type": "EditorMaterialComponent",
-                    "Id": self._generate_component_id(),
-                    "Controller": {
-                        "Configuration": {
-                            "materials": materials_config
-                        }
-                    }
-                }
-
-        # ---------------------------------------------------------------
-        # PhysX Colliders + Rigid Bodies
-        # ---------------------------------------------------------------
-        collider_child_ids = self._create_physx_components(
-            go, entity, mesh_mapping, entities_dict
+        ctx = ProcessingContext(
+            material_mapping      = material_mapping,
+            mesh_mapping          = mesh_mapping,
+            entities_dict         = entities_dict,
+            entity_id_map         = entity_id_map,
+            generate_component_id = self._generate_component_id,
+            generate_entity_id    = self._generate_entity_id,
+            make_bare_entity      = self._make_bare_entity,
+            log                   = self.log,
         )
+
+        collider_child_ids = []
+        for processor in self.component_processors:
+            child_ids = processor.emit(go, entity, ctx)
+            collider_child_ids.extend(child_ids)
+
+        # Update physics stats from what processors created
+        self.total_colliders   += len(go.colliders)
+        self.total_rigidbodies += 1 if (go.has_rigidbody or go.colliders) else 0
 
         # ---------------------------------------------------------------
         # Child entities: GO children + any collider sub-entities
@@ -1504,321 +1341,12 @@ class IntegratedAssetProcessor:
 SETTINGS_FILE = Path(__file__).parent / "converter_settings.json"
 
 
-class IntegratedProcessorGUI:
-    """GUI for integrated Unity asset processing"""
-
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Unity to O3DE Integrated Asset Processor")
-        self.root.geometry("700x650")
-
-        self._create_widgets()
-        self._load_settings()
-        self._check_blender_on_startup()
-    
-    def _create_widgets(self):
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        
-        # Title
-        title_label = ttk.Label(main_frame, text="Unity to O3DE Asset Processor", 
-                               font=('', 12, 'bold'))
-        title_label.grid(row=0, column=0, columnspan=2, pady=(0, 15))
-        
-        # Source path
-        ttk.Label(main_frame, text="Unity Assets Folder:", font=('', 10, 'bold')).grid(
-            row=1, column=0, sticky=tk.W, pady=(0, 5))
-        
-        source_frame = ttk.Frame(main_frame)
-        source_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 15))
-        
-        self.source_path_var = tk.StringVar()
-        ttk.Entry(source_frame, textvariable=self.source_path_var, width=50).grid(
-            row=0, column=0, sticky=(tk.W, tk.E))
-        ttk.Button(source_frame, text="Browse...", command=self._browse_source).grid(
-            row=0, column=1, padx=(5, 0))
-        
-        source_frame.columnconfigure(0, weight=1)
-        
-        # Output path
-        ttk.Label(main_frame, text="O3DE Output Folder:", font=('', 10, 'bold')).grid(
-            row=3, column=0, sticky=tk.W, pady=(0, 5))
-        
-        output_frame = ttk.Frame(main_frame)
-        output_frame.grid(row=4, column=0, sticky=(tk.W, tk.E), pady=(0, 20))
-        
-        self.output_path_var = tk.StringVar()
-        ttk.Entry(output_frame, textvariable=self.output_path_var, width=50).grid(
-            row=0, column=0, sticky=(tk.W, tk.E))
-        ttk.Button(output_frame, text="Browse...", command=self._browse_output).grid(
-            row=0, column=1, padx=(5, 0))
-        
-        output_frame.columnconfigure(0, weight=1)
-
-        # Blender path (for FBX transform baking)
-        ttk.Label(main_frame, text="Blender Path (optional):",
-                  font=('', 10, 'bold')).grid(
-            row=5, column=0, sticky=tk.W, pady=(0, 5))
-
-        blender_frame = ttk.Frame(main_frame)
-        blender_frame.grid(row=6, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
-
-        self.blender_path_var = tk.StringVar()
-        ttk.Entry(blender_frame, textvariable=self.blender_path_var,
-                  width=50).grid(row=0, column=0, sticky=(tk.W, tk.E))
-        ttk.Button(blender_frame, text="Browse...",
-                   command=self._browse_blender).grid(row=0, column=1, padx=(5, 0))
-        ttk.Button(blender_frame, text="Auto-detect",
-                   command=self._autodetect_blender).grid(row=0, column=2, padx=(5, 0))
-        blender_frame.columnconfigure(0, weight=1)
-
-        self.blender_status_var = tk.StringVar(value="")
-        self.blender_status_label = ttk.Label(
-            main_frame, textvariable=self.blender_status_var,
-            foreground="gray")
-        self.blender_status_label.grid(row=7, column=0, sticky=tk.W, pady=(0, 10))
-
-        # Info frame
-        info_frame = ttk.LabelFrame(main_frame, text="Output Structure", padding="10")
-        info_frame.grid(row=8, column=0, sticky=(tk.W, tk.E), pady=(0, 15))
-        
-        info_text = """This will create:
-  • Prefabs/    - O3DE prefabs with correct material references
-  • Materials/  - O3DE PBR materials with textures
-  • Textures/   - All textures in one location
-  • Meshes/     - FBX models (baked via Blender when available)"""
-
-        ttk.Label(info_frame, text=info_text, justify=tk.LEFT).pack()
-
-        # Status log
-        ttk.Label(main_frame, text="Processing Log:", font=('', 10, 'bold')).grid(
-            row=9, column=0, sticky=tk.W, pady=(0, 5))
-
-        self.status_text = scrolledtext.ScrolledText(main_frame, height=15, width=70,
-                                                     state='disabled')
-        self.status_text.grid(row=10, column=0, sticky=(tk.W, tk.E, tk.N, tk.S),
-                              pady=(0, 15))
-
-        # Process button
-        process_frame = ttk.Frame(main_frame)
-        process_frame.grid(row=11, column=0, sticky=(tk.W, tk.E))
-
-        self.process_btn = ttk.Button(process_frame, text="Process Assets",
-                                      command=self._process_assets)
-        self.process_btn.pack(side=tk.RIGHT)
-
-        # Configure grid weights
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
-        main_frame.columnconfigure(0, weight=1)
-        main_frame.rowconfigure(10, weight=1)
-
-        self._log("Ready. Select Unity assets folder and O3DE output folder to begin.")
-    
-    # ---------------------------------------------------------------
-    #  Settings persistence
-    # ---------------------------------------------------------------
-
-    def _load_settings(self):
-        try:
-            if SETTINGS_FILE.exists():
-                with open(SETTINGS_FILE, 'r') as f:
-                    data = json.load(f)
-                cfg = data.get("asset_processor", {})
-                if cfg.get("source_path"):
-                    self.source_path_var.set(cfg["source_path"])
-                if cfg.get("output_path"):
-                    self.output_path_var.set(cfg["output_path"])
-                if cfg.get("blender_path"):
-                    self.blender_path_var.set(cfg["blender_path"])
-                    self._update_blender_status()
-        except Exception:
-            pass
-
-    def _save_settings(self):
-        try:
-            data = {}
-            if SETTINGS_FILE.exists():
-                with open(SETTINGS_FILE, 'r') as f:
-                    data = json.load(f)
-            data["asset_processor"] = {
-                "source_path": self.source_path_var.get(),
-                "output_path": self.output_path_var.get(),
-                "blender_path": self.blender_path_var.get(),
-            }
-            with open(SETTINGS_FILE, 'w') as f:
-                json.dump(data, f, indent=4)
-        except Exception:
-            pass
-
-    # ---------------------------------------------------------------
-    #  Blender path helpers
-    # ---------------------------------------------------------------
-
-    def _update_blender_status(self):
-        """Refresh the status label under the Blender path field."""
-        path = validate_blender(self.blender_path_var.get())
-        if path:
-            self.blender_status_var.set(f"Blender found: {path.parent.name}")
-            self.blender_status_label.config(foreground="green")
-        elif self.blender_path_var.get():
-            self.blender_status_var.set("Invalid path — blender.exe not found")
-            self.blender_status_label.config(foreground="red")
-        else:
-            self.blender_status_var.set(
-                "Not set — FBX meshes will be copied without transform baking")
-            self.blender_status_label.config(foreground="gray")
-
-    def _browse_blender(self):
-        path = filedialog.askopenfilename(
-            title="Select blender.exe",
-            filetypes=[("Blender", "blender.exe"), ("All files", "*.*")])
-        if path:
-            self.blender_path_var.set(path)
-            self._update_blender_status()
-            self._save_settings()
-
-    def _autodetect_blender(self):
-        found = find_blender()
-        if found:
-            self.blender_path_var.set(str(found))
-            self._update_blender_status()
-            self._save_settings()
-            self._log(f"Blender auto-detected: {found}")
-        else:
-            self._update_blender_status()
-            messagebox.showwarning(
-                "Blender Not Found",
-                "Could not find a Blender installation.\n\n"
-                "FBX meshes will still be copied, but mesh pivot points\n"
-                "may appear offset in O3DE.\n\n"
-                "To fix this, install Blender (free) from:\n"
-                "https://www.blender.org/download/\n\n"
-                "After installing, click Auto-detect or Browse to set the path.")
-
-    def _check_blender_on_startup(self):
-        """On first launch, auto-detect Blender. Prompt if missing."""
-        if self.blender_path_var.get():
-            self._update_blender_status()
-            return
-
-        found = find_blender()
-        if found:
-            self.blender_path_var.set(str(found))
-            self._update_blender_status()
-            self._save_settings()
-            self._log(f"Blender auto-detected: {found}")
-        else:
-            self._update_blender_status()
-            self._log(
-                "Blender not found. FBX meshes will be copied without "
-                "transform baking. Install Blender from "
-                "https://www.blender.org/download/ for proper mesh pivots.")
-
-    # ---------------------------------------------------------------
-
-    def _browse_source(self):
-        directory = filedialog.askdirectory(title="Select Unity Assets Folder")
-        if directory:
-            self.source_path_var.set(directory)
-            self._log(f"Source: {directory}")
-            self._save_settings()
-
-    def _browse_output(self):
-        directory = filedialog.askdirectory(title="Select O3DE Output Folder")
-        if directory:
-            self.output_path_var.set(directory)
-            self._log(f"Output: {directory}")
-            self._save_settings()
-    
-    def _log(self, message: str):
-        self.status_text.config(state='normal')
-        self.status_text.insert(tk.END, f"{message}\n")
-        self.status_text.see(tk.END)
-        self.status_text.config(state='disabled')
-        self.root.update_idletasks()
-    
-    def _process_assets(self):
-        source_path = self.source_path_var.get()
-        output_path = self.output_path_var.get()
-        
-        if not source_path or not output_path:
-            messagebox.showerror("Error", "Please select both source and output folders")
-            return
-        
-        if not os.path.exists(source_path):
-            messagebox.showerror("Error", f"Source folder not found: {source_path}")
-            return
-        
-        self.process_btn.config(state='disabled')
-        
-        thread = threading.Thread(target=self._do_processing, args=(source_path, output_path))
-        thread.daemon = True
-        thread.start()
-    
-    def _do_processing(self, source_path: str, output_path: str):
-        try:
-            blender = validate_blender(self.blender_path_var.get())
-            processor = IntegratedAssetProcessor(
-                Path(source_path),
-                Path(output_path),
-                log_callback=self._log,
-                blender_path=blender,
-            )
-            
-            self._log("\n" + "="*60)
-            self._log("STARTING ASSET PROCESSING")
-            self._log("="*60)
-            
-            # Find all prefab files
-            prefab_files = list(Path(source_path).rglob('*.prefab'))
-            self._log(f"\nFound {len(prefab_files)} Unity prefabs to process")
-            
-            success_count = 0
-            for i, prefab_file in enumerate(prefab_files, 1):
-                self._log(f"\n[{i}/{len(prefab_files)}] {prefab_file.name}")
-                if processor.process_prefab(prefab_file):
-                    success_count += 1
-            
-            self._log("\n" + "="*60)
-            self._log("PROCESSING COMPLETE!")
-            self._log("="*60)
-            self._log(f"Prefabs processed: {success_count}/{len(prefab_files)}")
-            self._log(f"Materials created: {len(processor.processed_materials)}")
-            self._log(f"Textures copied: {len(processor.processed_textures)}")
-            mesh_verb = "baked" if blender else "copied"
-            self._log(f"Meshes {mesh_verb}: {len(processor.processed_meshes)}")
-            self._log(f"Colliders created: {processor.total_colliders}")
-            self._log(f"Rigid bodies created: {processor.total_rigidbodies}")
-            self._log(f"\nOutput location: {output_path}")
-            self._log("="*60)
-
-            self.root.after(0, lambda: messagebox.showinfo(
-                "Success",
-                f"Processing complete!\n\n"
-                f"Prefabs: {success_count}/{len(prefab_files)}\n"
-                f"Materials: {len(processor.processed_materials)}\n"
-                f"Textures: {len(processor.processed_textures)}\n"
-                f"Meshes: {len(processor.processed_meshes)}\n"
-                f"Colliders: {processor.total_colliders}\n"
-                f"Rigid bodies: {processor.total_rigidbodies}"
-            ))
-        
-        except Exception as e:
-            error_msg = f"Processing failed: {str(e)}"
-            self._log(f"\nERROR: {error_msg}")
-            import traceback
-            self._log(traceback.format_exc())
-            self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
-        
-        finally:
-            self.root.after(0, lambda: self.process_btn.config(state='normal'))
-
-
 def main():
-    root = tk.Tk()
-    app = IntegratedProcessorGUI(root)
-    root.mainloop()
+    """Launch the unified PySide6 GUI, opening directly on the Prefab tab."""
+    import sys
+    from main_app import main as app_main
+    sys.argv.append('--tab=prefab')
+    app_main()
 
 
 if __name__ == '__main__':
