@@ -38,6 +38,7 @@ class ProcessingContext:
     make_bare_entity:       Callable[[str, str, str], Dict]  # (id, name, parent_id) -> entity dict
 
     log:                    Callable[[str], None]
+    stats:                  Dict[str, int]          # component stats, incremented during emit
 
 
 # =============================================================================

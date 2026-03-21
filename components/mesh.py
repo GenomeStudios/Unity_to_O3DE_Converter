@@ -82,4 +82,5 @@ class MeshComponentProcessor(ComponentProcessor):
             }
         }
         ctx.log(f"  [Mesh] ✓ EditorMeshComponent → {mesh_path}")
+        ctx.stats["Mesh components"] = ctx.stats.get("Mesh components", 0) + 1
         return []

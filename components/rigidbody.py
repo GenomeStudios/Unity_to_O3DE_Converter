@@ -68,8 +68,10 @@ class RigidbodyComponentProcessor(ComponentProcessor):
     def emit(self, go, entity: Dict, ctx: ProcessingContext) -> List[str]:
         if go.has_rigidbody:
             self._emit_dynamic(go, entity, ctx)
+            ctx.stats["Rigid bodies"] = ctx.stats.get("Rigid bodies", 0) + 1
         elif go.colliders:
             self._emit_static(entity, ctx)
+            ctx.stats["Rigid bodies"] = ctx.stats.get("Rigid bodies", 0) + 1
         else:
             ctx.log(f"  [Physics] No rigidbody and no colliders — nothing to emit")
         return []

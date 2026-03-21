@@ -206,11 +206,19 @@ class AssetDatabase:
                     extracted['properties'][o3de_prop] = [r, g, b, a]
 
         # ---------------------------------------------------------------
-        # Transparency Detection
-        # Unity: _Surface=1 (URP/HDRP) or _Mode>=2 (Standard) = Transparent
-        #        _AlphaClip=1 or _Mode==1 (Standard) = Alpha Clipping
-        #        _Cutoff = clip threshold (0..1)
-        # O3DE:  opacity.mode "Blended", opacity.factor (0=clear, 1=opaque)
+        # Transparency / Cutout Detection
+        # Unity URP/HDRP:
+        #   _Surface=0  = Opaque
+        #   _Surface=1  = Transparent (blended)
+        #   _AlphaClip=1 on an opaque surface (_Surface=0) = Cutout
+        # Unity Standard shader:
+        #   _Mode=0 = Opaque, _Mode=1 = Cutout, _Mode>=2 = Transparent
+        #   _Cutoff = alpha clip threshold (0..1)
+        #
+        # O3DE opacity modes:
+        #   "Opaque"  — no transparency
+        #   "Cutout"  — opaque with alpha-tested mask, uses opacity.alphaSource + factor
+        #   "Blended" — true alpha blending
         # ---------------------------------------------------------------
         raw_floats = {}
         for float_prop in floats:
@@ -220,13 +228,15 @@ class AssetDatabase:
 
         is_transparent = (raw_floats.get('_Surface', 0) == 1
                           or raw_floats.get('_Mode', 0) >= 2)
-        has_alpha_clip = (raw_floats.get('_AlphaClip', 0) == 1
-                          or raw_floats.get('_Mode', 0) == 1)
+        is_cutout      = (not is_transparent
+                          and (raw_floats.get('_AlphaClip', 0) == 1
+                               or raw_floats.get('_Mode', 0) == 1))
 
-        if is_transparent or has_alpha_clip:
+        if is_transparent:
             extracted['properties']['opacity.mode'] = "Blended"
-            if has_alpha_clip:
-                extracted['properties']['opacity.factor'] = raw_floats.get('_Cutoff', 0.5)
+        elif is_cutout:
+            extracted['properties']['opacity.mode'] = "Cutout"
+            extracted['properties']['opacity.factor'] = raw_floats.get('_Cutoff', 0.5)
 
         return extracted
 
@@ -364,7 +374,8 @@ def build_fbx_node_paths(mesh_entities: list, all_game_objects: dict,
 
 
 def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
-                         entity_node_map: dict, log=print) -> None:
+                         entity_node_map: dict, log=print,
+                         collider_entity_node_map: dict = None) -> None:
     """Write an O3DE .assetinfo with one named MeshGroup per mesh entity.
 
     Group name format: "{fbx_stem}-{entity_name}"  e.g. "Closet_A-Glass_L"
@@ -375,6 +386,10 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
     MaterialRule, CoordinateSystemRule (useAdvancedData=true), and LodRule.
     Y-up FBX files (Maya-style, up_axis==1) get a 90° pitch rotation baked into
     the CoordinateSystemRule so the mesh imports upright without a transform workaround.
+
+    When collider_entity_node_map is provided, one PhysX convex MeshGroup is also
+    written per collider entity, targeting the parent node of the visual mesh node.
+    This produces the .pxmesh file that EditorMeshColliderComponent references.
     """
     import json as _json
     import uuid as _uuid
@@ -395,6 +410,10 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
     all_node_paths = list(entity_node_map.values())
     groups = []
 
+    # -------------------------------------------------------------------------
+    # VISUAL MESH GROUPS  ({07B356B7...} MeshGroup)
+    # One group per entity — produces the .azmodel render asset.
+    # -------------------------------------------------------------------------
     for entity_name, node_path in entity_node_map.items():
         group_name = f"{fbx_stem}-{entity_name}"
         unselected = [p for p in all_node_paths if p != node_path]
@@ -415,6 +434,44 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
             },
             "id": "{" + str(_uuid.uuid4()).upper() + "}"
         })
+
+    # -------------------------------------------------------------------------
+    # PHYSX MESH GROUPS  ({5B03C8E6...} MeshGroup)
+    # One convex group per collider entity — produces the .pxmesh physics asset.
+    # Targets the parent node of the visual mesh node so all geometry is captured.
+    # -------------------------------------------------------------------------
+    if collider_entity_node_map:
+        physx_coord_rule = {"$type": "CoordinateSystemRule", "useAdvancedData": True}
+        if is_y_up:
+            physx_coord_rule["rotation"] = Y_UP_ROTATION
+
+        for entity_name, node_path in collider_entity_node_map.items():
+            parts = node_path.split(".")
+            parent_path   = ".".join(parts[:-1]) if len(parts) > 1 else node_path
+            mesh_node_name = parts[-1]
+
+            groups.append({
+                "$type": "{5B03C8E6-8CEE-4DA0-A7FA-CD88689DD45B} MeshGroup",
+                "id": "{" + str(_uuid.uuid4()).upper() + "}",
+                "name": f"{fbx_stem}-{entity_name}",
+                "NodeSelectionList": {
+                    "selectedNodes": ["RootNode", parent_path],
+                    "unselectedNodes": [{}]
+                },
+                "export method": 1,
+                "ConvexAssetParams": {
+                    "Use16bitIndices": True,
+                    "CheckZeroAreaTriangles": True
+                },
+                "PhysicsMaterialSlots": {
+                    "Slots": [{"Name": mesh_node_name}]
+                },
+                "rules": {
+                    "rules": [physx_coord_rule]
+                }
+            })
+
+        log(f"    [Mesh] Added {len(collider_entity_node_map)} PhysX MeshGroup(s)")
 
     sidecar = Path(str(fbx_dest_path) + ".assetinfo")
     try:
@@ -454,9 +511,8 @@ class IntegratedAssetProcessor:
         self.processed_meshes: Dict[str, Path] = {}  # guid -> output Path
         self.processed_prefabs: Set[str] = set()  # Track processed prefab GUIDs
 
-        # Physics stats
-        self.total_colliders = 0
-        self.total_rigidbodies = 0
+        # Component processing stats — accumulated by processors via ctx.stats
+        self.stats: Dict[str, int] = {}
 
         # Get project folder name for asset hints (lowercase)
         self.project_name = output_root.name.lower()
@@ -551,7 +607,16 @@ class IntegratedAssetProcessor:
                     for go in entity_list if go.file_id in node_paths
                 }
 
-                write_fbx_assetinfo(fbx_path, fbx_stem, entity_node_map, self.log)
+                # Entities with a MeshCollider also need a PhysX MeshGroup
+                collider_entity_node_map = {
+                    go.name: node_paths[go.file_id]
+                    for go in entity_list
+                    if go.file_id in node_paths
+                    and any(c['type'] == 'MeshCollider' for c in go.colliders)
+                }
+
+                write_fbx_assetinfo(fbx_path, fbx_stem, entity_node_map, self.log,
+                                    collider_entity_node_map=collider_entity_node_map or None)
 
                 for go in entity_list:
                     if go.file_id in node_paths:
@@ -1300,16 +1365,13 @@ class IntegratedAssetProcessor:
             generate_entity_id    = self._generate_entity_id,
             make_bare_entity      = self._make_bare_entity,
             log                   = self.log,
+            stats                 = self.stats,
         )
 
         collider_child_ids = []
         for processor in self.component_processors:
             child_ids = processor.emit(go, entity, ctx)
             collider_child_ids.extend(child_ids)
-
-        # Update physics stats from what processors created
-        self.total_colliders   += len(go.colliders)
-        self.total_rigidbodies += 1 if (go.has_rigidbody or go.colliders) else 0
 
         # ---------------------------------------------------------------
         # Child entities: GO children + any collider sub-entities

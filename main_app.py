@@ -427,24 +427,26 @@ class PrefabProcessorTab(QWidget):
             if processor.process_prefab(prefab_file):
                 success_count += 1
 
+        # Merge asset-level counts into stats dict (displayed first)
+        asset_stats = {
+            "Materials created": len(processor.processed_materials),
+            "Textures copied":   len(processor.processed_textures),
+            "Meshes copied":     len(processor.processed_meshes),
+        }
+        asset_stats.update(processor.stats)
+
         log("\n" + "=" * 60)
         log("PROCESSING COMPLETE!")
         log("=" * 60)
         log(f"Prefabs processed : {success_count}/{len(prefab_files)}")
-        log(f"Materials created : {len(processor.processed_materials)}")
-        log(f"Textures copied   : {len(processor.processed_textures)}")
-        log(f"Meshes copied     : {len(processor.processed_meshes)}")
-        log(f"Colliders         : {processor.total_colliders}")
-        log(f"Rigid bodies      : {processor.total_rigidbodies}")
+        for label, count in asset_stats.items():
+            log(f"{label:<20}: {count}")
         log(f"Output            : {output_path}")
         log("=" * 60)
 
-        return (
-            f"Prefabs: {success_count}/{len(prefab_files)}  |  "
-            f"Materials: {len(processor.processed_materials)}  |  "
-            f"Textures: {len(processor.processed_textures)}  |  "
-            f"Meshes: {len(processor.processed_meshes)}"
-        )
+        summary_parts = [f"Prefabs: {success_count}/{len(prefab_files)}"]
+        summary_parts += [f"{label}: {count}" for label, count in asset_stats.items()]
+        return "  |  ".join(summary_parts)
 
     def _on_finished(self, success: bool, summary: str) -> None:
         self._process_btn.setEnabled(True)

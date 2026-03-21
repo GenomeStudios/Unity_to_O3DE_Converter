@@ -92,4 +92,5 @@ class DirectionalLightComponentProcessor(ComponentProcessor):
             f"  [Light] ✓ EditorDirectionalLightComponent — "
             f"intensity={light_data['intensity']}, shadows={light_data['shadows_on']}"
         )
+        ctx.stats["Directional lights"] = ctx.stats.get("Directional lights", 0) + 1
         return []

@@ -163,6 +163,9 @@ class UnitySceneConverter:
         self.component_processors = load_component_processors()
         self.component_dispatch   = build_dispatch_table(self.component_processors)
 
+        # Component processing stats — accumulated by processors via ctx.stats
+        self.stats: Dict[str, int] = {}
+
         # Collected component blocks from the scene (anchor -> {type, data})
         self.components_data: Dict[str, Dict] = {}
     
@@ -849,6 +852,7 @@ class UnitySceneConverter:
             generate_entity_id    = self._generate_entity_id,
             make_bare_entity      = self._make_bare_entity,
             log                   = self.log,
+            stats                 = self.stats,
         )
         collider_child_ids: List[str] = []
         for processor in self.component_processors:
@@ -1021,8 +1025,11 @@ class SceneConverterGUI:
 
     def _browse_scene(self):
         """Browse for Unity scene file"""
+        current = self.scene_path_var.get()
+        initial_dir = str(Path(current).parent) if current and Path(current).exists() else None
         filename = filedialog.askopenfilename(
             title="Select Unity Scene File",
+            initialdir=initial_dir,
             filetypes=[("Unity Scene", "*.unity"), ("All Files", "*.*")]
         )
         if filename:
@@ -1032,7 +1039,9 @@ class SceneConverterGUI:
 
     def _browse_output(self):
         """Browse for output directory"""
-        directory = filedialog.askdirectory(title="Select Output Directory")
+        current = self.output_path_var.get()
+        initial_dir = current if current and Path(current).exists() else None
+        directory = filedialog.askdirectory(title="Select Output Directory", initialdir=initial_dir)
         if directory:
             self.output_path_var.set(directory)
             self._log(f"Output directory: {directory}")

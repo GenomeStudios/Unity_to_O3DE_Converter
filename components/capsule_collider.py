@@ -82,6 +82,7 @@ class CapsuleColliderProcessor(ComponentProcessor):
                 f"{'main entity' if global_idx == 0 else 'child entity'}"
             )
 
+        ctx.stats["Colliders"] = ctx.stats.get("Colliders", 0) + len(my_colliders)
         return child_ids
 
 

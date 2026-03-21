@@ -79,6 +79,7 @@ class MeshColliderProcessor(ComponentProcessor):
                 f"{'main entity' if global_idx == 0 else 'child entity'}"
             )
 
+        ctx.stats["Colliders"] = ctx.stats.get("Colliders", 0) + len(my_colliders)
         return child_ids
 
 
@@ -111,9 +112,9 @@ def _write_mesh_collider(components: Dict, collider: Dict, go,
         hint = ctx.mesh_mapping[mesh_guid].replace('.azmodel', '.pxmesh')
         ctx.log(f"  [Physics] MeshCollider using collider mesh: {hint}")
 
-    elif go.mesh_guid and go.mesh_guid in ctx.mesh_mapping:
-        hint = ctx.mesh_mapping[go.mesh_guid].replace('.azmodel', '.pxmesh')
-        ctx.log(f"  [Physics] MeshCollider falling back to render mesh: {hint}")
+    elif go.file_id and go.file_id in ctx.mesh_mapping:
+        hint = ctx.mesh_mapping[go.file_id].replace('.azmodel', '.pxmesh')
+        ctx.log(f"  [Physics] MeshCollider using render mesh: {hint}")
 
     else:
         ctx.log(
