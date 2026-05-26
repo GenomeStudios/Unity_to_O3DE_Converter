@@ -89,6 +89,27 @@ QTabBar::tab:hover:!selected {
     background: #45475a;
 }
 
+/* Config "tab" lives as a corner widget so it can be right-pinned. Style
+   it to match the QTabBar::tab look so the seam isn't obvious. */
+QPushButton#config_corner {
+    background: #313244;
+    color: #cdd6f4;
+    padding: 8px 20px;
+    border: none;
+    border-top-left-radius: 4px;
+    border-top-right-radius: 4px;
+    margin-left: 8px;
+    min-width: 0;
+}
+QPushButton#config_corner:hover {
+    background: #45475a;
+}
+QPushButton#config_corner:checked {
+    background: #89b4fa;
+    color: #1e1e2e;
+    font-weight: bold;
+}
+
 QLineEdit {
     background: #313244;
     border: 1px solid #45475a;
@@ -734,7 +755,269 @@ class SceneConverterTab(QWidget):
 
 
 # =============================================================================
-# TAB 3 — CONFIG
+# TAB 3 — TERRAIN
+# =============================================================================
+
+class TerrainTab(QWidget):
+    """
+    Converts a user-picked set of Unity .mat files into O3DE terrain detail
+    materials (TerrainBaseMaterial materialtype). Settings persist under
+    "terrain_processor" in converter_settings.json.
+
+    Source folder is independent from the Prefab Processor tab so the user
+    can import terrain materials from a different Unity project than the
+    one feeding the prefab pipeline.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._worker: WorkerThread = None
+        self._selected_materials: list = []   # absolute paths to .mat files
+        self._build_ui()
+        self._load_settings()
+
+    # -------------------------------------------------------------------------
+    # UI CONSTRUCTION
+    # -------------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setSpacing(10)
+        root.setContentsMargins(14, 14, 14, 14)
+
+        # --- Source folder ---
+        root.addWidget(_section_label("Unity Assets Folder"))
+        self._source_edit, src_btn = _path_row(
+            "Select Unity project Assets folder (used to resolve texture GUIDs)…"
+        )
+        src_btn.clicked.connect(self._browse_source)
+        row = QHBoxLayout()
+        row.addWidget(self._source_edit)
+        row.addWidget(src_btn)
+        root.addLayout(row)
+
+        # --- Output folder ---
+        root.addWidget(_section_label("O3DE Output Folder"))
+        self._output_edit, out_btn = _path_row("Select O3DE output destination folder…")
+        out_btn.clicked.connect(self._browse_output)
+        row = QHBoxLayout()
+        row.addWidget(self._output_edit)
+        row.addWidget(out_btn)
+        root.addLayout(row)
+
+        # --- Selected materials list ---
+        root.addWidget(_section_label("Selected Unity Materials"))
+        self._material_list = QListWidget()
+        self._material_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self._material_list.setMinimumHeight(120)
+        self._material_list.setMaximumHeight(220)
+        root.addWidget(self._material_list)
+
+        mat_btn_row = QHBoxLayout()
+        add_btn    = QPushButton("Add Materials…")
+        remove_btn = QPushButton("Remove Selected")
+        clear_btn  = QPushButton("Clear All")
+        add_btn.clicked.connect(self._add_materials)
+        remove_btn.clicked.connect(self._remove_selected_materials)
+        clear_btn.clicked.connect(self._clear_materials)
+        mat_btn_row.addWidget(add_btn)
+        mat_btn_row.addWidget(remove_btn)
+        mat_btn_row.addWidget(clear_btn)
+        mat_btn_row.addStretch()
+        root.addLayout(mat_btn_row)
+
+        # --- Output structure info ---
+        info = QGroupBox("Output Structure")
+        info_layout = QVBoxLayout(info)
+        info_layout.addWidget(QLabel(
+            "  Terrain/Materials/  — O3DE .material files referencing\n"
+            "                          @gemroot:Terrain@/Assets/Materials/Types/\n"
+            "                          TerrainBaseMaterial.materialtype\n"
+            "  Terrain/Textures/   — Textures referenced by the materials above"
+        ))
+        root.addWidget(info)
+
+        # --- Log ---
+        root.addWidget(_section_label("Processing Log"))
+        self._log_edit = _log_widget()
+        root.addWidget(self._log_edit, stretch=1)
+
+        # --- Action buttons ---
+        btn_row = QHBoxLayout()
+        save_log_btn = QPushButton("Save Log…")
+        save_log_btn.clicked.connect(self._save_log)
+        btn_row.addWidget(save_log_btn)
+        btn_row.addStretch()
+        self._generate_btn = QPushButton("Generate Terrain Materials")
+        self._generate_btn.setObjectName("primary")
+        self._generate_btn.clicked.connect(self._start_generation)
+        btn_row.addWidget(self._generate_btn)
+        root.addLayout(btn_row)
+
+    # -------------------------------------------------------------------------
+    # SETTINGS
+    # -------------------------------------------------------------------------
+
+    def _load_settings(self) -> None:
+        cfg = load_settings().get("terrain_processor", {})
+        if cfg.get("source_path"): self._source_edit.setText(cfg["source_path"])
+        if cfg.get("output_path"): self._output_edit.setText(cfg["output_path"])
+        for path in cfg.get("selected_materials", []):
+            self._add_material_to_list(path)
+
+    def _save_settings(self) -> None:
+        save_settings({"terrain_processor": {
+            "source_path":        self._source_edit.text(),
+            "output_path":        self._output_edit.text(),
+            "selected_materials": list(self._selected_materials),
+        }})
+
+    # -------------------------------------------------------------------------
+    # BROWSE / LIST HELPERS
+    # -------------------------------------------------------------------------
+
+    def _browse_source(self) -> None:
+        d = QFileDialog.getExistingDirectory(self, "Select Unity Assets Folder")
+        if d:
+            self._source_edit.setText(d)
+            self._log(f"Source: {d}")
+            self._save_settings()
+
+    def _browse_output(self) -> None:
+        d = QFileDialog.getExistingDirectory(self, "Select O3DE Output Folder")
+        if d:
+            self._output_edit.setText(d)
+            self._log(f"Output: {d}")
+            self._save_settings()
+
+    def _add_materials(self) -> None:
+        # Start the picker inside the source folder when one is set so the
+        # user doesn't have to navigate from scratch each time.
+        start_dir = self._source_edit.text().strip() or ""
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select Unity Material Files", start_dir,
+            "Unity Materials (*.mat);;All files (*.*)"
+        )
+        added = 0
+        for p in paths:
+            if p not in self._selected_materials:
+                self._add_material_to_list(p)
+                added += 1
+        if added:
+            self._log(f"Added {added} material(s); list now has {len(self._selected_materials)}.")
+            self._save_settings()
+
+    def _add_material_to_list(self, path: str) -> None:
+        self._selected_materials.append(path)
+        self._material_list.addItem(QListWidgetItem(path))
+
+    def _remove_selected_materials(self) -> None:
+        rows = sorted(
+            (self._material_list.row(item) for item in self._material_list.selectedItems()),
+            reverse=True,
+        )
+        for row in rows:
+            self._material_list.takeItem(row)
+            self._selected_materials.pop(row)
+        if rows:
+            self._save_settings()
+
+    def _clear_materials(self) -> None:
+        self._material_list.clear()
+        self._selected_materials.clear()
+        self._save_settings()
+
+    # -------------------------------------------------------------------------
+    # LOGGING
+    # -------------------------------------------------------------------------
+
+    def _log(self, msg: str) -> None:
+        self._log_edit.append(msg)
+        self._log_edit.moveCursor(QTextCursor.End)
+
+    def _save_log(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Processing Log", "terrain_processor_log.txt",
+            "Text files (*.txt);;All files (*.*)"
+        )
+        if path:
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(self._log_edit.toPlainText())
+
+    # -------------------------------------------------------------------------
+    # GENERATION
+    # -------------------------------------------------------------------------
+
+    def _start_generation(self) -> None:
+        source = self._source_edit.text().strip()
+        output = self._output_edit.text().strip()
+
+        if not source or not output:
+            QMessageBox.critical(self, "Error",
+                "Please select both the Unity Assets folder and an output folder.")
+            return
+        if not os.path.exists(source):
+            QMessageBox.critical(self, "Error", f"Source folder not found:\n{source}")
+            return
+        if not self._selected_materials:
+            QMessageBox.warning(self, "Warning",
+                "No materials selected. Add at least one .mat file to convert.")
+            return
+
+        self._save_settings()
+        self._generate_btn.setEnabled(False)
+        self._log_edit.clear()
+
+        self._worker = WorkerThread(
+            self._do_generation, source, output, list(self._selected_materials),
+        )
+        self._worker.emitter.message.connect(self._log)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.start()
+
+    def _do_generation(self, source_path: str, output_path: str,
+                       material_paths: list, log) -> str:
+        from terrain_material_processor import TerrainMaterialProcessor
+
+        log("\n" + "=" * 60)
+        log("STARTING TERRAIN MATERIAL GENERATION")
+        log("=" * 60)
+        log(f"Source        : {source_path}")
+        log(f"Output        : {output_path}")
+        log(f"Materials in  : {len(material_paths)}")
+
+        processor = TerrainMaterialProcessor(
+            Path(source_path), Path(output_path), log_callback=log,
+        )
+        result = processor.process_materials([Path(p) for p in material_paths])
+
+        log("\n" + "=" * 60)
+        log("GENERATION COMPLETE!")
+        log("=" * 60)
+        log(f"Materials written : {result['materials_written']}/{len(material_paths)}")
+        log(f"Textures written  : {result['textures_written']}")
+        if result["errors"]:
+            log(f"Errors ({len(result['errors'])}):")
+            for err in result["errors"]:
+                log(f"  ⚠ {err}")
+        log("=" * 60)
+
+        return (
+            f"Materials: {result['materials_written']}/{len(material_paths)}  |  "
+            f"Textures: {result['textures_written']}  |  "
+            f"Errors: {len(result['errors'])}"
+        )
+
+    def _on_finished(self, success: bool, summary: str) -> None:
+        self._generate_btn.setEnabled(True)
+        if success:
+            QMessageBox.information(self, "Generation Complete", summary)
+        else:
+            QMessageBox.critical(self, "Generation Failed", summary)
+
+
+# =============================================================================
+# TAB 4 — CONFIG
 # =============================================================================
 
 def get_config() -> dict:
@@ -958,18 +1241,45 @@ class ConfigTab(QWidget):
 # =============================================================================
 
 class MainWindow(QMainWindow):
+    """
+    Config is registered as a real tab (so the QTabWidget owns its page
+    widget and lifetime) but hidden from the tab bar via setTabVisible(False).
+    A "Config" QPushButton placed in the tab bar's top-right corner switches
+    to it on click. This is the only QTabWidget pattern that gives genuine
+    right-alignment regardless of window width — the corner widget is laid
+    out by QTabWidget itself, not the tab bar.
+    """
+
     def __init__(self, start_tab: int = 0):
         super().__init__()
         self.setWindowTitle("Unity → O3DE Converter")
         self.resize(820, 760)
 
-        tabs = QTabWidget()
-        tabs.addTab(PrefabProcessorTab(), "Prefab Processor")
-        tabs.addTab(SceneConverterTab(),  "Scene Converter")
-        tabs.addTab(ConfigTab(),          "Config")
-        tabs.setCurrentIndex(start_tab)
+        self._tabs = QTabWidget()
+        self._tabs.addTab(PrefabProcessorTab(), "Prefab Processor")
+        self._tabs.addTab(SceneConverterTab(),  "Scene Converter")
+        self._tabs.addTab(TerrainTab(),         "Terrain")
+        self._config_index = self._tabs.addTab(ConfigTab(), "Config")
+        self._tabs.tabBar().setTabVisible(self._config_index, False)
+        self._tabs.setCurrentIndex(start_tab)
 
-        self.setCentralWidget(tabs)
+        # Corner button: Config, pinned to the top-right of the tab bar.
+        self._config_btn = QPushButton("Config")
+        self._config_btn.setObjectName("config_corner")
+        self._config_btn.setCheckable(True)
+        self._config_btn.setCursor(Qt.PointingHandCursor)
+        self._config_btn.setChecked(self._tabs.currentIndex() == self._config_index)
+        self._config_btn.clicked.connect(
+            lambda: self._tabs.setCurrentIndex(self._config_index)
+        )
+        self._tabs.currentChanged.connect(self._on_tab_changed)
+        self._tabs.setCornerWidget(self._config_btn, Qt.TopRightCorner)
+
+        self.setCentralWidget(self._tabs)
+
+    def _on_tab_changed(self, index: int) -> None:
+        # Keep the corner button visually in sync with whether Config is active.
+        self._config_btn.setChecked(index == self._config_index)
 
 
 # =============================================================================
