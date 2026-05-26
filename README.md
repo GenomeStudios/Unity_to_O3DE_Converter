@@ -119,7 +119,7 @@ unity_to_o3de_converter/
     sphere_collider.py  weight=125 SphereCollider
     capsule_collider.py weight=150 CapsuleCollider
     mesh_collider.py       weight=175 MeshCollider
-    directional_light.py   weight=500 Directional light (runs last; modifies transform)
+    light.py               weight=510 All Unity Light types (Directional / Point / Spot / Area)
 
   legacy_unity_prefab_to_o3de.py   Legacy — ignore
   bake_fbx_transforms.py           Legacy — ignore
@@ -321,9 +321,18 @@ Save this as `components/light.py` with `WEIGHT = 200` and it will be live on th
 
 ## Change Log
 
-**2026-03-14 (latest)**
+**2026-05-25 (latest)**
+- **Prefab override propagation**: nested-prefab instances now translate Unity `m_Modifications` into O3DE JSON-patch entries. Tier 1 (translate / rotate / scale) is always emitted; Tier 2 (`m_IsActive`) is logged to coverage; Tier 3 (`m_Materials.Array.data[N]` slot overrides) is resolved via per-prefab sidecars and emitted as `assetHint` patches. Anything else is recorded as an unhandled override path. Mirrored across both Stage 1 (`_create_nested_prefab_instance`) and Stage 2 (`UnitySceneConverter._create_prefab_instance`).
+- **Entity-map sidecars**: each converted prefab now writes a `<stem>.entitymap.json` next to its `.prefab` recording the Unity-fileID → O3DE-entity-alias map, the root entity, and per-entity material slot GUID lists. Required for cross-prefab override resolution.
+- **Asset index**: each run writes `<output_root>/asset_index.json` listing every processed material/mesh/prefab GUID and its O3DE asset hint. Loaded by Stage 2 (and override emission) to resolve GUIDs without re-walking the project.
+- **Coverage report**: each run writes `coverage.json` next to its primary output. Lists every Unity component type seen (handled or not), every prefab override propertyPath (with handled/unhandled counts and example values), every missing GUID, and converter warnings. Both Stage 1 and Stage 2 emit one.
+- **Material metallic / roughness reconciliation** (texture-aware): `_extract_material_data` now collects `_Metallic`, `_Smoothness`, `_Glossiness`, `_GlossMapScale` separately and routes them based on whether a metallic/roughness texture is bound. With a texture: no `metallic.factor` (O3DE ignores it), `roughness.lowerBound = 1 − multiplier` + `roughness.upperBound = 1.0`. Without: `metallic.factor` / `roughness.factor` scalars only.
+- **Opacity `alphaSource = "Packed"`**: Cutout and Blended materials now write `opacity.alphaSource` so O3DE StandardPBR actually reads the alpha channel from the baseColor texture. Previously omitted; materials rendered fully opaque despite `opacity.mode` being set.
+
+**2026-03-14**
 - **Scene converter — component processing for unowned entities**: GameObjects in a Unity scene that are not resolved as prefab instances now run the full component processor pipeline. Physics (colliders, rigidbodies) and directional lights are emitted onto those entities. `GameObject` dataclass extended with processor fields; `_dispatch_component_processors()` and `_make_bare_entity()` added to `UnitySceneConverter`
-- **Directional light processor** (`components/directional_light.py`, weight=500): converts Unity `Light` (type=1) to `EditorDirectionalLightComponent`; applies a 180° pitch flip to the entity transform on emit to correct the forward-axis mismatch between Unity and O3DE; `_to_int()` helper handles `m_Shadows`/`m_Type` being serialized as nested dicts in scene files vs plain ints in prefab files; runs at weight 500 (after all other processors) so it can safely modify the already-written TransformComponent
+- **Scene converter — component processing for unowned entities**: GameObjects in a Unity scene that are not resolved as prefab instances now run the full component processor pipeline. Physics (colliders, rigidbodies) and directional lights are emitted onto those entities. `GameObject` dataclass extended with processor fields; `_dispatch_component_processors()` and `_make_bare_entity()` added to `UnitySceneConverter`
+- **Unified light processor** (`components/light.py`, weight=510): handles all Unity `Light` types in one place. Directional (m_Type=1) emits `EditorDirectionalLightComponent` with a 180° pitch flip on the entity transform to correct the Unity↔O3DE forward-axis mismatch. Point (m_Type=2) emits `EditorAreaLightComponent` (LightType=Sphere) plus an `EditorSphereShapeComponent`. Spot (m_Type=0) emits `EditorAreaLightComponent` (LightType=SimpleSpot) with shutter half-angles. Area (m_Type=3) emits `EditorAreaLightComponent` (LightType=SimplePoint) as a runtime approximation (Unity area lights are baked-only). `_to_int()` helper handles `m_Shadows`/`m_Type` being serialized as nested dicts in scene files vs plain ints in prefab files. Supersedes the earlier `directional_light.py` (removed)
 - Shape components now emit with `DisplayFilled: false` / `IsFilled: false`; shape colliders emit with `DebugDrawSettings: {LocallyEnabled: false}`
 - Removed X-axis inversion from coordinate conversion — position is now `(x, z, y)`, rotation `(qx, qz, qy, qw)`; same fix applied to all shape collider center offsets
 - FBX `.assetinfo` generation: per-entity named MeshGroups, `selectedNodes` always begins with `"RootNode"`, binary FBX parser (`read_fbx_hierarchy`) extracts sub-objects (UV channels, vertex color layers, material nodes)

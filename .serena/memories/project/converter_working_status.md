@@ -18,13 +18,18 @@ Two-stage automated converter: Unity graphical assets/prefabs → O3DE prefabs, 
 - **YAML parsing**: parses Unity prefab multi-doc YAML (anchors pattern), extracts GameObject, Transform, MeshFilter, MeshRenderer, Rigidbody, BoxCollider, SphereCollider, CapsuleCollider, MeshCollider, PrefabInstance
 - **Hierarchy building**: resolves transform→GameObject IDs, builds bidirectional parent/child tree
 - **Component processor system**: auto-discovered, WEIGHT-ordered plugin modules in `components/` directory
-  - `mesh.py` (25), `material.py` (50), `rigidbody.py` (75), `box_collider.py` (100), `sphere_collider.py` (125), `capsule_collider.py` (150), `mesh_collider.py` (175), `directional_light.py` (500)
+  - `mesh.py` (25), `material.py` (50), `rigidbody.py` (75), `box_collider.py` (100), `sphere_collider.py` (125), `capsule_collider.py` (150), `mesh_collider.py` (175), `light.py` (510)
 - **Texture scraping**: copies textures to `Textures/` output dir, tracks by GUID
 - **Mesh scraping**: copies FBX/mesh files to `Meshes/` output dir
 - **Material pipeline**:
   - Texture map: `_MainTex/_BaseMap` → `baseColor`, `_BumpMap/_NormalMap` → `normal`, `_MetallicGlossMap` → `metallic` + `roughness`, `_OcclusionMap` → `occlusion`, `_EmissionMap` → `emissive`, `_HeightMap` → `height`
-  - Scalar: `_Metallic`, `_Smoothness`/`_Glossiness` (inverted to roughness), `_BumpScale`, color `_Color/_BaseColor`
+  - Scalar: `_BumpScale`, color `_Color/_BaseColor`. Metallic/roughness are reconciled in a dedicated post-pass — see below.
+  - **Metallic/roughness reconciliation** (added 2026-05-25): O3DE StandardPBR has texture-aware property semantics. The post-pass in `_extract_material_data` collects raw Unity scalars (`_Metallic`, `_Smoothness`, `_Glossiness`, `_GlossMapScale`) and routes them based on whether a texture is bound:
+    - Metallic — texture bound → no factor written (O3DE ignores it). No texture → `metallic.factor = _Metallic`.
+    - Roughness — texture bound → `roughness.lowerBound = 1 − multiplier`, `roughness.upperBound = 1.0`. Multiplier is `_GlossMapScale` (Standard shader) if present, else `_Smoothness`/`_Glossiness` (URP collapses both roles into `_Smoothness`). No texture → `roughness.factor = 1 − smoothness`.
+    - Caveat: Unity's `_MetallicGlossMap` stores smoothness in the alpha channel. O3DE samples the bound texture directly as roughness, so the alpha would have to be pre-inverted at copy time for the *texture content* to look correct. Currently NOT done — the bound texture's alpha is read as-is, which inverts shiny/dull on materials that use the metallic-gloss map. Bounds remap is still correct mathematically.
   - Transparency: Unity `_Surface=1` or `_Mode>=2` → `opacity.mode = "Blended"`; alpha clip via `_AlphaClip` or `_Mode==1`
+  - **`opacity.alphaSource = "Packed"`** is emitted for both Cutout and Blended (fixed 2026-05-25). Without it, O3DE StandardPBR ignores the alpha channel of the baseColor texture and renders fully opaque regardless of opacity.mode. `opacity.factor` carries `_Cutoff` for Cutout.
   - Writes `.material` files using `StandardPBR.materialtype`
   - Material file names **preserve case** from Unity source (e.g. `Door_MetalDark.azmaterial`)
 - **Multi-material slots**: `EditorMaterialComponent` emits `{}` (default slot) + `{0}`, `{1}`, ... indexed slots matching Unity MeshRenderer material list order ✓
@@ -39,12 +44,28 @@ Two-stage automated converter: Unity graphical assets/prefabs → O3DE prefabs, 
   - Sub-object path detection wired; full integration of hierarchy sub-paths still in progress
 - **Shape component defaults**: `EditorBoxShapeComponent` emits `DisplayFilled: false` + `IsFilled: false`; all shape colliders emit `DebugDrawSettings: {LocallyEnabled: false}`
 
-### Directional Light (`directional_light.py`, weight=500)
-- Handles Unity `Light` component with `m_Type == 1` (Directional)
-- Emits `AZ::Render::EditorDirectionalLightComponent` with intensity and shadow enabled flag
-- **Runs at weight 500** (after all other processors) so it can safely modify the entity's TransformComponent
-- **Pitch inversion**: applies 180° pitch flip to the TransformComponent rotation on emit — corrects the forward-axis mismatch between Unity and O3DE directional lights (without this, light shines from below)
-- **Scene-safe parsing**: `m_Shadows` and `m_Type` may be plain ints (prefab files) or nested dicts (scene files); `_to_int()` helper handles both formats
+### Unified Light (`light.py`, weight=510)
+Single processor handles all Unity `Light` types via `m_Type` dispatch. Supersedes the
+earlier `directional_light.py` (removed 2026-05-25).
+- **Directional (m_Type=1)** → `AZ::Render::EditorDirectionalLightComponent`.
+  Applies a 180° pitch flip to the TransformComponent on emit to correct the
+  Unity↔O3DE forward-axis mismatch (without this, light shines from below).
+- **Point (m_Type=2)** → `AZ::Render::EditorAreaLightComponent` with `LightType=1`
+  (Sphere), plus an `EditorSphereShapeComponent` (radius `DEFAULT_SPHERE_RADIUS=0.05`)
+  giving the emitter a physical size. IntensityMode=Lumen.
+- **Spot (m_Type=0)** → `AZ::Render::EditorAreaLightComponent` with `LightType=7`
+  (SimpleSpot). Unity stores `m_SpotAngle`/`m_InnerSpotAngle` as full cone angles;
+  the processor halves them to feed O3DE's `Outer/InnerShutterAngleDegrees`.
+  IntensityMode=Candela. EnableShutters=True.
+- **Area (m_Type=3)** → `AZ::Render::EditorAreaLightComponent` with `LightType=6`
+  (SimplePoint) as a runtime approximation; Unity area lights are baked-only and
+  have no direct real-time equivalent. IntensityMode=Lumen, GI enabled.
+- **Scene-safe parsing**: `m_Shadows` and `m_Type` may be plain ints (prefab files)
+  or nested dicts (scene files); `_to_int()` helper handles both formats.
+- **Dispatch precedence note**: `build_dispatch_table` is last-write-wins by WEIGHT
+  ascending order. `light.py` (weight 510) registers last for the `Light` type, so
+  it is the active parser. All processors' `emit()` methods always run; light.py's
+  emit short-circuits when `go.component_data['unity_light']` is unset.
 
 ### Coordinate Conversion (CORRECTED as of 2026-03-14)
 Unity → O3DE axis swap:
@@ -88,7 +109,7 @@ Previous versions negated X; this was incorrect and has been removed from:
   - Mesh and material emit silently skipped (no AssetDatabase in scene converter); physics and light fully functional
   - `_make_bare_entity()` added to support overflow collider child entity creation
   - Log callback wired through from GUI to convertor and into ProcessingContext
-- **Scene-file robustness**: `_to_int()` in `directional_light.py` handles Unity scene files serializing `m_Shadows` / `m_Type` as nested dicts instead of plain ints
+- **Scene-file robustness**: `_to_int()` in `light.py` handles Unity scene files serializing `m_Shadows` / `m_Type` as nested dicts instead of plain ints
 
 ### Known Issues ✗
 - **~Matches "nearly all"** prefabs — some prefabs go unmatched (tracked in `missing_prefabs` set)
@@ -114,9 +135,76 @@ GameObject: file_id, name, transform, components, parent_id, children_ids,
   Meshes/     ← copied FBX/mesh files + .assetinfo sidecars
 ```
 
+---
+
+## Prefab Override Propagation + Coverage Reporting (added 2026-05-25)
+
+### Sidecars and indexes
+Stage 1 now persists two new artifacts per run:
+
+- **`<output_root>/Prefabs/<stem>.entitymap.json`** — one per converted prefab.
+  Records `{source_guid, source_path, root_entity, container_alias,
+  entity_aliases: {unity_file_id: o3de_entity_alias}, material_slots:
+  {unity_file_id: [mat_guid_0, mat_guid_1, ...]}, go_names}`.
+  Consumed by nested-instance override emission to translate Unity fileIDs
+  inside `m_Modifications.target` into the right O3DE entity alias.
+- **`<output_root>/asset_index.json`** — one per run. Records
+  `{materials: {guid: assetHint}, meshes: {guid: stem}, prefabs: {guid: source_path}}`.
+  Consumed by Stage 2 (and any cross-prefab override resolution) to translate
+  Unity GUIDs to O3DE asset hints without re-walking the project.
+
+The Stage 1 entrypoint requires `processor.finalize()` to be called after the
+last `process_prefab()` to write these artifacts. main_app.py is updated;
+external callers must do the same.
+
+### Override emission tiers (Stage 1 + Stage 2 nested/scene instances)
+- **Tier 1 — Transform**: `m_LocalPosition.{x,y,z}`, `m_LocalRotation.{x,y,z,w}`,
+  `m_LocalScale.{x,y,z}` emit `/ContainerEntity/.../Translate/{N}`,
+  `Rotate/{N}`, and (uniform) `Scale` JSON patches.
+- **Tier 2 — m_IsActive**: parsed and logged to coverage; not yet emitted as
+  a patch because the O3DE disabled-entity field is not yet confirmed.
+- **Tier 3 — `m_Materials.Array.data[N]`**: resolved via sidecar
+  (`target.fileID` → `entity_alias`) and asset_index (`new_mat_guid` →
+  `assetHint`); emits `/Entities/<alias>/Components/EditorMaterialComponent/
+  Controller/Configuration/materials/{N}/MaterialAsset/assetHint`.
+- **Everything else** (light intensity, rigidbody mass, collider size, etc.)
+  is recorded as unhandled in `coverage.json` so the user gets an explicit
+  punch list rather than silent data loss.
+
+Sibling-field accounting (`m_AddedComponents`, `m_RemovedComponents`,
+`m_AddedGameObjects`) is counted into coverage and warned about, but the
+emission paths require larger surgery and are not implemented.
+
+### Coverage report (CoverageTracker class in integrated_asset_processor.py)
+- Tracks every Unity component type seen during parse, with handler resolution.
+- Tracks every prefab override propertyPath (with `[N]` collapsed to `[*]`),
+  with handled/unhandled counts and up to 3 example values per path.
+- Tracks missing texture/mesh/material/prefab GUIDs.
+- Tracks Unity light m_Type counts (Spot/Directional/Point/Area).
+- Stores free-form warnings the converter wanted to surface.
+- Stage 1 writes `<output_root>/coverage.json` from `finalize()`.
+- Stage 2 writes `<scene_output_dir>/coverage.json` from `converter.finalize(output_dir)`.
+
+### Known limitations
+- Material-slot overrides are keyed by `target.fileID`, which is the
+  MeshRenderer's fileID inside the source prefab. The current sidecar's
+  `entity_aliases` map is keyed by GameObject fileID; renderer-component IDs
+  are not recorded yet. Material override emission only works when the
+  override happens to target a fileID that matches a GO alias. Improvement
+  here is the next iteration of override propagation.
+- m_IsActive emits no patch (logged to coverage only).
+- Non-uniform scale overrides log a warning instead of emitting an
+  EditorNonUniformScaleComponent patch.
+- Added/removed components and added GameObjects are counted but not emitted.
+
+---
+
 ## Next Priority Areas
-1. Complete sub-object path integration in `write_fbx_assetinfo` (UV channels, material nodes in selectedNodes)
-2. Debug/verify collider shape offset pipeline end-to-end
-3. Finalize material pipeline (specular workflow, detail maps)
-4. Non-uniform scale end-to-end verification
-5. Add AssetDatabase support to scene converter for mesh/material emit on unowned entities
+1. Record renderer-component fileIDs in the entity-map sidecar so material
+   slot overrides resolve reliably regardless of where the user authored them.
+2. Confirm O3DE disabled-entity schema and emit m_IsActive patches.
+3. Complete sub-object path integration in `write_fbx_assetinfo` (UV channels, material nodes in selectedNodes)
+4. Debug/verify collider shape offset pipeline end-to-end
+5. Finalize material pipeline (specular workflow, detail maps)
+6. Non-uniform scale end-to-end verification
+7. Add AssetDatabase support to scene converter for mesh/material emit on unowned entities

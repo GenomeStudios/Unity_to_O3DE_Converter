@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout,
     QHBoxLayout, QLabel, QLineEdit, QPushButton, QTextEdit,
     QFileDialog, QGroupBox, QListWidget, QListWidgetItem,
-    QMessageBox, QSizePolicy,
+    QMessageBox, QSizePolicy, QCheckBox,
 )
 
 
@@ -164,6 +164,25 @@ QGroupBox::title {
     subcontrol-position: top left;
     padding: 0 6px;
     left: 10px;
+}
+
+QCheckBox {
+    color: #cdd6f4;
+    spacing: 8px;
+}
+QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    border: 1px solid #45475a;
+    border-radius: 3px;
+    background: #313244;
+}
+QCheckBox::indicator:hover {
+    border: 1px solid #89b4fa;
+}
+QCheckBox::indicator:checked {
+    background: #89b4fa;
+    border: 1px solid #89b4fa;
 }
 
 QLabel#section {
@@ -412,10 +431,12 @@ class PrefabProcessorTab(QWidget):
         log("STARTING ASSET PROCESSING")
         log("=" * 60)
 
+        cfg = get_config()
         processor = IntegratedAssetProcessor(
             Path(source_path),
             Path(output_path),
             log_callback=log,
+            convert_smoothness_to_roughness=cfg["convert_smoothness_to_roughness"],
         )
 
         prefab_files = list(Path(source_path).rglob('*.prefab'))
@@ -426,6 +447,9 @@ class PrefabProcessorTab(QWidget):
             log(f"\n[{i}/{len(prefab_files)}] {prefab_file.name}")
             if processor.process_prefab(prefab_file):
                 success_count += 1
+
+        # Write coverage.json and asset_index.json into the output root.
+        processor.finalize()
 
         # Merge asset-level counts into stats dict (displayed first)
         asset_stats = {
@@ -687,6 +711,9 @@ class SceneConverterTab(QWidget):
             output_path, Path(output_dir)
         )
 
+        # Write coverage.json next to the level output.
+        converter.finalize(Path(output_dir))
+
         log("\n" + "=" * 60)
         log("CONVERSION COMPLETE!")
         log("=" * 60)
@@ -707,6 +734,226 @@ class SceneConverterTab(QWidget):
 
 
 # =============================================================================
+# TAB 3 — CONFIG
+# =============================================================================
+
+def get_config() -> dict:
+    """Return the persisted `config` section, with defaults filled in."""
+    cfg = load_settings().get("config", {}) or {}
+    return {
+        "convert_smoothness_to_roughness":
+            bool(cfg.get("convert_smoothness_to_roughness", False)),
+    }
+
+
+# =============================================================================
+# DEPENDENCY PROBE
+#
+# The converter has three pip-installable dependencies. The Config tab probes
+# each one at startup (and on refresh) and renders a platform-specific install
+# command bound to this Python interpreter's `sys.executable`.  Using the full
+# interpreter path defeats the "pip is from a different python than the one
+# running the GUI" failure mode — `python -m pip` vs `pip` mismatches are the
+# single most common install issue on Windows machines with multiple Pythons.
+# =============================================================================
+
+# (import_name, pypi_name, role_text, is_hard_dep)
+DEPENDENCIES = [
+    ("PySide6", "PySide6", "GUI framework",                              True),
+    ("yaml",    "PyYAML",  "Unity prefab / scene YAML parser",           True),
+    ("PIL",     "Pillow",  "Smoothness→Roughness texture re-bake",       False),
+]
+
+
+def _probe_dependency(import_name: str, pypi_name: str):
+    """Return (installed: bool, version: Optional[str])."""
+    import importlib.util
+    spec = importlib.util.find_spec(import_name)
+    if spec is None:
+        return (False, None)
+    try:
+        import importlib.metadata as md
+        return (True, md.version(pypi_name))
+    except Exception:
+        return (True, None)
+
+
+def _platform_label() -> str:
+    if sys.platform.startswith("win"):  return "Windows"
+    if sys.platform == "darwin":        return "macOS"
+    return "Linux"
+
+
+def _install_command(pypi_names: list) -> str:
+    """Build a pip-install command bound to the running interpreter.
+
+    Quoting `sys.executable` is important — Windows user-install paths usually
+    contain spaces (AppData\\Local\\Programs\\...).  Single quotes on POSIX
+    are safe against shells that treat double quotes specially.
+    """
+    pkgs = " ".join(pypi_names) if pypi_names else " ".join(d[1] for d in DEPENDENCIES)
+    exe  = sys.executable
+    if sys.platform.startswith("win"):
+        return f'"{exe}" -m pip install {pkgs}'
+    return f"'{exe}' -m pip install {pkgs}"
+
+
+class ConfigTab(QWidget):
+    """
+    Per-run conversion options. Settings are persisted on toggle to
+    `converter_settings.json` under the `config` key and read back by the
+    Prefab Processor when a run is launched.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._build_ui()
+        self._load_settings()
+
+    # -------------------------------------------------------------------------
+    # UI CONSTRUCTION
+    # -------------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setSpacing(10)
+        root.setContentsMargins(14, 14, 14, 14)
+
+        # --- Material conversion group ---
+        mat_group = QGroupBox("Material Conversion")
+        ml        = QVBoxLayout(mat_group)
+
+        self._cb_smooth_to_rough = QCheckBox("Convert Smoothness Textures to Roughness")
+        self._cb_smooth_to_rough.setToolTip(
+            "When enabled, any Unity '_MetallicGlossMap' bound as the roughness "
+            "slot is re-baked with an inverted alpha channel and written as "
+            "<name>_Roughness.png in Textures/. O3DE samples roughness directly "
+            "from the bound texture, so without this step Unity smoothness maps "
+            "appear inverted (smooth surfaces look rough). Requires Pillow."
+        )
+        self._cb_smooth_to_rough.toggled.connect(self._save_settings)
+        ml.addWidget(self._cb_smooth_to_rough)
+        root.addWidget(mat_group)
+
+        # --- Dependencies group (platform-specific install commands) ---
+        dep_group = QGroupBox(f"Dependencies — {_platform_label()}")
+        dl        = QVBoxLayout(dep_group)
+
+        # Show the interpreter path so the user can confirm which Python is
+        # the install target. This is the single piece of info that explains
+        # "pip installed it but the app can't see it" failures.
+        dl.addWidget(QLabel("Python interpreter:"))
+        py_edit = QLineEdit(sys.executable)
+        py_edit.setReadOnly(True)
+        py_edit.setStyleSheet("font-family: Consolas, monospace;")
+        dl.addWidget(py_edit)
+
+        # Per-dependency status, refreshed by _refresh_dep_status().
+        self._dep_status_labels: dict = {}
+        for import_name, pypi_name, role, is_hard in DEPENDENCIES:
+            lbl = QLabel("")
+            lbl.setWordWrap(True)
+            self._dep_status_labels[pypi_name] = lbl
+            dl.addWidget(lbl)
+
+        dl.addSpacing(6)
+        dl.addWidget(QLabel("Install command (binds to the interpreter above):"))
+        self._install_cmd_edit = QLineEdit("")
+        self._install_cmd_edit.setReadOnly(True)
+        self._install_cmd_edit.setStyleSheet(
+            "font-family: Consolas, monospace; color: #a6e3a1;"
+        )
+        dl.addWidget(self._install_cmd_edit)
+
+        # Linux's system Python is usually PEP 668 externally-managed; warn
+        # there specifically so users don't bang their head against pip refusing
+        # to install. macOS Homebrew is similar but typical desktop users will
+        # have used the Python installer from python.org so we skip the macOS warn.
+        if sys.platform.startswith("linux"):
+            hint = QLabel(
+                "Note: on modern Linux distributions, the system Python may refuse "
+                "this install (PEP 668). If you see 'externally-managed-environment', "
+                "either add  --user  to the command, or create a venv first:  "
+                "python3 -m venv .venv && source .venv/bin/activate"
+            )
+            hint.setObjectName("status_warn")
+            hint.setWordWrap(True)
+            dl.addWidget(hint)
+
+        btn_row = QHBoxLayout()
+        self._copy_btn = QPushButton("Copy command")
+        self._copy_btn.clicked.connect(self._copy_install_cmd)
+        btn_row.addWidget(self._copy_btn)
+
+        self._refresh_btn = QPushButton("Refresh")
+        self._refresh_btn.setToolTip("Re-probe installed packages")
+        self._refresh_btn.clicked.connect(self._refresh_dep_status)
+        btn_row.addWidget(self._refresh_btn)
+        btn_row.addStretch(1)
+        dl.addLayout(btn_row)
+
+        root.addWidget(dep_group)
+        root.addStretch(1)
+
+        # Populate the dep section now.
+        self._refresh_dep_status()
+
+    # -------------------------------------------------------------------------
+    # SETTINGS
+    # -------------------------------------------------------------------------
+
+    def _load_settings(self) -> None:
+        cfg = get_config()
+        self._cb_smooth_to_rough.setChecked(cfg["convert_smoothness_to_roughness"])
+
+    def _save_settings(self) -> None:
+        save_settings({"config": {
+            "convert_smoothness_to_roughness": self._cb_smooth_to_rough.isChecked(),
+        }})
+
+    # -------------------------------------------------------------------------
+    # DEPENDENCY STATUS
+    # -------------------------------------------------------------------------
+
+    def _refresh_dep_status(self) -> None:
+        """Re-probe each dependency, update labels, rebuild install command.
+
+        The install command lists only the missing packages by default; when
+        nothing is missing it falls back to the "install all" form so a fresh
+        clone can copy a single line to bootstrap everything.
+
+        Flushes Python's import caches first so a package installed via
+        `pip install` AFTER the app started can be detected without an app
+        restart. Without this, `find_spec` can return stale negative results.
+        """
+        import importlib
+        importlib.invalidate_caches()
+
+        missing: list = []
+        for import_name, pypi_name, role, is_hard in DEPENDENCIES:
+            installed, version = _probe_dependency(import_name, pypi_name)
+            lbl = self._dep_status_labels[pypi_name]
+            if installed:
+                ver = version or "version unknown"
+                lbl.setText(f"  ✓  {pypi_name} {ver} — {role}")
+                lbl.setStyleSheet("color: #a6e3a1;")  # green
+            else:
+                tag = "required" if is_hard else "optional"
+                lbl.setText(f"  ✗  {pypi_name} — {role}  ({tag}, not installed)")
+                lbl.setStyleSheet("color: #f9e2af;")  # warn yellow
+                missing.append(pypi_name)
+
+        # Empty `missing` list → _install_command emits the full install line.
+        self._install_cmd_edit.setText(_install_command(missing))
+
+    def _copy_install_cmd(self) -> None:
+        QApplication.clipboard().setText(self._install_cmd_edit.text())
+        # Brief visual confirmation on the button.
+        self._copy_btn.setText("Copied ✓")
+        QTimer.singleShot(1200, lambda: self._copy_btn.setText("Copy command"))
+
+
+# =============================================================================
 # MAIN WINDOW
 # =============================================================================
 
@@ -719,6 +966,7 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(PrefabProcessorTab(), "Prefab Processor")
         tabs.addTab(SceneConverterTab(),  "Scene Converter")
+        tabs.addTab(ConfigTab(),          "Config")
         tabs.setCurrentIndex(start_tab)
 
         self.setCentralWidget(tabs)

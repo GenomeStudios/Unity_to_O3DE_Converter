@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 
 from components import load_component_processors, build_dispatch_table
 from components.base import ProcessingContext
+from integrated_asset_processor import CoverageTracker
 
 
 @dataclass
@@ -53,6 +54,11 @@ class GameObject:
     mesh_guid: Optional[str] = None
     material_guids: List[str] = field(default_factory=list)
     component_data: Dict[str, Any] = field(default_factory=dict)
+    # --- Prefab-instance overrides (populated only when is_prefab_instance) ---
+    prefab_modifications: List[Dict] = field(default_factory=list)
+    prefab_added_components: List[Dict] = field(default_factory=list)
+    prefab_removed_components: List[Dict] = field(default_factory=list)
+    prefab_added_gameobjects: List[Dict] = field(default_factory=list)
 
 
 class PrefabDatabase:
@@ -168,6 +174,18 @@ class UnitySceneConverter:
 
         # Collected component blocks from the scene (anchor -> {type, data})
         self.components_data: Dict[str, Dict] = {}
+
+        # =====================================================================
+        # Coverage tracker — populated incrementally; written by finalize()
+        # =====================================================================
+        self.coverage = CoverageTracker()
+
+        # Asset index (loaded from disk on first material override that needs
+        # GUID→assetHint resolution). Searched in the parents of prefab dirs.
+        self._asset_index: Optional[Dict] = None
+
+        # Cache for source-prefab entity-map sidecars, keyed by absolute path.
+        self._entity_map_cache: Dict[str, Optional[Dict]] = {}
     
     def parse_unity_scene(self, scene_path: str) -> None:
         """Parse Unity scene file"""
@@ -209,14 +227,25 @@ class UnitySceneConverter:
                 elif 'PrefabInstance' in doc:
                     self._parse_prefab_instance(doc['PrefabInstance'])
                 else:
-                    # Collect component blocks for the processor pipeline
+                    # Collect component blocks for the processor pipeline,
+                    # and record every top-level key into coverage so the
+                    # end-of-run report shows handled + unhandled types.
+                    handled = False
                     for known_type in self.component_dispatch:
                         if known_type in doc:
                             self.components_data[anchor] = {
                                 'type': known_type,
                                 'data': doc[known_type],
                             }
+                            self.coverage.record_component(
+                                known_type,
+                                type(self.component_dispatch[known_type]).__name__,
+                            )
+                            handled = True
                             break
+                    if not handled:
+                        for top_key in doc:
+                            self.coverage.record_component(top_key, None)
             
             except yaml.YAMLError:
                 continue
@@ -333,71 +362,70 @@ class UnitySceneConverter:
             )
     
     def _parse_prefab_instance(self, prefab_data: Dict) -> None:
-        """Parse PrefabInstance data to create prefab reference entities"""
-        # Extract GUID
+        """
+        Parse PrefabInstance data — capture transform overrides for the existing
+        prefab_instances pipeline, AND capture the full m_Modifications array +
+        sibling override fields (added/removed components, added GameObjects)
+        so _create_prefab_instance can emit non-transform patches.
+        """
         source_prefab = prefab_data.get('m_SourcePrefab', {})
-        prefab_guid = source_prefab.get('guid', '')
-        
+        prefab_guid   = source_prefab.get('guid', '')
         if not prefab_guid:
             return
-        
-        # Extract modifications
-        modification = prefab_data.get('m_Modification', {})
-        modifications = modification.get('m_Modifications', [])
-        
-        # Parse transform and name from modifications
-        instance_data = {
-            'guid': prefab_guid,
-            'name': None,
-            'position': (0, 0, 0),
-            'rotation': (0, 0, 0, 1),
-            'scale': (1, 1, 1),
-            'parent_fileID': None
+
+        modification          = prefab_data.get('m_Modification', {}) or {}
+        modifications         = modification.get('m_Modifications', []) or []
+        added_components      = modification.get('m_AddedComponents', []) or []
+        removed_components    = modification.get('m_RemovedComponents', []) or []
+        added_gameobjects     = modification.get('m_AddedGameObjects', []) or []
+
+        instance_data: Dict[str, Any] = {
+            'guid':              prefab_guid,
+            'name':              None,
+            'position':          (0, 0, 0),
+            'rotation':          (0, 0, 0, 1),
+            'scale':             (1, 1, 1),
+            'parent_fileID':     None,
+            'modifications':     list(modifications),
+            'added_components':  list(added_components),
+            'removed_components': list(removed_components),
+            'added_gameobjects': list(added_gameobjects),
         }
-        
-        # Get parent
-        transform_parent = modification.get('m_TransformParent', {})
+
+        # Parent
+        transform_parent = modification.get('m_TransformParent', {}) or {}
         parent_id = str(transform_parent.get('fileID', '0'))
         if parent_id != '0':
             instance_data['parent_fileID'] = parent_id
-        
-        # Parse modifications
-        pos = [0, 0, 0]
-        rot = [0, 0, 0, 1]
+
+        # Project transform modifications onto position/rotation/scale.
+        pos        = [0, 0, 0]
+        rot        = [0, 0, 0, 1]
         scale_vals = [1, 1, 1]
-        
+        AXIS = {'x': 0, 'y': 1, 'z': 2, 'w': 3}
+
         for mod in modifications:
-            property_path = mod.get('propertyPath', '')
-            value = mod.get('value')
-            
+            property_path = (mod.get('propertyPath') or '').strip()
+            value         = mod.get('value')
             if property_path == 'm_Name':
                 instance_data['name'] = value
-            elif property_path == 'm_LocalPosition.x':
-                pos[0] = float(value) if value is not None else 0
-            elif property_path == 'm_LocalPosition.y':
-                pos[1] = float(value) if value is not None else 0
-            elif property_path == 'm_LocalPosition.z':
-                pos[2] = float(value) if value is not None else 0
-            elif property_path == 'm_LocalRotation.x':
-                rot[0] = float(value) if value is not None else 0
-            elif property_path == 'm_LocalRotation.y':
-                rot[1] = float(value) if value is not None else 0
-            elif property_path == 'm_LocalRotation.z':
-                rot[2] = float(value) if value is not None else 0
-            elif property_path == 'm_LocalRotation.w':
-                rot[3] = float(value) if value is not None else 1
-            elif property_path == 'm_LocalScale.x':
-                scale_vals[0] = float(value) if value is not None else 1
-            elif property_path == 'm_LocalScale.y':
-                scale_vals[1] = float(value) if value is not None else 1
-            elif property_path == 'm_LocalScale.z':
-                scale_vals[2] = float(value) if value is not None else 1
-        
+            elif property_path.startswith('m_LocalPosition.'):
+                a = property_path.rsplit('.', 1)[-1]
+                if a in AXIS and AXIS[a] < 3 and value is not None:
+                    pos[AXIS[a]] = float(value)
+            elif property_path.startswith('m_LocalRotation.'):
+                a = property_path.rsplit('.', 1)[-1]
+                if a in AXIS and value is not None:
+                    rot[AXIS[a]] = float(value)
+            elif property_path.startswith('m_LocalScale.'):
+                a = property_path.rsplit('.', 1)[-1]
+                if a in AXIS and AXIS[a] < 3 and value is not None:
+                    scale_vals[AXIS[a]] = float(value)
+
         instance_data['position'] = tuple(pos)
         instance_data['rotation'] = tuple(rot)
-        instance_data['scale'] = tuple(scale_vals)
-        
-        # Add to prefab instances list
+        instance_data['scale']    = tuple(scale_vals)
+
         self.prefab_instances.append(instance_data)
     
     def _build_hierarchy(self) -> None:
@@ -461,55 +489,52 @@ class UnitySceneConverter:
                 self.missing_prefabs.add(prefab_name)
     
     def _process_prefab_instances(self) -> None:
-        """Convert parsed PrefabInstance data into GameObjects with prefab references"""
+        """Convert parsed PrefabInstance data into GameObjects with prefab references."""
         for instance in self.prefab_instances:
-            # Create a unique file_id for this instance
             file_id = f"prefab_instance_{self.entity_counter}"
             self.entity_counter += 1
-            
-            # Create Transform
+
             transform = Transform(
                 position=instance['position'],
                 rotation=instance['rotation'],
-                scale=instance['scale']
+                scale=instance['scale'],
             )
-            
-            # Determine name
+
             name = instance['name'] if instance['name'] else "PrefabInstance"
-            
-            # Create GameObject
+
             go = GameObject(
                 file_id=file_id,
                 name=name,
                 transform=transform,
                 is_prefab_instance=True,
                 prefab_source_guid=instance['guid'],
-                prefab_name=name
+                prefab_name=name,
             )
-            
-            # Set parent if specified
+            # Carry the full override payload so _create_prefab_instance can emit
+            # non-transform JSON patches and record unhandled paths into coverage.
+            go.prefab_modifications      = instance.get('modifications', []) or []
+            go.prefab_added_components   = instance.get('added_components', []) or []
+            go.prefab_removed_components = instance.get('removed_components', []) or []
+            go.prefab_added_gameobjects  = instance.get('added_gameobjects', []) or []
+
             if instance['parent_fileID']:
-                # Parent is a transform ID, need to resolve to GameObject
                 parent_go_id = self.transform_to_gameobject.get(instance['parent_fileID'])
                 if parent_go_id:
                     go.parent_id = parent_go_id
-                    # Add this child to parent's children_ids
                     if parent_go_id in self.game_objects:
                         self.game_objects[parent_go_id].children_ids.append(file_id)
-            
-            # Add to game_objects
+
             self.game_objects[file_id] = go
-            
-            # Try to find matching O3DE prefab
+
             prefab_path = self.prefab_db.find_prefab_by_guid(instance['guid'])
             if not prefab_path:
-                # Try by name as fallback
                 prefab_path = self.prefab_db.find_prefab_by_name(name)
-            
+
             if prefab_path:
                 self.prefab_references[file_id] = prefab_path
             else:
                 self.missing_prefabs.add(name)
+                self.coverage.record_missing_prefab(instance['guid'])
     
     def convert_to_o3de_coordinates(self, unity_transform: Transform) -> Tuple[Transform, bool]:
         """Convert Unity transform to O3DE coordinate system"""
@@ -649,45 +674,264 @@ class UnitySceneConverter:
         # Fallback: if not in any search directory, just use filename
         return f"Prefabs/{prefab_path.name}"
     
-    def _create_prefab_instance(self, go: GameObject, prefab_path: Path, 
+    def _create_prefab_instance(self, go: GameObject, prefab_path: Path,
                                 output_base: Path, parent_entity_id: str) -> Dict:
-        """Create prefab instance with patches"""
-        # Convert to Assets-relative path
+        """Emit a prefab Instance entry with JSON-patch overrides.
+
+        Same tiered scheme as Stage 1's nested-instance emitter:
+          Tier 1  Transform — translate, rotate, scale on the ContainerEntity
+          Tier 2  m_IsActive — logged to coverage (schema TBD)
+          Tier 3  m_Materials.Array.data[N] — patch the assetHint in the
+                  target entity's EditorMaterialComponent materialsByLabel
+                  entry whose key is the stem of the ORIGINAL material at
+                  slot N in the source prefab.
+        Unhandled propertyPaths are recorded into self.coverage.
+        """
         source_path = self._convert_to_assets_path(prefab_path)
-        
         o3de_transform, _ = self.convert_to_o3de_coordinates(go.transform)
-        
-        patches = [
+        euler             = self._quaternion_to_euler(o3de_transform.rotation)
+
+        patches: List[Dict] = [
             {
-                "op": "replace",
-                "path": "/ContainerEntity/Components/TransformComponent/Parent Entity",
-                "value": f"../{parent_entity_id}"
+                "op":    "replace",
+                "path":  "/ContainerEntity/Components/TransformComponent/Parent Entity",
+                "value": f"../{parent_entity_id}",
             }
         ]
-        
+
+        # ---- Tier 1: transform overrides on the ContainerEntity ----
         if any(abs(v) > 0.0001 for v in o3de_transform.position):
-            patches.extend([
-                {
-                    "op": "replace",
-                    "path": "/ContainerEntity/Components/TransformComponent/Transform Data/Translate/0",
-                    "value": o3de_transform.position[0]
-                },
-                {
-                    "op": "replace",
-                    "path": "/ContainerEntity/Components/TransformComponent/Transform Data/Translate/1",
-                    "value": o3de_transform.position[1]
-                },
-                {
-                    "op": "replace",
-                    "path": "/ContainerEntity/Components/TransformComponent/Transform Data/Translate/2",
-                    "value": o3de_transform.position[2]
-                }
-            ])
-        
+            for i, axis_val in enumerate(o3de_transform.position):
+                patches.append({
+                    "op":   "replace",
+                    "path": f"/ContainerEntity/Components/TransformComponent/Transform Data/Translate/{i}",
+                    "value": axis_val,
+                })
+
+        if any(abs(v) > 0.0001 for v in euler):
+            for i, axis_val in enumerate(euler):
+                patches.append({
+                    "op":   "replace",
+                    "path": f"/ContainerEntity/Components/TransformComponent/Transform Data/Rotate/{i}",
+                    "value": axis_val,
+                })
+
+        sx, sy, sz = o3de_transform.scale
+        if abs(sx - 1.0) > 0.0001 and abs(sx - sy) < 0.0001 and abs(sy - sz) < 0.0001:
+            patches.append({
+                "op":   "replace",
+                "path": "/ContainerEntity/Components/TransformComponent/Transform Data/Scale",
+                "value": sx,
+            })
+        elif (abs(sx - 1.0) > 0.0001 or abs(sy - 1.0) > 0.0001 or abs(sz - 1.0) > 0.0001):
+            self.coverage.warn(
+                f"Non-uniform scale override on scene prefab instance '{go.name}' "
+                f"({sx}, {sy}, {sz}) not emitted — needs EditorNonUniformScaleComponent."
+            )
+
+        # ---- Tier 2 + 3: walk modifications by propertyPath ----
+        sidecar = self._load_entity_map_sidecar(prefab_path)
+        entity_aliases = (sidecar or {}).get("entity_aliases", {})
+        material_slots = (sidecar or {}).get("material_slots", {})
+
+        if go.prefab_modifications and not sidecar:
+            self.coverage.warn(
+                f"No entity-map sidecar for prefab '{prefab_path.name}' — "
+                f"non-transform overrides on scene instance '{go.name}' cannot be targeted."
+            )
+
+        material_overrides: Dict[str, Dict[int, str]] = {}
+
+        for mod in go.prefab_modifications:
+            prop_path = (mod.get('propertyPath') or '').strip()
+            value     = mod.get('value', None)
+            objref    = mod.get('objectReference') or {}
+            target    = mod.get('target') or {}
+            target_id = str(target.get('fileID', ''))
+
+            if prop_path == 'm_Name' or prop_path.startswith(
+                ('m_LocalPosition.', 'm_LocalRotation.', 'm_LocalScale.')
+            ):
+                self.coverage.record_modification(prop_path, handled=True, example_value=value)
+                continue
+
+            if prop_path == 'm_IsActive':
+                self.coverage.record_modification(prop_path, handled=False, example_value=value)
+                self.coverage.warn(
+                    f"m_IsActive override on scene instance '{go.name}' (value={value}) "
+                    f"not emitted — O3DE disabled-entity patch path needs confirmation."
+                )
+                continue
+
+            m = re.match(r'^m_Materials\.Array\.data\[(\d+)\]$', prop_path)
+            if m:
+                slot_idx = int(m.group(1))
+                new_guid = objref.get('guid', '') if isinstance(objref, dict) else ''
+                if not new_guid:
+                    self.coverage.record_modification(prop_path, handled=False,
+                                                     example_value="<no guid>")
+                    continue
+                slot_map = material_overrides.setdefault(target_id, {})
+                slot_map[slot_idx] = new_guid
+                continue
+
+            self.coverage.record_modification(
+                prop_path, handled=False,
+                example_value=value if value not in (None, '') else objref,
+            )
+
+        # Emit material slot patches.
+        asset_index = self._get_asset_index(prefab_path)
+        for target_id, slot_map in material_overrides.items():
+            entity_alias = entity_aliases.get(target_id)
+            if not entity_alias:
+                self.coverage.warn(
+                    f"Material override on scene instance '{go.name}' targets "
+                    f"fileID={target_id} not in source's entity map — skipped."
+                )
+                for slot_idx, mat_guid in slot_map.items():
+                    self.coverage.record_modification(
+                        f'm_Materials.Array.data[{slot_idx}]',
+                        handled=False, example_value=mat_guid,
+                    )
+                continue
+
+            # Original material guids per slot index for this target — used
+            # to derive the label key in the base prefab's materialsByLabel.
+            original_slots = material_slots.get(target_id, []) or []
+
+            for slot_idx, mat_guid in slot_map.items():
+                asset_hint = (asset_index or {}).get('materials', {}).get(mat_guid)
+                if not asset_hint:
+                    self.coverage.record_missing_material(mat_guid)
+                    self.coverage.record_modification(
+                        f'm_Materials.Array.data[{slot_idx}]',
+                        handled=False, example_value=mat_guid,
+                    )
+                    continue
+
+                # Resolve the slot's label = stem of the ORIGINAL material the
+                # source prefab assigned at this index. That stem is the key
+                # in the base O3DE prefab's materialsByLabel map (matches the
+                # FBX submesh slot's m_displayName, which equals the original
+                # Unity material name by convention).
+                original_guid = (original_slots[slot_idx]
+                                 if slot_idx < len(original_slots) else '')
+                original_hint = ((asset_index or {}).get('materials', {}).get(original_guid, '')
+                                 if original_guid else '')
+                label = Path(original_hint).stem if original_hint else ''
+
+                if not label:
+                    self.coverage.warn(
+                        f"Material override on scene instance '{go.name}' "
+                        f"slot {slot_idx} — cannot resolve original slot's "
+                        f"label (source prefab had no recorded material at "
+                        f"this index). Patch skipped."
+                    )
+                    self.coverage.record_modification(
+                        f'm_Materials.Array.data[{slot_idx}]',
+                        handled=False, example_value=mat_guid,
+                    )
+                    continue
+
+                patches.append({
+                    "op":   "replace",
+                    "path": (f"/Entities/{entity_alias}/Components/EditorMaterialComponent/"
+                             f"Controller/Configuration/materialsByLabel/{label}/"
+                             f"MaterialAsset/assetHint"),
+                    "value": asset_hint,
+                })
+                self.coverage.record_modification(
+                    f'm_Materials.Array.data[{slot_idx}]',
+                    handled=True, example_value=asset_hint,
+                )
+
+        # Sibling-field accounting.
+        for _ in go.prefab_added_components:    self.coverage.record_added_component()
+        for _ in go.prefab_removed_components:  self.coverage.record_removed_component()
+        for _ in go.prefab_added_gameobjects:   self.coverage.record_added_gameobject()
+        if (go.prefab_added_components or go.prefab_removed_components
+                or go.prefab_added_gameobjects):
+            self.coverage.warn(
+                f"Scene instance '{go.name}' has added/removed components or "
+                f"added GameObjects that are not yet propagated to O3DE patches."
+            )
+
         return {
-            "Source": source_path,
-            "Patches": patches
+            "Source":  source_path,
+            "Patches": patches,
         }
+
+    # =========================================================================
+    # SIDECAR + ASSET INDEX LOOKUP
+    # =========================================================================
+
+    def _load_entity_map_sidecar(self, prefab_path: Path) -> Optional[Dict]:
+        """Load `<stem>.entitymap.json` next to a converted O3DE prefab.
+
+        These are written by Stage 1 (IntegratedAssetProcessor). When Stage 2
+        is run after Stage 1 against the same output, the sidecar is present;
+        otherwise this returns None and non-transform overrides are recorded
+        as unhandled.
+        """
+        key = str(prefab_path)
+        if key in self._entity_map_cache:
+            return self._entity_map_cache[key]
+        candidate = prefab_path.with_suffix('.entitymap.json')
+        if not candidate.exists():
+            self._entity_map_cache[key] = None
+            return None
+        try:
+            with open(candidate, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self._entity_map_cache[key] = data
+            return data
+        except Exception as exc:
+            self.log(f"  ⚠ Failed to load entity map sidecar {candidate.name}: {exc}")
+            self._entity_map_cache[key] = None
+            return None
+
+    def _get_asset_index(self, hint_path: Path) -> Optional[Dict]:
+        """Lazy-load asset_index.json by walking up from a converted prefab path.
+
+        Searches `<prefab_path>.parent.parent / asset_index.json` first
+        (matching the Stage 1 output layout), then the immediate parent.
+        Cached after first successful load.
+        """
+        if self._asset_index is not None:
+            return self._asset_index
+        for candidate in (hint_path.parent.parent / 'asset_index.json',
+                          hint_path.parent / 'asset_index.json'):
+            if candidate.exists():
+                try:
+                    with open(candidate, 'r', encoding='utf-8') as f:
+                        self._asset_index = json.load(f)
+                    self.log(f"  ✓ Loaded asset index: {candidate}")
+                    return self._asset_index
+                except Exception as exc:
+                    self.log(f"  ⚠ Failed to load asset index {candidate}: {exc}")
+        self._asset_index = {}
+        return self._asset_index
+
+    # =========================================================================
+    # FINALIZE — write the scene-side coverage report
+    # =========================================================================
+
+    def finalize(self, output_dir: Path) -> None:
+        """Write coverage.json into the scene output directory."""
+        path = Path(output_dir) / "coverage.json"
+        payload = self.coverage.to_dict()
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, indent=2)
+            unh_comp = len(payload['unhandled_component_types'])
+            unh_over = len(payload['unhandled_override_paths'])
+            self.log(f"  ✓ Wrote coverage report: {path.name} "
+                     f"({unh_comp} unhandled component type(s), "
+                     f"{unh_over} unhandled override path(s), "
+                     f"{len(payload['warnings'])} warning(s))")
+        except Exception as exc:
+            self.log(f"  ⚠ Failed to write coverage.json: {exc}")
     
     def _generate_component_id(self) -> int:
         """Generate unique component ID"""
