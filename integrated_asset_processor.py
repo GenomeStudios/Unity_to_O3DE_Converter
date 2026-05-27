@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Integrated Unity Prefab + Material Asset Processor
 
@@ -9,7 +9,6 @@ Component processing is handled by auto-discovered modules in components/.
 Add or remove processors by dropping files into that directory.
 """
 
-import yaml
 import hashlib
 import json
 import os
@@ -20,10 +19,12 @@ import random
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple, Optional, Set
-from dataclasses import dataclass, field
+# `dataclass`/`field` imports dropped — the Unity source-data dataclasses
+# (Transform, UnityComponent, GameObject) moved to platforms.unity.types
+# and CoverageTracker uses a hand-rolled `__init__` instead.
 
-from components import load_component_processors, build_dispatch_table
-from components.base import ProcessingContext
+from platforms.unity.components import build_dispatch_table
+from platforms.unity.components.base import ProcessingContext
 
 # Pillow is a soft dependency, only required when the user enables
 # "Convert Smoothness Textures to Roughness" in the Config tab. The plain
@@ -36,57 +37,13 @@ except ImportError:
     PIL_AVAILABLE = False
 
 
-@dataclass
-class Transform:
-    """Unity transform data"""
-    position: Tuple[float, float, float] = (0.0, 0.0, 0.0)
-    rotation: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
-    scale: Tuple[float, float, float] = (1.0, 1.0, 1.0)
-    
-    def is_uniform_scale(self, tolerance: float = 0.0001) -> bool:
-        return abs(self.scale[0] - self.scale[1]) < tolerance and \
-               abs(self.scale[1] - self.scale[2]) < tolerance
-
-
-@dataclass
-class UnityComponent:
-    """Unity component reference"""
-    type_name: str
-    file_id: str
-    data: Dict = field(default_factory=dict)
-
-
-@dataclass
-class GameObject:
-    """Unity GameObject representation"""
-    file_id: str
-    name: str
-    transform: Transform
-    components: List[UnityComponent] = field(default_factory=list)
-    parent_id: Optional[str] = None
-    children_ids: List[str] = field(default_factory=list)
-    mesh_guid: Optional[str] = None
-    material_guids: List[str] = field(default_factory=list)
-    has_rigidbody: bool = False
-    rigidbody_data: Optional[Dict] = None
-    colliders: List[Dict] = field(default_factory=list)
-    is_prefab_instance: bool = False
-    prefab_source_guid: Optional[str] = None
-    component_data: Dict[str, Any] = field(default_factory=dict)
-
-    # =============================================================================
-    # Prefab-instance override capture (populated only when is_prefab_instance=True)
-    # =============================================================================
-    # Raw `m_Modification.m_Modifications` entries kept verbatim. Each entry is a
-    # dict with keys like {target: {fileID, guid, type}, propertyPath, value,
-    # objectReference}. The override emitter walks this list and dispatches by
-    # propertyPath. Transform overrides are also reflected in self.transform for
-    # convenience, but the raw entries remain here so the coverage tracker can
-    # account for everything.
-    prefab_modifications: List[Dict] = field(default_factory=list)
-    prefab_added_components: List[Dict] = field(default_factory=list)
-    prefab_removed_components: List[Dict] = field(default_factory=list)
-    prefab_added_gameobjects: List[Dict] = field(default_factory=list)  # processor-specific state
+# Unity source-data dataclasses moved to platforms.unity.types
+# (follow-up: item 4). Re-exported here so existing call sites
+# (`Transform`, `GameObject`, `UnityComponent` used throughout this
+# module + by `unity_scene_converter_gui.py` and the component
+# processors) keep working unchanged. Behaviour is byte-identical;
+# the canonical home is `platforms/unity/types.py`.
+from platforms.unity.types import Transform, UnityComponent, GameObject  # noqa: E402,F401
 
 
 class CoverageTracker:
@@ -241,387 +198,21 @@ class CoverageTracker:
         }
 
 
-class AssetDatabase:
-    """Central asset database for GUID resolution"""
-    
-    def __init__(self, unity_assets_root: Path):
-        self.unity_assets_root = unity_assets_root
-        self.guid_to_path: Dict[str, Path] = {}
-        # Raw parsed YAML body keyed by str(path). Separated from the
-        # profile-applied extraction cache so a re-parse under a different
-        # profile reuses the expensive YAML parse.
-        self.material_yaml_cache: Dict[str, Dict] = {}
-        # Profile-applied extraction. Key: (str(path), profile_id). The
-        # legacy "no profile" call sites (e.g. terrain_material_processor)
-        # use profile_id=0; F-9 worker calls pass profile_id=id(profile_dict).
-        self.material_cache: Dict[tuple, Dict] = {}
-        self.texture_extensions = {'.png', '.jpg', '.jpeg', '.tga', '.tif', '.tiff', '.bmp', '.psd', '.exr', '.hdr'}
-        self.mesh_extensions = {'.fbx', '.obj', '.dae', '.blend', '.3ds', '.max', '.ma', '.mb'}
-        
-        print("Building asset GUID index...")
-        self._build_guid_index()
-        print(f"Indexed {len(self.guid_to_path)} assets")
-    
-    def _build_guid_index(self) -> None:
-        """Build GUID -> file path index from .meta files"""
-        for meta_file in self.unity_assets_root.rglob('*.meta'):
-            try:
-                with open(meta_file, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                
-                guid_match = re.search(r'guid:\s*([a-f0-9]+)', content)
-                if guid_match:
-                    guid = guid_match.group(1)
-                    asset_file = Path(str(meta_file)[:-5])  # Remove .meta
-                    if asset_file.exists():
-                        self.guid_to_path[guid] = asset_file
-            except Exception:
-                continue
-    
-    def resolve_guid(self, guid: str) -> Optional[Path]:
-        """Resolve GUID to file path"""
-        return self.guid_to_path.get(guid)
+# AssetDatabase moved to platforms.unity.asset_database (Phase A of the
+# platform-abstraction refactor). Re-exported here so existing call sites
+# (`from integrated_asset_processor import AssetDatabase` in
+# terrain_material_processor + any future tooling) keep working without
+# code change. The original class body lived in this file at this line;
+# behaviour is unchanged.
+from platforms.unity.asset_database import AssetDatabase  # noqa: E402
 
-    def path_to_guid(self, asset_path: Path) -> Optional[str]:
-        """Reverse lookup: file path → Unity GUID (by reading the .meta sidecar)."""
-        meta = asset_path.parent / (asset_path.name + '.meta')
-        if not meta.exists():
-            return None
-        try:
-            with open(meta, 'r', encoding='utf-8') as f:
-                for line in f:
-                    if line.startswith('guid:'):
-                        return line.split(':', 1)[1].strip()
-        except Exception:
-            return None
-        return None
-    
-    def parse_material(self, material_path: Path,
-                       profile: Optional[Dict] = None) -> Optional[Dict]:
-        """Parse Unity material file and run the Unity → O3DE remap.
+# Phase A.4: shader-name resolution moved to platforms.unity.shader. The
+# IntegratedAssetProcessor class keeps `_resolve_shader_name` as a thin
+# wrapper that threads the worker's per-instance cache into the moved
+# function. Imported under an alias so the wrapper inside the class body
+# references it without colliding with the module name.
+from platforms.unity import shader as _unity_shader_module  # noqa: E402
 
-        ``profile`` is an F-9 shader profile dict (see
-        ``project_manager.DEFAULT_SHADER_PROFILE``). When ``None``, falls back
-        to the legacy hard-coded TEXTURE_MAP / PROPERTY_MAP / IGNORE_UNMAPPED
-        + ``metallic_gloss_smoothness_to_roughness=True`` behaviour so
-        existing callers (terrain_material_processor, tests) keep working.
-        """
-        profile_id = id(profile) if profile is not None else 0
-        cache_key  = (str(material_path), profile_id)
-        if cache_key in self.material_cache:
-            return self.material_cache[cache_key]
-
-        raw_material = self.material_yaml_cache.get(str(material_path))
-        if raw_material is None:
-            if not material_path.exists() or material_path.suffix != '.mat':
-                return None
-            try:
-                with open(material_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                doc_pattern = r'---\s+!u!\d+\s+&(\d+)\n(.*?)(?=---\s+!u!|\Z)'
-                matches = re.findall(doc_pattern, content, re.DOTALL)
-                for _anchor, doc_content in matches:
-                    clean_content = re.sub(r'!u!\d+', '', doc_content)
-                    try:
-                        doc = yaml.safe_load(clean_content)
-                    except yaml.YAMLError:
-                        continue
-                    if doc and 'Material' in doc:
-                        raw_material = doc['Material']
-                        self.material_yaml_cache[str(material_path)] = raw_material
-                        break
-            except Exception as e:
-                print(f"Error parsing material {material_path}: {e}")
-                return None
-
-        if raw_material is None:
-            return None
-
-        extracted = self._extract_material_data(raw_material, profile=profile)
-        self.material_cache[cache_key] = extracted
-        return extracted
-    
-    def _extract_material_data(self, material_data: Dict,
-                                profile: Optional[Dict] = None) -> Dict:
-        """Extract material properties and texture references.
-
-        When ``profile`` is provided, the texture remap, property remap,
-        ignore list, and the metallic-gloss → roughness special rule come
-        from the profile data (see ``project_manager.DEFAULT_SHADER_PROFILE``).
-        When ``profile`` is ``None``, fall back to the legacy hard-coded
-        dicts so callers that don't know about profiles (e.g.
-        ``terrain_material_processor``) keep working.
-
-        Note: the legacy fallback dicts mirror the
-        ``Default — Anything to PBR`` profile byte-for-byte. They live here
-        AS WELL AS in ``project_manager`` so a tool import that doesn't pull
-        ``project_manager`` (e.g. a standalone CLI) can still run.
-        """
-        if profile is not None:
-            # Profile-driven mode (F-9). Flatten the {slot, transform}
-            # entries: F-9 only consumes the slot field — transforms beyond
-            # "passthrough" land in F-10 with the editor.
-            TEXTURE_MAP = {
-                unity_prop: entry["slot"]
-                for unity_prop, entry in (profile.get("texture_map") or {}).items()
-                if isinstance(entry, dict) and entry.get("slot")
-            }
-            IGNORE_UNMAPPED = set(profile.get("ignore_unmapped") or [])
-            PROPERTY_MAP = {
-                unity_prop: entry["target"]
-                for unity_prop, entry in (profile.get("property_map") or {}).items()
-                if isinstance(entry, dict) and entry.get("target")
-            }
-            special_rules        = profile.get("special_rules") or {}
-            smoothness_to_rough  = bool(special_rules.get(
-                "metallic_gloss_smoothness_to_roughness", True))
-        else:
-            # Legacy hard-coded behaviour. Kept verbatim so the no-profile
-            # call path is byte-identical to pre-F-9.
-            TEXTURE_MAP = {
-                '_MainTex':          'baseColor',
-                '_BaseMap':          'baseColor',
-                '_BaseColorMap':     'baseColor',
-                '_Albedo':           'baseColor',
-                '_AlbedoMap':        'baseColor',
-                '_AlbedoTex':        'baseColor',
-                '_Diffuse':          'baseColor',
-                '_DiffuseMap':       'baseColor',
-                '_DiffuseTex':       'baseColor',
-                '_ColorMap':         'baseColor',
-                '_BumpMap':          'normal',
-                '_NormalMap':        'normal',
-                '_NormalTex':        'normal',
-                '_MetallicGlossMap': 'metallic',
-                '_MetallicMap':      'metallic',
-                '_MetallicTex':      'metallic',
-                '_Metallic_Map':     'metallic',
-                '_SpecGlossMap':     'specular',
-                '_SpecularMap':      'specular',
-                '_OcclusionMap':         'occlusion.specular',
-                '_AOMap':                'occlusion.specular',
-                '_AmbientOcclusion':     'occlusion.specular',
-                '_AmbientOcclusionMap':  'occlusion.specular',
-                '_AO':                   'occlusion.specular',
-                '_RockAlbedo':       'baseColor',
-                '_RockNormal':       'normal',
-                '_RockSpecular':     'specular',
-                '_EmissionMap':      'emissive',
-                '_EmissionTex':      'emissive',
-                '_EmissiveMap':      'emissive',
-                '_Emissive':         'emissive',
-                '_HeightMap':        'height',
-                '_ParallaxMap':      'height',
-                '_DisplacementMap':  'height',
-            }
-            IGNORE_UNMAPPED = {
-                '_DetailAlbedoMap', '_DetailMask', '_DetailNormalMap',
-                '_LightTextureB0', '_VectorNoise', '_texcoord',
-                '_Composite', '_CompositeMap', '_MOHS', '_MaskMap',
-                '_Detail', '_AODetail',
-                '_CoverAlbedo', '_CoverNormal', '_CoverSpecular',
-            }
-            PROPERTY_MAP = {
-                '_Color':             'baseColor.color',
-                '_BaseColor':         'baseColor.color',
-                '_BumpScale':         'normal.factor',
-                '_OcclusionStrength': 'occlusion.specularFactor',
-                '_EmissionColor':     'emissive.color',
-            }
-            smoothness_to_rough = True
-        
-        # Unity materials store m_Shader as a reference, not a name. Record
-        # the guid + fileID so _process_material can resolve the friendly
-        # "Shader \"Name\"" string via the .shader file (or a built-in
-        # lookup table).
-        shader_ref = material_data.get('m_Shader') or {}
-        if not isinstance(shader_ref, dict):
-            shader_ref = {}
-        extracted = {
-            'name':         material_data.get('m_Name', 'Material'),
-            'shader':       '',  # filled by _process_material via _resolve_shader_name
-            'shader_guid':  shader_ref.get('guid', '') or '',
-            'shader_fileid': shader_ref.get('fileID', 0) or 0,
-            'textures':    {},
-            'properties': {},
-            # GUIDs that came from Unity's _MetallicGlossMap. _process_material
-            # uses this set to decide whether the roughness slot should sample
-            # from an alpha-inverted re-bake rather than the raw Unity texture.
-            'metallic_gloss_source_guids': set(),
-        }
-
-        saved_properties = material_data.get('m_SavedProperties', {})
-
-        # Extract textures
-        tex_envs = saved_properties.get('m_TexEnvs', [])
-        unmapped_with_texture: List[str] = []
-        for tex_prop in tex_envs:
-            for prop_name, tex_data in tex_prop.items():
-                texture_ref = tex_data.get('m_Texture', {})
-                guid = texture_ref.get('guid', '')
-
-                if not guid:
-                    continue
-
-                if prop_name in TEXTURE_MAP:
-                    o3de_prop = TEXTURE_MAP[prop_name]
-                    # Don't let a later alias clobber an already-resolved slot
-                    # (e.g. _BumpMap and _NormalMap both → 'normal'; keep first).
-                    if o3de_prop not in extracted['textures']:
-                        extracted['textures'][o3de_prop] = guid
-
-                    # Unity's _MetallicGlossMap contains metallic in RGB and smoothness in Alpha.
-                    # O3DE needs the same texture for both metallic and roughness, but only
-                    # when the profile's smoothness_to_roughness rule is enabled.
-                    if prop_name == '_MetallicGlossMap' and smoothness_to_rough:
-                        if 'roughness' not in extracted['textures']:
-                            extracted['textures']['roughness'] = guid
-                        extracted['metallic_gloss_source_guids'].add(guid)
-                elif prop_name not in IGNORE_UNMAPPED:
-                    unmapped_with_texture.append(prop_name)
-
-        if unmapped_with_texture:
-            # Record on the extracted dict so _process_material can surface a
-            # single concise warning per material (with the material name and
-            # shader path for context).
-            extracted['unmapped_texture_props'] = unmapped_with_texture
-        
-        # Extract float properties
-        floats = saved_properties.get('m_Floats', [])
-        for float_prop in floats:
-            for prop_name, value in float_prop.items():
-                if prop_name in PROPERTY_MAP:
-                    o3de_prop = PROPERTY_MAP[prop_name]
-                    extracted['properties'][o3de_prop] = value
-        
-        # Extract colors
-        colors = saved_properties.get('m_Colors', [])
-        for color_prop in colors:
-            for prop_name, color_data in color_prop.items():
-                if prop_name in PROPERTY_MAP:
-                    o3de_prop = PROPERTY_MAP[prop_name]
-                    r = color_data.get('r', 1.0)
-                    g = color_data.get('g', 1.0)
-                    b = color_data.get('b', 1.0)
-                    a = color_data.get('a', 1.0)
-                    extracted['properties'][o3de_prop] = [r, g, b, a]
-
-        # ---------------------------------------------------------------
-        # Metallic / Roughness reconciliation
-        #
-        # O3DE StandardPBR exposes these properties with TEXTURE-AWARE semantics:
-        #
-        #   metallic
-        #     - texture bound    → no factor dial; the texture is the value.
-        #     - no texture       → metallic.factor ∈ [0, 1].
-        #
-        #   roughness
-        #     - texture bound    → no factor; instead roughness.lowerBound /
-        #                          roughness.upperBound remap the sampled range.
-        #                          (0 = shiny, 1 = rough.)
-        #     - no texture       → roughness.factor ∈ [0, 1]. (0 = shiny, 1 = rough.)
-        #
-        # Unity stores SMOOTHNESS (= 1 − roughness):
-        #
-        #   No map:  _Smoothness (URP) or _Glossiness (Standard) is the scalar.
-        #   Map:     sampled smoothness is multiplied by _GlossMapScale (Standard)
-        #            or _Smoothness (URP, which reuses the scalar in both roles).
-        #
-        # Mapping when a texture is bound:
-        #   multiplier `s`  ⇒  final smoothness ∈ [0, s]
-        #                  ⇒  final roughness  ∈ [1 − s, 1]
-        #                  ⇒  O3DE lowerBound = 1 − s, upperBound = 1.0
-        #
-        # Note: Unity's _MetallicGlossMap stores smoothness in the alpha channel.
-        # O3DE samples the bound texture directly as roughness, so the alpha would
-        # have to be pre-inverted at copy time for the texture branch to look
-        # correct. That texture-channel fix is a separate concern from the
-        # factor / bound semantics handled here.
-        # ---------------------------------------------------------------
-        raw_metallic        = None
-        raw_smoothness      = None
-        raw_smoothness_mult = None
-        for float_prop in floats:
-            for prop_name, value in float_prop.items():
-                if prop_name == '_Metallic':
-                    raw_metallic = float(value)
-                elif prop_name in ('_Smoothness', '_Glossiness'):
-                    raw_smoothness = float(value)
-                elif prop_name == '_GlossMapScale':
-                    raw_smoothness_mult = float(value)
-
-        has_metallic_tex  = 'metallic'  in extracted['textures']
-        has_roughness_tex = 'roughness' in extracted['textures']
-
-        # Metallic: factor is only meaningful without a texture.
-        if not has_metallic_tex and raw_metallic is not None:
-            extracted['properties']['metallic.factor'] = raw_metallic
-
-        # Roughness: pick factor vs bounds based on whether a texture is bound.
-        # The inversion below assumes Unity stored smoothness — profiles whose
-        # source shader already speaks roughness can flip
-        # `metallic_gloss_smoothness_to_roughness` off so the value passes
-        # through untouched.
-        if has_roughness_tex and smoothness_to_rough:
-            # Standard's _GlossMapScale takes precedence over _Smoothness/_Glossiness
-            # when a gloss map is present (URP collapses both into _Smoothness).
-            multiplier = (raw_smoothness_mult
-                          if raw_smoothness_mult is not None
-                          else raw_smoothness)
-            if multiplier is not None:
-                lower = max(0.0, min(1.0, 1.0 - float(multiplier)))
-                extracted['properties']['roughness.lowerBound'] = lower
-                extracted['properties']['roughness.upperBound'] = 1.0
-        elif raw_smoothness is not None and smoothness_to_rough:
-            extracted['properties']['roughness.factor'] = max(
-                0.0, min(1.0, 1.0 - raw_smoothness)
-            )
-        elif raw_smoothness is not None and not smoothness_to_rough:
-            # Profile says the source is already roughness, not smoothness.
-            extracted['properties']['roughness.factor'] = max(
-                0.0, min(1.0, raw_smoothness)
-            )
-
-        # ---------------------------------------------------------------
-        # Transparency / Cutout Detection
-        # Unity URP/HDRP:
-        #   _Surface=0  = Opaque
-        #   _Surface=1  = Transparent (blended)
-        #   _AlphaClip=1 on an opaque surface (_Surface=0) = Cutout
-        # Unity Standard shader:
-        #   _Mode=0 = Opaque, _Mode=1 = Cutout, _Mode>=2 = Transparent
-        #   _Cutoff = alpha clip threshold (0..1)
-        #
-        # O3DE opacity modes:
-        #   "Opaque"  — no transparency
-        #   "Cutout"  — opaque with alpha-tested mask, uses opacity.alphaSource + factor
-        #   "Blended" — true alpha blending
-        # ---------------------------------------------------------------
-        raw_floats = {}
-        for float_prop in floats:
-            for prop_name, value in float_prop.items():
-                if prop_name in ('_Mode', '_Surface', '_Blend', '_AlphaClip', '_Cutoff'):
-                    raw_floats[prop_name] = float(value)
-
-        is_transparent = (raw_floats.get('_Surface', 0) == 1
-                          or raw_floats.get('_Mode', 0) >= 2)
-        is_cutout      = (not is_transparent
-                          and (raw_floats.get('_AlphaClip', 0) == 1
-                               or raw_floats.get('_Mode', 0) == 1))
-
-        # Unity stores alpha in the baseColor texture's alpha channel for both
-        # cutout and transparent surfaces. O3DE StandardPBR requires alphaSource
-        # to be set explicitly, otherwise the mask/blend is ignored and the
-        # material renders as fully opaque regardless of opacity.mode.
-        if is_transparent:
-            extracted['properties']['opacity.mode']        = "Blended"
-            extracted['properties']['opacity.alphaSource'] = "Packed"
-        elif is_cutout:
-            extracted['properties']['opacity.mode']        = "Cutout"
-            extracted['properties']['opacity.alphaSource'] = "Packed"
-            extracted['properties']['opacity.factor']      = raw_floats.get('_Cutoff', 0.5)
-
-        return extracted
 
 
 
@@ -799,9 +390,17 @@ def build_fbx_node_paths(mesh_entities: list, all_game_objects: dict,
     return result
 
 
-# Quaternion for 90° rotation around X axis (Y-up → Z-up correction).
-# Module-level so the F-9 mesh-settings composition path can read it.
-Y_UP_ROTATION = [0.7071067690849304, 0.0, 0.0, 0.7071067094802856]
+# Phase A.3: `Y_UP_ROTATION`, `_euler_deg_to_quat`, `_quat_mul`,
+# `_resolve_mesh_settings`, and `write_fbx_assetinfo` moved to
+# `targets.o3de.assetinfo_writer`. Re-exported here so existing call
+# sites in this module + any tests reaching for them work unchanged.
+from targets.o3de.assetinfo_writer import (  # noqa: E402
+    Y_UP_ROTATION,
+    _euler_deg_to_quat,
+    _quat_mul,
+    _resolve_mesh_settings,
+    write_fbx_assetinfo,
+)
 
 
 def _utc_now_iso() -> str:
@@ -809,195 +408,6 @@ def _utc_now_iso() -> str:
     the worker doesn't pull project_manager just for a date string."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-
-def _euler_deg_to_quat(deg_xyz) -> list:
-    """Convert Euler XYZ degrees to a quaternion [x, y, z, w] using the
-    intrinsic ZYX rotation convention (same as Unity's TRS Quaternion.Euler).
-    Returns the identity for an all-zero input."""
-    rx = math.radians(float(deg_xyz[0] or 0.0))
-    ry = math.radians(float(deg_xyz[1] or 0.0))
-    rz = math.radians(float(deg_xyz[2] or 0.0))
-    cr, cp, cy = math.cos(rx * 0.5), math.cos(ry * 0.5), math.cos(rz * 0.5)
-    sr, sp, sy = math.sin(rx * 0.5), math.sin(ry * 0.5), math.sin(rz * 0.5)
-    return [
-        sr * cp * cy - cr * sp * sy,
-        cr * sp * cy + sr * cp * sy,
-        cr * cp * sy - sr * sp * cy,
-        cr * cp * cy + sr * sp * sy,
-    ]
-
-
-def _quat_mul(q1, q2) -> list:
-    """Hamilton-product quaternion multiplication: result = q1 ⊗ q2."""
-    x1, y1, z1, w1 = q1
-    x2, y2, z2, w2 = q2
-    return [
-        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-    ]
-
-
-def _resolve_mesh_settings(mesh_settings: Optional[Dict],
-                            mesh_guid: Optional[str]) -> dict:
-    """F-9 mesh settings chain — `overrides[mesh_guid]` (partial) merged on
-    top of `defaults`. Returns a fully-populated dict carrying the three
-    knobs the assetinfo writer cares about. When no settings supplied,
-    returns the conservative defaults (zero position, no rotation) so the
-    legacy call path keeps writing the same assetinfo content."""
-    defaults = {
-        "zero_position":    True,
-        "default_position": [0.0, 0.0, 0.0],
-        "default_rotation": [0.0, 0.0, 0.0],
-    }
-    if not mesh_settings:
-        return defaults
-    base = dict(defaults)
-    base.update(mesh_settings.get("defaults") or {})
-    override = ((mesh_settings.get("overrides") or {}).get(mesh_guid)
-                if mesh_guid else None)
-    if isinstance(override, dict):
-        base.update(override)
-    return base
-
-
-def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
-                         entity_node_map: dict, log=print,
-                         collider_entity_node_map: dict = None,
-                         mesh_settings: Optional[Dict] = None,
-                         mesh_guid: Optional[str] = None) -> None:
-    """Write an O3DE .assetinfo with one named MeshGroup per mesh entity.
-
-    Group name format: "{fbx_stem}-{entity_name}"  e.g. "Closet_A-Glass_L"
-    O3DE lowercases the output: closet_a-glass_l.fbx.azmodel
-
-    Each group selects exactly its FBX node; all other mesh nodes are unselected.
-    Rules mirror O3DE's auto-generated defaults: StaticMeshAdvancedRule (vertex color Col0),
-    MaterialRule, CoordinateSystemRule (useAdvancedData=true), and LodRule.
-    Y-up FBX files (Maya-style, up_axis==1) get a 90° pitch rotation baked into
-    the CoordinateSystemRule so the mesh imports upright without a transform workaround.
-
-    F-9 mesh settings (defaults + overrides) layer on top of the Y-up
-    correction. `default_rotation` is XYZ Euler degrees, converted to a
-    quaternion and composed with the Y-up quaternion so the user transform
-    sits in mesh-local space. `default_position` is a metric translation —
-    written into the CoordinateSystemRule only when `zero_position=True`
-    (the documented "zero on import, then offset by default_position"
-    behaviour). When `zero_position=False` no translation field is emitted,
-    so the source FBX node transform passes through.
-
-    When collider_entity_node_map is provided, one PhysX convex MeshGroup is also
-    written per collider entity, targeting the parent node of the visual mesh node.
-    This produces the .pxmesh file that EditorMeshColliderComponent references.
-    """
-    import json as _json
-    import uuid as _uuid
-
-    # Detect Y-up FBX — up_axis==1 means Y-up (Maya), 2 means Z-up (matches O3DE)
-    up_axis = read_fbx_up_axis(fbx_dest_path)
-    is_y_up = (up_axis == 1)
-    if is_y_up:
-        log(f"    [Mesh] Y-up detected — adding 90° pitch to CoordinateSystemRule")
-
-    # F-9 — resolve the per-mesh settings chain (defaults + override).
-    eff = _resolve_mesh_settings(mesh_settings, mesh_guid)
-    user_rot   = list(eff.get("default_rotation") or [0.0, 0.0, 0.0])
-    user_pos   = list(eff.get("default_position") or [0.0, 0.0, 0.0])
-    zero_pos   = bool(eff.get("zero_position", True))
-    has_user_rotation = any(abs(float(v)) > 1e-6 for v in user_rot)
-    has_user_translation = any(abs(float(v)) > 1e-6 for v in user_pos)
-
-    coordinate_rule = {"$type": "CoordinateSystemRule", "useAdvancedData": True}
-    # Compose rotation: Y-up correction first (mesh-local), then user rotation.
-    # Result quaternion is q_user ⊗ q_yup so the user's authored transform
-    # applies in the corrected coordinate space.
-    if is_y_up and has_user_rotation:
-        coordinate_rule["rotation"] = _quat_mul(
-            _euler_deg_to_quat(user_rot), Y_UP_ROTATION,
-        )
-    elif is_y_up:
-        coordinate_rule["rotation"] = list(Y_UP_ROTATION)
-    elif has_user_rotation:
-        coordinate_rule["rotation"] = _euler_deg_to_quat(user_rot)
-    # Translation only when zero_position=True. zero_position=False explicitly
-    # opts out of having the assetinfo touch position at all.
-    if zero_pos and has_user_translation:
-        coordinate_rule["translation"] = [float(v) for v in user_pos]
-
-    all_node_paths = list(entity_node_map.values())
-    groups = []
-
-    # -------------------------------------------------------------------------
-    # VISUAL MESH GROUPS  ({07B356B7...} MeshGroup)
-    # One group per entity — produces the .azmodel render asset.
-    # -------------------------------------------------------------------------
-    for entity_name, node_path in entity_node_map.items():
-        group_name = f"{fbx_stem}-{entity_name}"
-        unselected = [p for p in all_node_paths if p != node_path]
-        groups.append({
-            "$type": "{07B356B7-3635-40B5-878A-FAC4EFD5AD86} MeshGroup",
-            "name": group_name,
-            "nodeSelectionList": {
-                "selectedNodes": ["RootNode", node_path],
-                "unselectedNodes": unselected
-            },
-            "rules": {
-                "rules": [
-                    {"$type": "StaticMeshAdvancedRule", "vertexColorStreamName": "Col0"},
-                    {"$type": "MaterialRule"},
-                    coordinate_rule,
-                    {"$type": "{6E796AC8-1484-4909-860A-6D3F22A7346F} LodRule"}
-                ]
-            },
-            "id": "{" + str(_uuid.uuid4()).upper() + "}"
-        })
-
-    # -------------------------------------------------------------------------
-    # PHYSX MESH GROUPS  ({5B03C8E6...} MeshGroup)
-    # One convex group per collider entity — produces the .pxmesh physics asset.
-    # Targets the parent node of the visual mesh node so all geometry is captured.
-    # -------------------------------------------------------------------------
-    if collider_entity_node_map:
-        # PhysX collider lives in the same mesh-local space as the visual
-        # group, so the same composed rotation + translation applies.
-        physx_coord_rule = dict(coordinate_rule)
-
-        for entity_name, node_path in collider_entity_node_map.items():
-            parts = node_path.split(".")
-            parent_path   = ".".join(parts[:-1]) if len(parts) > 1 else node_path
-            mesh_node_name = parts[-1]
-
-            groups.append({
-                "$type": "{5B03C8E6-8CEE-4DA0-A7FA-CD88689DD45B} MeshGroup",
-                "id": "{" + str(_uuid.uuid4()).upper() + "}",
-                "name": f"{fbx_stem}-{entity_name}",
-                "NodeSelectionList": {
-                    "selectedNodes": ["RootNode", parent_path],
-                    "unselectedNodes": [{}]
-                },
-                "export method": 1,
-                "ConvexAssetParams": {
-                    "Use16bitIndices": True,
-                    "CheckZeroAreaTriangles": True
-                },
-                "PhysicsMaterialSlots": {
-                    "Slots": [{"Name": mesh_node_name}]
-                },
-                "rules": {
-                    "rules": [physx_coord_rule]
-                }
-            })
-
-        log(f"    [Mesh] Added {len(collider_entity_node_map)} PhysX MeshGroup(s)")
-
-    sidecar = Path(str(fbx_dest_path) + ".assetinfo")
-    try:
-        with open(sidecar, 'w', encoding='utf-8') as f:
-            _json.dump({"values": groups}, f, indent=4)
-        log(f"    [Mesh] .assetinfo written — {len(groups)} group(s) ({sidecar.name})")
-    except Exception as e:
-        log(f"    [Mesh] WARNING: Could not write .assetinfo: {e}")
 
 
 class IntegratedAssetProcessor:
@@ -1010,13 +420,29 @@ class IntegratedAssetProcessor:
                  material_settings: Optional[Dict] = None,
                  mesh_settings:     Optional[Dict] = None,
                  scope_root:        Optional[Path] = None,
-                 state_index:       Optional[Dict] = None):
+                 state_index:       Optional[Dict] = None,
+                 platform=None):
         self.unity_assets_root = unity_assets_root
         self.output_root = output_root
         self.log = log_callback or print
 
         # Per-run config flags
         self.convert_smoothness_to_roughness = convert_smoothness_to_roughness
+
+        # Phase C — source-platform plugin. Defaults to the Unity reference
+        # plugin via the registry. Other plugins (Unreal / Godot / Blender)
+        # plug in here once they're authored. The worker stays
+        # platform-agnostic at the orchestration level; per-method calls
+        # consult ``self.platform`` for platform-specific behaviour.
+        if platform is None:
+            from platforms import get as _get_platform
+            platform = _get_platform("unity")
+            if platform is None:
+                raise RuntimeError(
+                    "No 'unity' platform registered. The platforms package "
+                    "must be importable before constructing the worker."
+                )
+        self.platform = platform
 
         # F-9 settings copied at construction time so worker mutations don't
         # round-trip back into the project state until to_outputs() runs.
@@ -1042,6 +468,12 @@ class IntegratedAssetProcessor:
         }
 
         self.asset_db = AssetDatabase(unity_assets_root)
+        # Bind the worker-owned AssetDatabase into the active platform so
+        # the platform's parse methods reuse this GUID index instead of
+        # building a fresh one. Worker and platform share state until the
+        # worker is destructed.
+        if hasattr(self.platform, "bind_asset_db"):
+            self.platform.bind_asset_db(self.asset_db)
         
         # Output structure
         self.prefabs_dir = output_root / "Prefabs"
@@ -1120,10 +552,17 @@ class IntegratedAssetProcessor:
 
         self.entity_id_counter = 1000000
 
-        # Component processor registry — auto-discovered from components/
-        self.component_processors = load_component_processors(self.log)
+        # Component processor registry — sourced from the active platform
+        # plugin. Phase C wires this through `SourcePlatform.component_processors()`
+        # so a non-Unity plugin can ship its own per-engine processor set
+        # (e.g. an Unreal plugin's StaticMeshActor / SpotLightComponent
+        # translators) without touching the worker.
+        self.component_processors = self.platform.component_processors()
         self.component_dispatch   = build_dispatch_table(self.component_processors)
-        self.log(f"  Registered {len(self.component_processors)} component processor(s)")
+        self.log(
+            f"  Registered {len(self.component_processors)} component "
+            f"processor(s) from platform '{self.platform.NAME}'"
+        )
 
         # Surface the smoothness→roughness conversion mode at run start so
         # the log makes it obvious which texture pipeline is active.
@@ -1244,11 +683,19 @@ class IntegratedAssetProcessor:
                     and any(c['type'] == 'MeshCollider' for c in go.colliders)
                 }
 
+                # Pass the platform's source-axis correction quaternion
+                # (follow-up: item 5). Unity supplies its Y-up→Z-up quat;
+                # other plugins ship their own constant via
+                # `platforms.<name>.coordinates`.
+                correction_quat = getattr(
+                    self.platform, "correction_quat", None,
+                )
                 write_fbx_assetinfo(
                     fbx_path, fbx_stem, entity_node_map, self.log,
                     collider_entity_node_map=collider_entity_node_map or None,
                     mesh_settings=self._mesh_settings,
                     mesh_guid=mesh_guid,
+                    correction_quat=correction_quat,
                 )
                 # F-9.I.4 — record mesh fingerprint AFTER the assetinfo
                 # exists on disk so the recorded output_files list includes
@@ -1450,325 +897,71 @@ class IntegratedAssetProcessor:
             "prefabs":   dict(self._state_index_out["prefabs"]),
         }
     
+    def _parser_context(self):
+        """Build a fresh ``UnityParseContext`` from the worker's
+        state. Each parser entry-point constructs one on demand."""
+        from platforms.unity.prefab import UnityParseContext
+        return UnityParseContext(
+            log=self.log,
+            coverage=self.coverage,
+            component_dispatch=self.component_dispatch,
+        )
+
     def _parse_unity_prefab(self, prefab_path: Path) -> Tuple[Dict[str, GameObject], Dict[str, str]]:
-        """Parse Unity prefab and extract GameObjects"""
-        game_objects = {}
-        components_data = {}
-        transform_to_gameobject = {}
-        
-        with open(prefab_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        doc_pattern = r'---\s+!u!\d+\s+&(\d+)\n(.*?)(?=---\s+!u!|\Z)'
-        matches = re.findall(doc_pattern, content, re.DOTALL)
-        
-        for anchor, doc_content in matches:
-            clean_content = re.sub(r'!u!\d+', '', doc_content)
-            
-            try:
-                doc = yaml.safe_load(clean_content)
-                if not doc:
-                    continue
-                
-                if 'Transform' in doc:
-                    self._parse_transform(doc['Transform'], anchor, game_objects, transform_to_gameobject)
-                elif 'GameObject' in doc:
-                    self._parse_game_object(doc['GameObject'], anchor, game_objects, transform_to_gameobject)
-                elif 'PrefabInstance' in doc:
-                    # PrefabInstance blocks represent nested prefabs
-                    self._parse_prefab_instance_in_prefab(doc['PrefabInstance'], anchor, game_objects, transform_to_gameobject)
-                else:
-                    # Dispatch to registered component processors and record
-                    # every top-level key into coverage so the end-of-run report
-                    # shows both handled and unhandled component types.
-                    handled = False
-                    for known_type in self.component_dispatch:
-                        if known_type in doc:
-                            components_data[anchor] = {'type': known_type, 'data': doc[known_type]}
-                            self.coverage.record_component(
-                                known_type,
-                                type(self.component_dispatch[known_type]).__name__,
-                            )
-                            handled = True
-                            break
-                    if not handled:
-                        for top_key in doc:
-                            self.coverage.record_component(top_key, None)
-            
-            except yaml.YAMLError:
-                continue
-        
-        # Build hierarchy and assign components
-        self._build_hierarchy(game_objects, transform_to_gameobject, components_data)
-        
-        return game_objects, transform_to_gameobject
-    
-    def _parse_transform(self, transform_data: Dict, anchor: str, 
+        """Parse Unity prefab and extract GameObjects.
+
+        Body extracted to ``platforms.unity.prefab.parse_unity_prefab``
+        (follow-up: item 1a). This method now builds a
+        ``UnityParseContext`` and delegates."""
+        from platforms.unity.prefab import parse_unity_prefab
+        return parse_unity_prefab(self._parser_context(), prefab_path)
+
+    def _parse_transform(self, transform_data: Dict, anchor: str,
                         game_objects: Dict, transform_map: Dict) -> None:
-        """Parse Transform component"""
-        go_ref = transform_data.get('m_GameObject', {})
-        go_file_id = str(go_ref.get('fileID', ''))
-        
-        if not go_file_id or go_file_id == '0':
-            return
-        
-        transform_map[anchor] = go_file_id
-        
-        local_pos = transform_data.get('m_LocalPosition', {'x': 0, 'y': 0, 'z': 0})
-        local_rot = transform_data.get('m_LocalRotation', {'x': 0, 'y': 0, 'z': 0, 'w': 1})
-        local_scale = transform_data.get('m_LocalScale', {'x': 1, 'y': 1, 'z': 1})
-        
-        position = (float(local_pos.get('x', 0)), float(local_pos.get('y', 0)), float(local_pos.get('z', 0)))
-        rotation = (float(local_rot.get('x', 0)), float(local_rot.get('y', 0)),
-                   float(local_rot.get('z', 0)), float(local_rot.get('w', 1)))
-        scale = (float(local_scale.get('x', 1)), float(local_scale.get('y', 1)), float(local_scale.get('z', 1)))
-        
-        transform = Transform(position, rotation, scale)
-        
-        if go_file_id not in game_objects:
-            game_objects[go_file_id] = GameObject(
-                file_id=go_file_id,
-                name="",
-                transform=transform
-            )
-        else:
-            game_objects[go_file_id].transform = transform
-        
-        parent = transform_data.get('m_Father', {})
-        parent_transform_id = str(parent.get('fileID', '0'))
-        if parent_transform_id != '0':
-            game_objects[go_file_id].parent_id = parent_transform_id
-        
-        children = transform_data.get('m_Children', [])
-        for child in children:
-            if child and child.get('fileID'):
-                child_transform_id = str(child['fileID'])
-                game_objects[go_file_id].children_ids.append(child_transform_id)
-    
-    def _parse_game_object(self, go_data: Dict, anchor: str, 
+        """Body extracted to ``platforms.unity.prefab.parse_transform``."""
+        from platforms.unity.prefab import parse_transform
+        return parse_transform(self._parser_context(),
+                                transform_data, anchor, game_objects, transform_map)
+
+    def _parse_game_object(self, go_data: Dict, anchor: str,
                           game_objects: Dict, transform_map: Dict) -> None:
-        """Parse GameObject"""
-        file_id = anchor
-        name = go_data.get('m_Name', 'GameObject')
-        
-        components = go_data.get('m_Component', [])
-        transform_id = None
-        for comp in components:
-            comp_ref = comp.get('component', {})
-            comp_file_id = str(comp_ref.get('fileID', ''))
-            if comp_file_id:
-                transform_id = comp_file_id
-                break
-        
-        if transform_id and transform_id in transform_map:
-            old_go_id = transform_map[transform_id]
-            if old_go_id in game_objects:
-                game_objects[file_id] = game_objects.pop(old_go_id)
-                game_objects[file_id].file_id = file_id
-                game_objects[file_id].name = name
-            transform_map[transform_id] = file_id
-        
-        if file_id in game_objects:
-            game_objects[file_id].name = name
-        else:
-            game_objects[file_id] = GameObject(
-                file_id=file_id,
-                name=name,
-                transform=Transform()
-            )
+        """Body extracted to ``platforms.unity.prefab.parse_game_object``."""
+        from platforms.unity.prefab import parse_game_object
+        return parse_game_object(self._parser_context(),
+                                  go_data, anchor, game_objects, transform_map)
     
     def _parse_prefab_instance_in_prefab(self, instance_data: Dict, anchor: str,
                                         game_objects: Dict, transform_map: Dict) -> None:
-        """
-        Parse a PrefabInstance block (a nested prefab reference inside a Unity prefab).
-
-        Captures the FULL m_Modifications array verbatim onto the GameObject so
-        downstream emission can dispatch overrides by propertyPath. Also extracts
-        m_AddedComponents, m_RemovedComponents, m_AddedGameObjects from the
-        m_Modification block — these live alongside m_Modifications, not inside it.
-
-        The transform-related modifications are additionally projected onto a
-        Transform so that the converter's existing position/rotation/scale plumbing
-        keeps working. All other overrides are left for _create_nested_prefab_instance
-        to translate into O3DE JSON patches.
-        """
-        source_prefab = instance_data.get('m_SourcePrefab', {})
-        prefab_guid   = source_prefab.get('guid', '')
-        if not prefab_guid:
-            return
-
-        modification         = instance_data.get('m_Modification', {})
-        modifications        = modification.get('m_Modifications', []) or []
-        added_components     = modification.get('m_AddedComponents', []) or []
-        removed_components   = modification.get('m_RemovedComponents', []) or []
-        added_gameobjects    = modification.get('m_AddedGameObjects', []) or []
-        parent_transform     = modification.get('m_TransformParent', {}) or {}
-        parent_id            = str(parent_transform.get('fileID', ''))
-
-        # --- Project transform-related overrides onto a Transform ---
-        # All other overrides stay in modifications[] for the emitter to handle.
-        name     = 'PrefabInstance'
-        position = [0.0, 0.0, 0.0]
-        rotation = [0.0, 0.0, 0.0, 1.0]
-        scale    = [1.0, 1.0, 1.0]
-        TRANSFORM_AXIS = {'x': 0, 'y': 1, 'z': 2, 'w': 3}
-
-        for mod in modifications:
-            prop_path = mod.get('propertyPath', '') or ''
-            value     = mod.get('value', 0)
-
-            if prop_path == 'm_Name':
-                name = str(value) if value else name
-            elif prop_path.startswith('m_LocalPosition.'):
-                axis = prop_path.rsplit('.', 1)[-1]
-                if axis in TRANSFORM_AXIS and TRANSFORM_AXIS[axis] < 3:
-                    position[TRANSFORM_AXIS[axis]] = float(value)
-            elif prop_path.startswith('m_LocalRotation.'):
-                axis = prop_path.rsplit('.', 1)[-1]
-                if axis in TRANSFORM_AXIS:
-                    rotation[TRANSFORM_AXIS[axis]] = float(value)
-            elif prop_path.startswith('m_LocalScale.'):
-                axis = prop_path.rsplit('.', 1)[-1]
-                if axis in TRANSFORM_AXIS and TRANSFORM_AXIS[axis] < 3:
-                    scale[TRANSFORM_AXIS[axis]] = float(value)
-
-        transform = Transform(
-            position=tuple(position),
-            rotation=tuple(rotation),
-            scale=tuple(scale),
+        """Body extracted to
+        ``platforms.unity.prefab.parse_prefab_instance_in_prefab``."""
+        from platforms.unity.prefab import parse_prefab_instance_in_prefab
+        return parse_prefab_instance_in_prefab(
+            self._parser_context(),
+            instance_data, anchor, game_objects, transform_map,
         )
 
-        file_id = anchor
-        go = GameObject(
-            file_id=file_id,
-            name=name,
-            transform=transform,
-            is_prefab_instance=True,
-            prefab_source_guid=prefab_guid,
+    def _build_hierarchy(self, game_objects: Dict, transform_map: Dict,
+                         components_data: Dict) -> None:
+        """Body extracted to ``platforms.unity.prefab.build_hierarchy``."""
+        from platforms.unity.prefab import build_hierarchy
+        return build_hierarchy(
+            self._parser_context(),
+            game_objects, transform_map, components_data,
         )
-
-        # Keep every override entry around for the emitter and the coverage tracker.
-        go.prefab_modifications      = list(modifications)
-        go.prefab_added_components   = list(added_components)
-        go.prefab_removed_components = list(removed_components)
-        go.prefab_added_gameobjects  = list(added_gameobjects)
-
-        if parent_id and parent_id != '0':
-            go.parent_id = parent_id
-
-        game_objects[file_id] = go
-
-        # Log a one-line override summary for visibility during conversion.
-        other_count = sum(
-            1 for m in modifications
-            if not (m.get('propertyPath', '') or '').startswith(
-                ('m_LocalPosition.', 'm_LocalRotation.', 'm_LocalScale.', 'm_Name')
-            )
-        )
-        self.log(
-            f"  [PrefabInstance] '{name}' src={prefab_guid[:8]}… "
-            f"mods={len(modifications)} (transform+name handled, "
-            f"{other_count} other), added_comp={len(added_components)}, "
-            f"removed_comp={len(removed_components)}, "
-            f"added_go={len(added_gameobjects)}"
-        )
-        # Don't add to transform_map since PrefabInstance doesn't have a separate Transform component
-    
-    def _build_hierarchy(self, game_objects: Dict, transform_map: Dict, components_data: Dict) -> None:
-        """Build hierarchy and assign component data"""
-        # Resolve transform IDs to GameObject IDs
-        for go_id, go in list(game_objects.items()):
-            if go.parent_id and go.parent_id in transform_map:
-                go.parent_id = transform_map[go.parent_id]
-            elif go.parent_id == '0':
-                go.parent_id = None
-            
-            resolved_children = []
-            for child_transform_id in go.children_ids:
-                if child_transform_id in transform_map:
-                    resolved_children.append(transform_map[child_transform_id])
-            go.children_ids = resolved_children
-        
-        # Ensure parent-child relationships (bidirectional)
-        for file_id, go in game_objects.items():
-            # Forward: parent -> children
-            for child_id in go.children_ids:
-                if child_id in game_objects:
-                    game_objects[child_id].parent_id = file_id
-            
-            # Reverse: child -> parent (add child to parent's children_ids if not already there)
-            if go.parent_id and go.parent_id in game_objects:
-                parent_go = game_objects[go.parent_id]
-                if file_id not in parent_go.children_ids:
-                    parent_go.children_ids.append(file_id)
-        
-        # Dispatch each component to its registered processor's parse() method
-        for comp_id, comp_info in components_data.items():
-            comp_type = comp_info.get('type')
-            comp_data = comp_info.get('data', {})
-
-            go_ref = comp_data.get('m_GameObject', {})
-            go_id  = str(go_ref.get('fileID', ''))
-
-            if go_id not in game_objects:
-                self.log(f"  [Hierarchy] ⚠ Component '{comp_type}' references unknown GO id={go_id}")
-                continue
-
-            go = game_objects[go_id]
-
-            processor = self.component_dispatch.get(comp_type)
-            if processor:
-                self.log(f"  [Hierarchy] Parsing {comp_type} on '{go.name}'")
-                processor.parse(comp_type, comp_data, go, self.log)
-            else:
-                self.log(f"  [Hierarchy] ⚠ No processor for component type '{comp_type}' — skipped")
     
     
-    # F-6 — Map a few Unity built-in shader fileIDs to their canonical
-    # names, since their GUIDs use the reserved `0000…f0…0000` pattern
-    # and don't resolve to a file on disk inside any user project.
-    _UNITY_BUILTIN_SHADERS: Dict[int, str] = {
-        4:  "Standard",
-        46: "Standard (Specular setup)",
-    }
+    # Phase A.4 — shader-name resolution moved to platforms.unity.shader.
+    # The class keeps a thin wrapper so call sites
+    # (`self._resolve_shader_name(...)` inside `_process_material`) read the
+    # same way. The wrapper threads the worker's per-instance cache + its
+    # AssetDatabase into the moved function.
+    _UNITY_BUILTIN_SHADERS = _unity_shader_module.UNITY_BUILTIN_SHADERS
 
     def _resolve_shader_name(self, shader_guid: str, shader_fileid: int = 0) -> str:
-        """Resolve a Unity material's m_Shader reference to its friendly
-        name (e.g. ``"MK4/Foliage Fantasy"`` or ``"Standard"``).
-
-        Reads the first ``Shader "..."`` declaration from the .shader file
-        the GUID points at. Built-in shaders use a reserved GUID pattern
-        and don't have a file in the user's project — fall through to a
-        small built-in fileID lookup for those. Returns empty string when
-        neither path produces a name."""
-        cache_key = f"{shader_guid}:{shader_fileid}"
-        if cache_key in self._shader_name_cache:
-            return self._shader_name_cache[cache_key]
-
-        name = ""
-        if shader_guid:
-            shader_path = self.asset_db.resolve_guid(shader_guid)
-            if shader_path and shader_path.suffix in (".shader", ".shadergraph"):
-                try:
-                    with open(shader_path, "r", encoding="utf-8", errors="replace") as f:
-                        for _ in range(80):
-                            line = f.readline()
-                            if not line:
-                                break
-                            m = re.match(r'\s*Shader\s+"([^"]+)"', line)
-                            if m:
-                                name = m.group(1).strip()
-                                break
-                except Exception:
-                    pass
-
-        # Built-in fallback (Unity engine shaders). Only consult when the
-        # GUID didn't resolve.
-        if not name and shader_fileid:
-            name = self._UNITY_BUILTIN_SHADERS.get(int(shader_fileid), "")
-
-        self._shader_name_cache[cache_key] = name
-        return name
+        return _unity_shader_module.resolve_shader_name(
+            self.asset_db, shader_guid, shader_fileid,
+            cache=self._shader_name_cache,
+        )
 
     def _resolve_profile_for_material(self, material_guid: str,
                                        shader_name: str) -> Optional[Dict]:
@@ -2251,543 +1444,69 @@ class IntegratedAssetProcessor:
             return None
     
     
+    # =========================================================================
+    # PREFAB / ENTITY EMITTERS  (target-side bodies live in
+    # `targets.o3de.prefab_writer`. The class keeps thin wrappers so every
+    # existing call site reads the same way; the worker is passed in as
+    # the first argument so the writers can reach `self.log`,
+    # `self.coverage`, `self.asset_db`, etc.).
+    # =========================================================================
+
     def _generate_component_id(self) -> int:
-        """Generate unique component ID"""
-        return random.randint(1000000000000000, 9999999999999999)
-    
+        from targets.o3de.prefab_writer import generate_component_id
+        return generate_component_id(self)
+
     def _generate_entity_id(self) -> str:
-        """Generate unique entity ID in O3DE format"""
-        self.entity_id_counter += 1
-        return f"Entity_[{self.entity_id_counter}]"
-    
+        from targets.o3de.prefab_writer import generate_entity_id
+        return generate_entity_id(self)
+
     def _quaternion_to_euler(self, quaternion: Tuple[float, float, float, float]) -> List[float]:
-        """Convert quaternion to Euler angles in degrees (XYZ order)"""
-        x, y, z, w = quaternion
-        
-        # Roll (x-axis rotation)
-        sinr_cosp = 2 * (w * x + y * z)
-        cosr_cosp = 1 - 2 * (x * x + y * y)
-        roll = math.atan2(sinr_cosp, cosr_cosp)
-        
-        # Pitch (y-axis rotation)
-        sinp = 2 * (w * y - z * x)
-        if abs(sinp) >= 1:
-            pitch = math.copysign(math.pi / 2, sinp)
-        else:
-            pitch = math.asin(sinp)
-        
-        # Yaw (z-axis rotation)
-        siny_cosp = 2 * (w * z + x * y)
-        cosy_cosp = 1 - 2 * (y * y + z * z)
-        yaw = math.atan2(siny_cosp, cosy_cosp)
-        
-        # Convert to degrees
-        return [math.degrees(roll), math.degrees(pitch), math.degrees(yaw)]
-    
+        from targets.o3de.prefab_writer import quaternion_to_euler
+        return quaternion_to_euler(quaternion)
+
     def _convert_to_o3de_coordinates(self, unity_transform: Transform) -> Tuple[Transform, bool]:
-        """Convert Unity transform to O3DE coordinate system"""
-        o3de_pos = (unity_transform.position[0], unity_transform.position[2], unity_transform.position[1])
-        qx, qy, qz, qw = unity_transform.rotation
-        o3de_rot = (qx, qz, qy, qw)
-        o3de_scale = (unity_transform.scale[0], unity_transform.scale[2], unity_transform.scale[1])
-        converted = Transform(o3de_pos, o3de_rot, o3de_scale)
-        return converted, not converted.is_uniform_scale()
-    
+        from targets.o3de.prefab_writer import convert_to_o3de_coordinates
+        return convert_to_o3de_coordinates(unity_transform)
+
     def _create_o3de_prefab(self, root_go: GameObject, all_game_objects: Dict,
-                           transform_map: Dict, material_mapping: Dict, mesh_mapping: Dict,
+                           transform_map: Dict, material_mapping: Dict,
+                           mesh_mapping: Dict,
                            fbx_material_labels: Dict[str, List[str]],
                            output_path: Path) -> None:
-        """Create O3DE prefab in JSON format, plus a `.entitymap.json` sidecar
-        that records the fileID→entity_alias mapping so nested-instance override
-        propagation can target the right entity in this prefab from a consumer.
-        """
-        # ContainerEntity uses the root GameObject's name
-        prefab_data = {
-            "ContainerEntity": self._create_container_entity(root_go),
-            "Entities": {},
-            "Instances": {}
-        }
-
-        entity_id_map: Dict[str, str] = {}
-
-        # Find the actual root GameObject (should only be one with parent_id = None)
-        root_entities = [go for go in all_game_objects.values() if go.parent_id is None]
-
-        if not root_entities:
-            self.log("  ⚠ No root GameObject found")
-            return
-
-        if len(root_entities) > 1:
-            self.log(f"  ⚠ Multiple root GameObjects found ({len(root_entities)}), using first one")
-
-        root_entity = root_entities[0]
-
-        # Create the root entity with ContainerEntity as parent
-        root_entity_id = self._create_entity_recursive(
-            root_entity, all_game_objects, prefab_data["Entities"],
-            prefab_data["Instances"], entity_id_map, material_mapping, mesh_mapping,
-            fbx_material_labels,
-            parent_entity_id="ContainerEntity"
+        from targets.o3de.prefab_writer import create_o3de_prefab
+        return create_o3de_prefab(
+            self, root_go, all_game_objects, transform_map,
+            material_mapping, mesh_mapping, fbx_material_labels, output_path,
         )
-
-        # Set child order in ContainerEntity
-        if root_entity_id:
-            prefab_data["ContainerEntity"]["Components"]["EditorEntitySortComponent"]["Child Entity Order"] = [root_entity_id]
-
-        with open(output_path, 'w') as f:
-            json.dump(prefab_data, f, indent=4)
-
-        # ---------------------------------------------------------------
-        # Write the sidecar entity map. Anything that overrides a child of
-        # this prefab from a parent prefab needs to translate Unity fileIDs
-        # into the O3DE entity aliases used above.
-        # ---------------------------------------------------------------
-        self._write_entity_map_sidecar(
-            output_path, root_entity, all_game_objects, entity_id_map,
-            fbx_material_labels,
-        )
-
-    # =========================================================================
-    # ENTITY-MAP SIDECAR  (per-prefab, written next to the .prefab output)
-    # =========================================================================
 
     def _write_entity_map_sidecar(self, prefab_output_path: Path,
                                   root_go: GameObject,
                                   all_game_objects: Dict,
                                   entity_id_map: Dict[str, str],
                                   fbx_material_labels: Dict[str, List[str]]) -> None:
-        """
-        Build the per-prefab entity-map record and stash it in:
-          1. `self._project_prefab_records[guid_or_stem]` — persisted to
-             the project file at end-of-run via `to_outputs()`.
-          2. `self._entity_map_cache[source_path]` — used during the SAME
-             run by override propagation to translate Unity fileIDs into
-             O3DE entity aliases when a consumer prefab nests this one.
-
-        Replaces the old `<output>/.ImporterData/<stem>.entitymap.json`
-        sidecar file. Schema unchanged otherwise:
-
-            {
-              "source_guid":     "<unity_prefab_guid>",
-              "source_path":     "Assets/Foo.prefab",
-              "output_path":     "Prefabs/Foo.prefab",
-              "root_entity":     "Entity_[1000001]",
-              "container_alias": "ContainerEntity",
-              "entity_aliases":     {"<unity_file_id>": "Entity_[N]", ...},
-              "material_slots":     {"<unity_file_id>": ["<mat_guid_0>", ...]},
-              "material_slot_labels": {"<unity_file_id>": ["<fbx_name_0>", ...]},
-              "go_names":           {"<unity_file_id>": "Cube_001", ...},
-              "written_at":         "<iso-8601>"
-            }
-
-        `material_slot_labels` is the FBX-internal material name list per
-        MeshRenderer slot, ordinally paired — the only valid key source
-        for the runtime `materialsByLabel` map. Tier 3 override emission
-        must look up labels here rather than guessing from the assetHint
-        stem.
-        """
-        # Recover the source Unity prefab path/guid from output_path.stem
-        # (the converter writes outputs named after the source prefab's stem).
-        source_path: Optional[Path] = None
-        source_guid: Optional[str]  = None
-        for guid, path in self.asset_db.guid_to_path.items():
-            if path.suffix == '.prefab' and path.stem == prefab_output_path.stem:
-                source_path = path
-                source_guid = guid
-                break
-
-        if source_guid:
-            self.asset_index["prefabs"][source_guid] = str(source_path) if source_path else ""
-
-        material_slots = {
-            go.file_id: list(go.material_guids)
-            for go in all_game_objects.values()
-            if go.material_guids
-        }
-        material_slot_labels = {
-            file_id: list(labels)
-            for file_id, labels in fbx_material_labels.items()
-            if labels
-        }
-        go_names = {
-            go.file_id: go.name for go in all_game_objects.values() if go.name
-        }
-
-        try:
-            output_rel = str(prefab_output_path.relative_to(self.output_root)).replace("\\", "/")
-        except Exception:
-            output_rel = prefab_output_path.name
-
-        record = {
-            "source_guid":          source_guid or "",
-            "source_path":          str(source_path) if source_path else "",
-            "output_path":          output_rel,
-            "root_entity":          entity_id_map.get(root_go.file_id, ""),
-            "container_alias":      "ContainerEntity",
-            "entity_aliases":       dict(entity_id_map),
-            "material_slots":       material_slots,
-            "material_slot_labels": material_slot_labels,
-            "go_names":             go_names,
-            "written_at":           datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        }
-
-        # Project-outputs map keyed by GUID where available, else by stem.
-        outputs_key = source_guid or f"path:{prefab_output_path.stem}"
-        self._project_prefab_records[outputs_key] = record
-
-        # In-memory cache keyed by source path for cross-prefab reads.
-        if source_path:
-            self._entity_map_cache[str(source_path)] = record
-
-        self.log(f"  ✓ Recorded entity map for {prefab_output_path.stem} "
-                 f"(guid={source_guid or 'n/a'})")
+        from targets.o3de.prefab_writer import write_entity_map_sidecar
+        return write_entity_map_sidecar(
+            self, prefab_output_path, root_go, all_game_objects,
+            entity_id_map, fbx_material_labels,
+        )
 
     def _load_entity_map_sidecar(self, source_prefab_path: Path) -> Optional[Dict]:
-        """Return the entity-map record for the given Unity source prefab,
-        or None if it hasn't been processed in the current run. Reads from
-        the in-memory cache populated by `_write_entity_map_sidecar`."""
-        return self._entity_map_cache.get(str(source_prefab_path))
-    
+        from targets.o3de.prefab_writer import load_entity_map_sidecar
+        return load_entity_map_sidecar(self, source_prefab_path)
+
     def _create_container_entity(self, root_go: GameObject) -> Dict:
-        """Create ContainerEntity for prefab"""
-        return {
-            "Id": "ContainerEntity",
-            "Name": root_go.name,
-            "Components": {
-                "EditorDisabledCompositionComponent": {
-                    "$type": "EditorDisabledCompositionComponent",
-                    "Id": self._generate_component_id()
-                },
-                "EditorEntityIconComponent": {
-                    "$type": "EditorEntityIconComponent",
-                    "Id": self._generate_component_id()
-                },
-                "EditorEntitySortComponent": {
-                    "$type": "EditorEntitySortComponent",
-                    "Id": self._generate_component_id(),
-                    "Child Entity Order": []
-                },
-                "EditorInspectorComponent": {
-                    "$type": "EditorInspectorComponent",
-                    "Id": self._generate_component_id()
-                },
-                "EditorLockComponent": {
-                    "$type": "EditorLockComponent",
-                    "Id": self._generate_component_id()
-                },
-                "EditorOnlyEntityComponent": {
-                    "$type": "EditorOnlyEntityComponent",
-                    "Id": self._generate_component_id(),
-                    "IsEditorOnly": True
-                },
-                "EditorPendingCompositionComponent": {
-                    "$type": "EditorPendingCompositionComponent",
-                    "Id": self._generate_component_id()
-                },
-                "EditorPrefabComponent": {
-                    "$type": "EditorPrefabComponent",
-                    "Id": self._generate_component_id()
-                },
-                "EditorVisibilityComponent": {
-                    "$type": "EditorVisibilityComponent",
-                    "Id": self._generate_component_id()
-                },
-                "TransformComponent": {
-                    "$type": "{27F1E1A1-8D9D-4C3B-BD3A-AFB9762449C0} TransformComponent",
-                    "Id": self._generate_component_id(),
-                    "Parent Entity": ""
-                }
-            }
-        }
-    
-    
+        from targets.o3de.prefab_writer import create_container_entity
+        return create_container_entity(self, root_go)
+
     def _create_nested_prefab_instance(self, go: GameObject, prefab_path: Path,
                                        parent_entity_id: str) -> Dict:
-        """Emit a nested-prefab Instance entry with JSON-patch overrides.
-
-        Patch tiers handled here (anything else is logged to the coverage
-        tracker as 'unhandled' so the end-of-run coverage.json shows what
-        was lost):
-
-          Tier 1  Transform — translate, rotate, scale on the ContainerEntity
-          Tier 2  m_IsActive on the prefab root → container visibility patch
-          Tier 3  m_Materials.Array.data[N] → patch the assetHint inside the
-                  target entity's EditorMaterialComponent materialsByLabel
-                  entry. Label key = FBX-internal material name at slot N
-                  (read from the source prefab's sidecar
-                  `material_slot_labels`, which mirrors what SceneAPI exposes
-                  as ModelMaterialSlot::m_displayName at runtime).
-
-        Patch path conventions (all are valid JSON Pointer fragments rooted at
-        the nested instance):
-          /ContainerEntity/...                — affects the instance shell
-          /Entities/<entity_alias>/...        — affects a child of the source
-        """
-        source_path = f"{self.asset_hint_root}/prefabs/{prefab_path.name}"
-        o3de_transform, _ = self._convert_to_o3de_coordinates(go.transform)
-        euler             = self._quaternion_to_euler(o3de_transform.rotation)
-
-        # ---------------------------------------------------------------
-        # PARENT RE-PARENT (always emitted)
-        # ---------------------------------------------------------------
-        patches: List[Dict] = [
-            {
-                "op":    "replace",
-                "path":  "/ContainerEntity/Components/TransformComponent/Parent Entity",
-                "value": f"../{parent_entity_id}",
-            }
-        ]
-
-        # ---------------------------------------------------------------
-        # TIER 1 — Transform overrides on the ContainerEntity
-        # ---------------------------------------------------------------
-        if any(abs(v) > 0.0001 for v in o3de_transform.position):
-            for i, axis_val in enumerate(o3de_transform.position):
-                patches.append({
-                    "op":    "replace",
-                    "path":  f"/ContainerEntity/Components/TransformComponent/Transform Data/Translate/{i}",
-                    "value": axis_val,
-                })
-
-        if any(abs(v) > 0.0001 for v in euler):
-            for i, axis_val in enumerate(euler):
-                patches.append({
-                    "op":    "replace",
-                    "path":  f"/ContainerEntity/Components/TransformComponent/Transform Data/Rotate/{i}",
-                    "value": axis_val,
-                })
-
-        # Scale only when non-unit. Uniform scale collapses to scalar in the
-        # source prefab; non-uniform scale becomes EditorNonUniformScaleComponent.
-        # For the instance shell we keep it simple and emit a scalar scale patch
-        # when the captured local scale is uniform-ish and non-1.
-        sx, sy, sz = o3de_transform.scale
-        if abs(sx - 1.0) > 0.0001 and abs(sx - sy) < 0.0001 and abs(sy - sz) < 0.0001:
-            patches.append({
-                "op":    "replace",
-                "path":  "/ContainerEntity/Components/TransformComponent/Transform Data/Scale",
-                "value": sx,
-            })
-        elif (abs(sx - 1.0) > 0.0001 or abs(sy - 1.0) > 0.0001 or abs(sz - 1.0) > 0.0001):
-            # Non-uniform — would require an EditorNonUniformScaleComponent
-            # patch path that may or may not already exist in the source prefab.
-            # Log to coverage and skip for now.
-            self.coverage.warn(
-                f"Non-uniform scale override on nested instance '{go.name}' "
-                f"({sx}, {sy}, {sz}) not emitted — needs EditorNonUniformScaleComponent."
-            )
-
-        # ---------------------------------------------------------------
-        # TIER 2 + TIER 3 — walk modifications by propertyPath
-        # ---------------------------------------------------------------
-        sidecar = self._load_entity_map_sidecar(prefab_path)
-        entity_aliases = (sidecar or {}).get("entity_aliases", {})
-        material_slot_labels = (sidecar or {}).get("material_slot_labels", {})
-
-        if go.prefab_modifications and not sidecar:
-            self.coverage.warn(
-                f"No entity-map sidecar for source prefab '{prefab_path.name}' — "
-                f"non-transform overrides on nested instance '{go.name}' cannot be targeted."
-            )
-
-        # Material-slot overrides arrive as multiple property entries on the
-        # same target (the renderer component fileID, not the GO). We collect
-        # them first so we know the slot count per target before patching.
-        # Structure: {target_fileID: {slot_index: new_mat_guid}}
-        material_overrides: Dict[str, Dict[int, str]] = {}
-
-        for mod in go.prefab_modifications:
-            prop_path = (mod.get('propertyPath') or '').strip()
-            value     = mod.get('value', None)
-            objref    = mod.get('objectReference') or {}
-            target    = mod.get('target') or {}
-            target_id = str(target.get('fileID', ''))
-
-            # Transform/name overrides were already projected onto go.transform / go.name
-            # and emitted above. Mark them as handled in the coverage tracker.
-            if prop_path == 'm_Name' or prop_path.startswith(
-                ('m_LocalPosition.', 'm_LocalRotation.', 'm_LocalScale.')
-            ):
-                self.coverage.record_modification(prop_path, handled=True, example_value=value)
-                continue
-
-            # --- Tier 2: m_IsActive (on the GameObject) ---
-            if prop_path == 'm_IsActive':
-                # O3DE entity-disabled state isn't fully reverse-engineered yet;
-                # log a warning and record as unhandled. Container-side
-                # patching can be added once the exact schema is confirmed.
-                self.coverage.record_modification(
-                    prop_path, handled=False, example_value=value
-                )
-                self.coverage.warn(
-                    f"m_IsActive override on nested instance '{go.name}' (value={value}) "
-                    f"not emitted — O3DE disabled-entity patch path needs confirmation."
-                )
-                continue
-
-            # --- Tier 3: material slot override ---
-            # propertyPath is `m_Materials.Array.data[N]` and the new material
-            # GUID lives on `objectReference.guid` (not `value`).
-            m = re.match(r'^m_Materials\.Array\.data\[(\d+)\]$', prop_path)
-            if m:
-                slot_idx = int(m.group(1))
-                new_guid = objref.get('guid', '') if isinstance(objref, dict) else ''
-                if not new_guid:
-                    self.coverage.record_modification(prop_path, handled=False,
-                                                     example_value="<no guid>")
-                    continue
-                # The target.fileID for material overrides is the MeshRenderer's
-                # fileID inside the source prefab — NOT the GameObject. The
-                # sidecar's material_slots map is keyed by GameObject fileID,
-                # so we resolve via the renderer-to-GO link the sidecar omits
-                # today. Until that's added, we fall back to "target.fileID is
-                # the renderer's owner GO" which is true when the override was
-                # authored at the GO level (most common).
-                slot_map = material_overrides.setdefault(target_id, {})
-                slot_map[slot_idx] = new_guid
-                continue
-
-            # --- Catch-all: unhandled override ---
-            self.coverage.record_modification(
-                prop_path, handled=False,
-                example_value=value if value not in (None, '') else objref,
-            )
-
-        # Emit material slot patches now that we have all slots per target.
-        for target_id, slot_map in material_overrides.items():
-            entity_alias = entity_aliases.get(target_id)
-            if not entity_alias:
-                # The override targets a component fileID, not a GO. Search
-                # go_names for a GO whose ID is close — for now, just log.
-                self.coverage.warn(
-                    f"Material override on nested instance '{go.name}' targets "
-                    f"fileID={target_id} which is not in the source's entity map "
-                    f"— renderer-component fileIDs aren't recorded yet. Skipped."
-                )
-                for slot_idx, mat_guid in slot_map.items():
-                    self.coverage.record_modification(
-                        f'm_Materials.Array.data[{slot_idx}]',
-                        handled=False, example_value=mat_guid,
-                    )
-                continue
-
-            # FBX-internal material names per slot index for this target.
-            # Recorded by the source prefab's converter run as the truth
-            # source for label keys in the base prefab's materialsByLabel.
-            slot_labels = material_slot_labels.get(target_id, []) or []
-
-            for slot_idx, mat_guid in slot_map.items():
-                asset_hint = self.asset_index["materials"].get(mat_guid)
-                if not asset_hint:
-                    # Try to process the material now (covers consumer-only refs).
-                    asset_hint = self._process_material(mat_guid)
-                if not asset_hint:
-                    self.coverage.record_missing_material(mat_guid)
-                    self.coverage.record_modification(
-                        f'm_Materials.Array.data[{slot_idx}]',
-                        handled=False, example_value=mat_guid,
-                    )
-                    continue
-
-                # Resolve the slot's label = FBX-internal material name at
-                # this ordinal position (as SceneAPI saw it when the base
-                # prefab was emitted). This is the only key that will match
-                # the base prefab's materialsByLabel entry at runtime.
-                label = (slot_labels[slot_idx]
-                         if slot_idx < len(slot_labels) else '')
-
-                if not label:
-                    self.coverage.warn(
-                        f"Material override on nested instance '{go.name}' "
-                        f"slot {slot_idx} — no FBX-internal label recorded "
-                        f"in sidecar (source prefab predates the label "
-                        f"refactor, or FBX parse failed at emit time). "
-                        f"Patch skipped — re-convert the source prefab to fix."
-                    )
-                    self.coverage.record_modification(
-                        f'm_Materials.Array.data[{slot_idx}]',
-                        handled=False, example_value=mat_guid,
-                    )
-                    continue
-
-                patches.append({
-                    "op":   "replace",
-                    "path": (f"/Entities/{entity_alias}/Components/EditorMaterialComponent/"
-                             f"Controller/Configuration/materialsByLabel/{label}/"
-                             f"MaterialAsset/assetHint"),
-                    "value": asset_hint,
-                })
-                self.coverage.record_modification(
-                    f'm_Materials.Array.data[{slot_idx}]',
-                    handled=True, example_value=asset_hint,
-                )
-
-        # ---------------------------------------------------------------
-        # Sibling fields (added / removed / added GOs) — record and skip
-        # ---------------------------------------------------------------
-        for _ in go.prefab_added_components:    self.coverage.record_added_component()
-        for _ in go.prefab_removed_components:  self.coverage.record_removed_component()
-        for _ in go.prefab_added_gameobjects:   self.coverage.record_added_gameobject()
-        if (go.prefab_added_components or go.prefab_removed_components
-                or go.prefab_added_gameobjects):
-            self.coverage.warn(
-                f"Nested instance '{go.name}' has added/removed components or "
-                f"added GameObjects that are not yet propagated to O3DE patches."
-            )
-
-        return {
-            "Source":  source_path,
-            "Patches": patches,
-        }
-    
-    # ===================================================================
-    #  Entity Helpers
-    # ===================================================================
+        from targets.o3de.prefab_writer import create_nested_prefab_instance
+        return create_nested_prefab_instance(self, go, prefab_path, parent_entity_id)
 
     def _make_bare_entity(self, entity_id: str, name: str,
                           parent_entity_id: str) -> Dict:
-        """Create a minimal O3DE entity (for child collider entities)."""
-        return {
-            "Id": entity_id,
-            "Name": name,
-            "Components": {
-                "TransformComponent": {
-                    "$type": "{27F1E1A1-8D9D-4C3B-BD3A-AFB9762449C0} TransformComponent",
-                    "Id": self._generate_component_id(),
-                    "Parent Entity": parent_entity_id
-                },
-                "EditorDisabledCompositionComponent": {
-                    "$type": "EditorDisabledCompositionComponent",
-                    "Id": self._generate_component_id()
-                },
-                "EditorEntityIconComponent": {
-                    "$type": "EditorEntityIconComponent",
-                    "Id": self._generate_component_id()
-                },
-                "EditorInspectorComponent": {
-                    "$type": "EditorInspectorComponent",
-                    "Id": self._generate_component_id()
-                },
-                "EditorLockComponent": {
-                    "$type": "EditorLockComponent",
-                    "Id": self._generate_component_id()
-                },
-                "EditorOnlyEntityComponent": {
-                    "$type": "EditorOnlyEntityComponent",
-                    "Id": self._generate_component_id()
-                },
-                "EditorPendingCompositionComponent": {
-                    "$type": "EditorPendingCompositionComponent",
-                    "Id": self._generate_component_id()
-                },
-                "EditorVisibilityComponent": {
-                    "$type": "EditorVisibilityComponent",
-                    "Id": self._generate_component_id()
-                }
-            }
-        }
-
-    # ===================================================================
+        from targets.o3de.prefab_writer import make_bare_entity
+        return make_bare_entity(self, entity_id, name, parent_entity_id)
 
     def _create_entity_recursive(self, go: GameObject, all_game_objects: Dict,
                                  entities_dict: Dict, instances_dict: Dict,
@@ -2795,183 +1514,12 @@ class IntegratedAssetProcessor:
                                  material_mapping: Dict, mesh_mapping: Dict,
                                  fbx_material_labels: Dict[str, List[str]],
                                  parent_entity_id: str = None) -> str:
-        """Recursively create entities or instances in JSON format"""
-        # Check if this is a prefab instance
-        if go.is_prefab_instance and go.prefab_source_guid:
-            instance_id = f"Instance_[{self.entity_id_counter}]"
-            self.entity_id_counter += 1
-            
-            # Find the prefab file for this GUID
-            prefab_path = self.asset_db.resolve_guid(go.prefab_source_guid)
-            if prefab_path and prefab_path.suffix == '.prefab':
-                # Create instance entry
-                instances_dict[instance_id] = self._create_nested_prefab_instance(
-                    go, prefab_path, parent_entity_id
-                )
-                return f"{instance_id}/ContainerEntity"
-            # If we can't find the prefab, fall through to create regular entity
-        
-        entity_id = self._generate_entity_id()
-        entity_id_map[go.file_id] = entity_id
-        
-        o3de_transform, needs_nonuniform = self._convert_to_o3de_coordinates(go.transform)
-
-        # Use provided parent_entity_id or look up from entity_id_map
-        if parent_entity_id is None:
-            if go.parent_id and go.parent_id in entity_id_map:
-                parent_entity_id = entity_id_map[go.parent_id]
-            else:
-                parent_entity_id = ""
-
-        # Unity prefabs are always rooted at a single GameObject whose stored
-        # transform is just whatever the prefab happened to sit at when last
-        # saved. Unity treats that root transform as DEAD DATA at instance
-        # time: every PrefabInstance modification records the FINAL
-        # m_LocalPosition / m_LocalRotation / m_LocalScale, not a delta on
-        # top of the prefab root. So preserving the Unity root GO's
-        # transform on the converted prefab's inner root entity causes a
-        # double-offset — the consumer's instance patch positions the
-        # ContainerEntity at the world placement, and then the inner root
-        # entity adds its own bake on top.
-        #
-        # Fix: when this entity is the prefab's root (parent_entity_id is
-        # the ContainerEntity), force identity. World placement is supplied
-        # entirely by the consumer's patches on the ContainerEntity.
-        is_prefab_root = (parent_entity_id == "ContainerEntity")
-        if is_prefab_root and (
-            any(abs(v) > 0.0001 for v in o3de_transform.position)
-            or any(abs(v) > 0.0001 for v in self._quaternion_to_euler(o3de_transform.rotation))
-            or needs_nonuniform
-            or abs(o3de_transform.scale[0] - 1.0) > 0.0001
-        ):
-            self.log(
-                f"  [Transform] Discarding non-identity root transform on "
-                f"'{go.name}' (pos={o3de_transform.position}, "
-                f"scale={o3de_transform.scale}) — Unity prefab root "
-                f"transforms are dead data, placement comes from the "
-                f"consumer's ContainerEntity patch."
-            )
-            o3de_transform   = Transform((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), (1.0, 1.0, 1.0))
-            needs_nonuniform = False
-        
-        entity = {
-            "Id": entity_id,
-            "Name": go.name,
-            "Components": {
-                "EditorDisabledCompositionComponent": {
-                    "$type": "EditorDisabledCompositionComponent",
-                    "Id": self._generate_component_id()
-                },
-                "EditorEntityIconComponent": {
-                    "$type": "EditorEntityIconComponent",
-                    "Id": self._generate_component_id()
-                },
-                "EditorInspectorComponent": {
-                    "$type": "EditorInspectorComponent",
-                    "Id": self._generate_component_id()
-                },
-                "EditorLockComponent": {
-                    "$type": "EditorLockComponent",
-                    "Id": self._generate_component_id()
-                },
-                "EditorPendingCompositionComponent": {
-                    "$type": "EditorPendingCompositionComponent",
-                    "Id": self._generate_component_id()
-                },
-                "EditorVisibilityComponent": {
-                    "$type": "EditorVisibilityComponent",
-                    "Id": self._generate_component_id()
-                }
-            }
-        }
-        
-        # Add TransformComponent
-        transform_component = {
-            "$type": "{27F1E1A1-8D9D-4C3B-BD3A-AFB9762449C0} TransformComponent",
-            "Id": self._generate_component_id(),
-            "Parent Entity": parent_entity_id
-        }
-        
-        # Convert quaternion to Euler for rotation check
-        euler = self._quaternion_to_euler(o3de_transform.rotation)
-        
-        # Add Transform Data only if entity has non-default transform
-        has_translation = any(abs(v) > 0.0001 for v in o3de_transform.position)
-        has_rotation = any(abs(v) > 0.0001 for v in euler)
-        has_scale = not needs_nonuniform and abs(o3de_transform.scale[0] - 1.0) > 0.0001
-        
-        if has_translation or has_rotation or has_scale:
-            transform_data = {}
-            
-            if has_translation:
-                transform_data["Translate"] = list(o3de_transform.position)
-            
-            if has_rotation:
-                transform_data["Rotate"] = euler
-            
-            if has_scale:
-                transform_data["Scale"] = o3de_transform.scale[0]
-            
-            transform_component["Transform Data"] = transform_data
-        
-        entity["Components"]["TransformComponent"] = transform_component
-        
-        if needs_nonuniform:
-            entity["Components"]["EditorNonUniformScaleComponent"] = {
-                "$type": "EditorNonUniformScaleComponent",
-                "Id": self._generate_component_id(),
-                "Scale": list(o3de_transform.scale)
-            }
-        
-        # ---------------------------------------------------------------
-        # Component Processors — emit phase (mesh, material, physics, ...)
-        # Each processor runs in WEIGHT order and may add child entities.
-        # ---------------------------------------------------------------
-        ctx = ProcessingContext(
-            material_mapping      = material_mapping,
-            mesh_mapping          = mesh_mapping,
-            fbx_material_labels   = fbx_material_labels,
-            entities_dict         = entities_dict,
-            entity_id_map         = entity_id_map,
-            generate_component_id = self._generate_component_id,
-            generate_entity_id    = self._generate_entity_id,
-            make_bare_entity      = self._make_bare_entity,
-            log                   = self.log,
-            stats                 = self.stats,
+        from targets.o3de.prefab_writer import create_entity_recursive
+        return create_entity_recursive(
+            self, go, all_game_objects, entities_dict, instances_dict,
+            entity_id_map, material_mapping, mesh_mapping,
+            fbx_material_labels, parent_entity_id,
         )
-
-        collider_child_ids = []
-        for processor in self.component_processors:
-            child_ids = processor.emit(go, entity, ctx)
-            collider_child_ids.extend(child_ids)
-
-        # ---------------------------------------------------------------
-        # Child entities: GO children + any collider sub-entities
-        # ---------------------------------------------------------------
-        child_order = []
-        for child_id in go.children_ids:
-            if child_id in all_game_objects:
-                child_entity_id = self._create_entity_recursive(
-                    all_game_objects[child_id], all_game_objects,
-                    entities_dict, instances_dict, entity_id_map,
-                    material_mapping, mesh_mapping, fbx_material_labels,
-                    entity_id
-                )
-                if child_entity_id:
-                    child_order.append(child_entity_id)
-
-        child_order.extend(collider_child_ids)
-
-        if child_order:
-            entity["Components"]["EditorEntitySortComponent"] = {
-                "$type": "EditorEntitySortComponent",
-                "Id": self._generate_component_id(),
-                "Child Entity Order": child_order
-            }
-
-        entities_dict[entity_id] = entity
-        return entity_id
-
 
 SETTINGS_FILE = Path(__file__).parent / "converter_settings.json"
 

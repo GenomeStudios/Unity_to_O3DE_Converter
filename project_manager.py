@@ -508,7 +508,43 @@ class Project:
     # value is the snapshot hash that was current when the user clicked
     # Acknowledge. The pre-flight gate re-arms whenever the snapshot drifts.
     preflight_acks:  Dict[str, str] = field(default_factory=dict)
+    # Phase D — per-source-platform namespaced stages + outputs. A single
+    # project preserves its Unity selections / overrides / state index
+    # even when the user switches the source engine to Unreal mid-project
+    # (and switches back later). The flat `stages` / `outputs` fields above
+    # are live views into the active platform's slot — mutations via
+    # `update_stage` / `update_outputs` pass through to the namespaced
+    # storage. `__post_init__` keeps the views in sync.
+    stages_by_platform:  Dict[str, dict] = field(default_factory=dict)
+    outputs_by_platform: Dict[str, dict] = field(default_factory=dict)
+    active_platform:     str = "unity"
     _dirty:          bool = field(default=False, repr=False)
+
+    # -------------------------------------------------------------------------
+    # Post-init — Phase D — bind `stages` / `outputs` to the active
+    # platform's slot, populating from the flat fields if the caller
+    # only passed those (legacy construction path) or from defaults if
+    # this is a brand-new project.
+    # -------------------------------------------------------------------------
+
+    def __post_init__(self) -> None:
+        active = self.active_platform or "unity"
+        # If the caller didn't populate stages_by_platform, lift the flat
+        # `stages` dict into the active slot. Same for outputs.
+        if not self.stages_by_platform:
+            self.stages_by_platform = {active: self.stages}
+        elif active not in self.stages_by_platform:
+            # Active platform set but no entry yet — initialise from defaults.
+            self.stages_by_platform[active] = _default_stages()
+        if not self.outputs_by_platform:
+            self.outputs_by_platform = {active: self.outputs}
+        elif active not in self.outputs_by_platform:
+            self.outputs_by_platform[active] = _default_outputs()
+        # Live views: same dict objects, no copies. Mutations to
+        # `self.stages` propagate to `self.stages_by_platform[active]`.
+        self.stages  = self.stages_by_platform[active]
+        self.outputs = self.outputs_by_platform[active]
+        self.active_platform = active
 
     # Backwards-compat alias: pre-F-9 the field was named `scope` and held a
     # ProjectScope (Whole Game / Asset Cluster / ...). Replaced by
@@ -527,70 +563,99 @@ class Project:
     # -------------------------------------------------------------------------
 
     def to_json(self) -> dict:
+        """Phase D — namespaced shape. The flat `stages` / `outputs` keys
+        are NOT written (the same dicts live under
+        `stages_by_platform[active_platform]`). `from_json` migrates
+        legacy flat-shape files on load, so a load-save round-trip is
+        enough to convert a pre-Phase-D project file."""
         return {
-            "schema_version":  SCHEMA_VERSION,
-            "name":            self.name,
-            "source_engine":   self.source_engine.value,
-            "scope_root":      str(self.scope_root) if self.scope_root else "",
-            "notes":           self.notes,
-            "created":         self.created,
-            "modified":        self.modified,
-            "stages":          self.stages,
-            "pipeline_status": self.pipeline_status,
-            "outputs":         self.outputs,
-            "preflight_acks":  dict(self.preflight_acks),
+            "schema_version":      SCHEMA_VERSION,
+            "name":                self.name,
+            "source_engine":       self.source_engine.value,
+            "scope_root":          str(self.scope_root) if self.scope_root else "",
+            "notes":               self.notes,
+            "created":             self.created,
+            "modified":            self.modified,
+            "active_platform":     self.active_platform,
+            "stages_by_platform":  self.stages_by_platform,
+            "outputs_by_platform": self.outputs_by_platform,
+            "pipeline_status":     self.pipeline_status,
+            "preflight_acks":      dict(self.preflight_acks),
         }
 
     @classmethod
     def from_json(cls, data: dict, path: Optional[Path]) -> "Project":
-        # Recursive deep merge each stage's settings so newer schema
-        # defaults survive load (e.g. F-6 pre-seeded shader_mappings need
-        # to fill in keys an older project's mappings dict doesn't carry).
-        # Saved data wins on conflict — user customisations stay intact.
-        stages = _default_stages()
-        for key, saved in (data.get("stages", {}) or {}).items():
-            if key in stages and isinstance(saved, dict):
-                stages[key] = _deep_merge(stages[key], saved)
-            else:
-                stages[key] = saved
-        # F-9 one-shot normalization: material_processor switched from
-        # `defaults.target_materialtype` + path-valued shader_mappings to
-        # `defaults.profile` + profile-name-valued shader_mappings. Drop
-        # the stale field and coerce any non-profile-name mapping value
-        # back to the catch-all profile.
-        mp = stages.get("material_processor")
-        if isinstance(mp, dict):
-            defaults = mp.setdefault("defaults", {})
-            defaults.pop("target_materialtype", None)
-            defaults.setdefault("profile", DEFAULT_PROFILE_NAME)
-            profile_names = set((mp.get("shader_profiles") or {}).keys())
-            mappings = mp.get("shader_mappings") or {}
-            for shader, value in list(mappings.items()):
-                if value not in profile_names:
-                    mappings[shader] = DEFAULT_PROFILE_NAME
-            # Per-material overrides: legacy `materialtype` key stays as a
-            # raw escape hatch; `profile` is the new preferred override.
-            # No migration required — both keys coexist by design.
-        status = _default_status()
-        status.update(data.get("pipeline_status", {}))
-        outputs = _default_outputs()
-        # Deep merge: keep new defaults for missing stages but copy any
-        # existing data over.
-        for k, v in (data.get("outputs", {}) or {}).items():
-            if k in outputs and isinstance(v, dict):
-                outputs[k].update(v)
-            else:
-                outputs[k] = v
-
-        raw_root = (data.get("scope_root") or "").strip()
-        scope_root = Path(raw_root) if raw_root else None
-
         # Prefer the new `source_engine` key; fall back to the legacy `scope`
         # field on existing project files. `SourceEngine.from_string` already
         # maps legacy ProjectScope values (whole_game / asset_cluster /
         # asset_set / individual_action) onto UNITY, so a load-save round-trip
         # is enough to migrate a project file fully.
-        engine_value = data.get("source_engine") or data.get("scope") or "unity"
+        engine_value    = data.get("source_engine") or data.get("scope") or "unity"
+        active_platform = (data.get("active_platform") or engine_value or "unity").strip().lower()
+        if not active_platform:
+            active_platform = "unity"
+
+        # Phase D migration: legacy projects carry flat `stages` /
+        # `outputs`; new projects carry `stages_by_platform[name]` /
+        # `outputs_by_platform[name]`. Accept either; reconcile into the
+        # namespaced shape.
+        raw_stages_by_plat  = data.get("stages_by_platform") or {}
+        raw_outputs_by_plat = data.get("outputs_by_platform") or {}
+
+        if not raw_stages_by_plat:
+            # Legacy flat -> namespace under the active platform.
+            raw_stages_by_plat = {active_platform: data.get("stages") or {}}
+        if not raw_outputs_by_plat:
+            raw_outputs_by_plat = {active_platform: data.get("outputs") or {}}
+
+        # Per-platform deep-merge against `_default_stages()` so newer
+        # schema defaults (shader_profiles, state_index, etc.) populate
+        # missing keys without dropping user data.
+        stages_by_platform: Dict[str, dict]  = {}
+        outputs_by_platform: Dict[str, dict] = {}
+        for plat_name, saved_stages in raw_stages_by_plat.items():
+            stages = _default_stages()
+            for key, saved in (saved_stages or {}).items():
+                if key in stages and isinstance(saved, dict):
+                    stages[key] = _deep_merge(stages[key], saved)
+                else:
+                    stages[key] = saved
+            # F-9 one-shot normalization: material_processor switched from
+            # `defaults.target_materialtype` + path-valued shader_mappings to
+            # `defaults.profile` + profile-name-valued shader_mappings.
+            mp = stages.get("material_processor")
+            if isinstance(mp, dict):
+                defaults = mp.setdefault("defaults", {})
+                defaults.pop("target_materialtype", None)
+                defaults.setdefault("profile", DEFAULT_PROFILE_NAME)
+                profile_names = set((mp.get("shader_profiles") or {}).keys())
+                mappings = mp.get("shader_mappings") or {}
+                for shader, value in list(mappings.items()):
+                    if value not in profile_names:
+                        mappings[shader] = DEFAULT_PROFILE_NAME
+            stages_by_platform[plat_name] = stages
+
+        for plat_name, saved_outputs in raw_outputs_by_plat.items():
+            outputs = _default_outputs()
+            for k, v in (saved_outputs or {}).items():
+                if k in outputs and isinstance(v, dict):
+                    outputs[k].update(v)
+                else:
+                    outputs[k] = v
+            outputs_by_platform[plat_name] = outputs
+
+        # Ensure the active platform's slots exist (covers a project file
+        # that listed `active_platform: unity` but no entry for unity).
+        if active_platform not in stages_by_platform:
+            stages_by_platform[active_platform] = _default_stages()
+        if active_platform not in outputs_by_platform:
+            outputs_by_platform[active_platform] = _default_outputs()
+
+        status = _default_status()
+        status.update(data.get("pipeline_status", {}))
+
+        raw_root = (data.get("scope_root") or "").strip()
+        scope_root = Path(raw_root) if raw_root else None
 
         # F-8 — preflight acknowledgements survive load. Missing on legacy
         # files is fine; defaults to empty so every yellow row re-arms on
@@ -604,11 +669,14 @@ class Project:
             notes=data.get("notes", ""),
             created=data.get("created",  _utc_now_iso()),
             modified=data.get("modified", _utc_now_iso()),
-            stages=stages,
+            stages=stages_by_platform[active_platform],
             pipeline_status=status,
-            outputs=outputs,
+            outputs=outputs_by_platform[active_platform],
             scope_root=scope_root,
             preflight_acks=preflight_acks,
+            stages_by_platform=stages_by_platform,
+            outputs_by_platform=outputs_by_platform,
+            active_platform=active_platform,
         )
 
     # -------------------------------------------------------------------------
@@ -638,9 +706,34 @@ class Project:
             self._mark_dirty()
 
     def set_source_engine(self, engine: SourceEngine) -> None:
-        if engine != self.source_engine:
-            self.source_engine = engine
-            self._mark_dirty()
+        """Phase D — switching source engine ALSO switches the active
+        platform's per-engine stages/outputs slot. Off-platform data is
+        preserved untouched (the previous slot stays in
+        `stages_by_platform[old]`); switching back restores it byte-for-byte.
+        """
+        if engine == self.source_engine and engine.value == self.active_platform:
+            return
+        self.source_engine = engine
+        self.set_active_platform(engine.value)
+
+    def set_active_platform(self, name: str) -> None:
+        """Switch which platform's namespaced stages/outputs are the
+        active view. Non-destructive: the prior platform's state stays
+        in `stages_by_platform[old]` for later round-trips. The active
+        platform's slot is created with `_default_stages()` /
+        `_default_outputs()` on first entry."""
+        name = (name or "unity").strip().lower() or "unity"
+        if name == self.active_platform:
+            return
+        if name not in self.stages_by_platform:
+            self.stages_by_platform[name] = _default_stages()
+        if name not in self.outputs_by_platform:
+            self.outputs_by_platform[name] = _default_outputs()
+        self.active_platform = name
+        # Rebind the live views.
+        self.stages  = self.stages_by_platform[name]
+        self.outputs = self.outputs_by_platform[name]
+        self._mark_dirty()
 
     def set_preflight_ack(self, ack_key: str, snapshot: str) -> None:
         """F-8 — record the user's Acknowledge for a yellow preflight row.

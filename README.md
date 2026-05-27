@@ -2,447 +2,354 @@
 
 [Youtube Demo Video](https://youtu.be/amyFFLV5Dck)
 
-# Unity → O3DE Converter
+# To‑O3DE Project Converter
 
-A Conversion Project workspace for bringing Unity content into O3DE. The
-tool itself is the surface layer; the long-term goal is to **formalize
-a conversion language** — a vocabulary of stages, scopes, marks,
-overrides, sync states, and patches — that other engines can mirror to
-solve their own one-off conversion problems systematically.
+A multi-platform Conversion Project workspace for migrating game-engine
+and DCC content into **Open 3D Engine (O3DE)**. Point it at a project
+folder, mark the assets you want, run a staged conversion, and get
+O3DE prefabs, materials, meshes, and levels on the other side — with
+a patchable state record so you can iterate on overrides without
+re-running from scratch.
+
+Unity is the production-ready reference platform that ships today.
+The architecture is built around a **source-platform plugin contract**
+so additional engines (Unreal, Godot, Blender, …) can plug in without
+touching the core.
 
 > System co-developed with Claude LLMs. Public Domain.
 
 ---
 
-## Vision: a conversion language, not just a converter
-
-Cross-engine asset migrations get re-solved every time someone needs
-one. The same obscure issues (mesh pivot rebake, smoothness→roughness
-inversion, prefab override propagation, scene reference resolution)
-get rediscovered in isolation, fixed once, and lost.
-
-This project is a working bet that those issues have *common shapes*,
-and that the right surface area looks like:
-
-| Stage shape | What it does | Engine-specific code |
-|---|---|---|
-| **Scope** | Pin the walking root of a source project | Choose a folder |
-| **Mark** | Pick the subset to convert from scrubbed inventories | UI checklists |
-| **Preprocess** | Per-asset overrides + cross-asset mapping libraries | Mesh / material / shader rules |
-| **Orchestrate** | Pre-flight check → staged execution | Generic dispatch |
-| **Sync** | Track input hashes vs last-export hashes per stage | Generic state machine |
-| **Patch** | Surgically re-emit only affected artifacts | Per-asset emitters |
-
-Unity → O3DE is the first concrete implementation. If the shape is
-right, an Unreal → O3DE or Unity → Godot converter should be largely
-the same Conversion Project workspace with different emitters wired in.
-That is the language we are trying to formalize through this project.
-
-**Co-development with LLMs is part of the methodology**, not a side
-note. Every non-trivial feature has a locked Q&A plan + living working
-doc in `.serena/memories/`, so both humans and LLMs can pick up cold
-and contribute without re-deriving prior decisions. The
-[PID memory methodology](#pid-memory-methodology) below explains how
-to read those files.
+> [!IMPORTANT]
+> **If you're an LLM picking up this project**, stop and read
+> [`AGENTICS_GUIDELINES.md`](AGENTICS_GUIDELINES.md) **first**. It is
+> the primary funnel point and covers the P/I/T methodology, the
+> memory model under `.serena/memories/`, and how to interact with
+> the developing user. Skipping it is the most common failure mode.
 
 ---
 
-## Status at a glance
+## What it does
+
+| You give it | The converter produces |
+|---|---|
+| A source-engine project folder (Unity `Assets/`, etc.) | An O3DE-shaped output tree |
+| A list of marked prefabs, scenes, and terrain materials | One `.prefab` per source prefab + per-scene level prefabs + `.material` files + copied textures + FBX `.assetinfo` sidecars |
+| Per-mesh + per-material overrides | Overrides baked into the emitted O3DE assets |
+| Subsequent edits to overrides / profiles | Patch-only re-emission via input-hash-driven dirty detection |
+| Project switches mid-flight | Non-destructive per-platform state (Unity edits preserved when you switch to Unreal slot and back) |
+
+Mission Command (the Dashboard) is the single launch surface — it
+gates Run All on a pre-flight check pass and surfaces per-stage
+status, sync state, and dirty markers.
+
+---
+
+## Status
 
 | Layer | Status |
 |---|---|
-| Conversion Project system (named projects, save/load/recent) | Shipped |
-| Project header banner + custom window chrome (frameless) | Shipped |
-| Dashboard with per-stage status cards | Shipped |
-| Project-level `scope_root` + per-stage source override | Shipped |
-| Dependency-missing startup banner | Shipped |
-| Multi-scene marking + nested O3DE level output | Shipped |
-| State management (sidecar-free, input-hash sync) | Shipped |
-| Scrubbed prefab marking (F-4) | Pending |
-| Mesh preprocessing + per-FBX overrides (F-5) | Pending |
-| Material shader-mapping library (F-6) | Pending |
-| Terrain heightmap extraction (F-7) | Partial — materials only |
-| Staged orchestration + pre-flight (F-8) | Pending |
-| Patch worker for cheap re-emit (F-9) | Foundation laid; lighter scope post-state-management |
-
-See the [feature roadmap](#feature-roadmap) for details.
+| Conversion Project system (`.u2oproj.json`, save/load/recent) | **Shipped** |
+| Mission Command (preflight + Run All + Patch All) | **Shipped** |
+| F-9 shader profile library + per-material overrides + patch worker | **Shipped** |
+| F-9 mesh per-FBX overrides + assetinfo composition | **Shipped** |
+| F-9 state index + externally-modified detection | **Shipped** |
+| F-8 orchestration + per-stage cancel | **Shipped (T-8 failure routing deferred)** |
+| Platform-abstraction refactor (SourcePlatform plugin contract) | **Shipped** |
+| Per-platform UI tab gating (`SUPPORTED_TABS`) | **Shipped** |
+| Unity source plugin | **Shipped — reference implementation** |
+| Unreal / Godot / Blender source plugins | Open — see [`platforms/README.md`](platforms/README.md) |
+| F-7 terrain heightmap extraction | Partial — materials shipped, heightmap pending |
+| F-10 shader profile authoring editor | Pending — stub plan in `.serena/memories/profile_editor/` |
 
 ---
 
 ## Quick start
 
-Requires Python 3.10+, PySide6, PyYAML. Pillow is optional (used for
-smoothness → roughness texture re-bake).
+Requires **Python 3.10+**, **PySide6**, **PyYAML**. **Pillow** is
+optional (smoothness → roughness alpha re-bake).
 
-```
+```bash
 pip install PySide6 PyYAML Pillow
 ```
 
 **Launch the GUI:**
 
-```
-UnityToO3DE_Converter.bat        # Windows
+```bash
 python main_app.py               # any platform
+UnityToO3DE_Converter.bat        # Windows shortcut
 ```
 
-CLI tab override (e.g. open straight to Scene Converter):
+Open a project (or create one), pick a Source Engine + Source Root,
+mark prefabs/scenes/materials on their respective tabs, then click
+**Run All** in Mission Command.
 
-```
-python main_app.py --tab=scene
-```
+CLI tab override:
 
-Accepted values: `dashboard` (default) / `scene` / `prefab` / `terrain`.
+```bash
+python main_app.py --tab=prefab    # dashboard / scenes / prefabs / meshes / materials / terrain
+```
 
 ---
 
-## Project workflow
-
-The Conversion Project is the unit of work. A project owns:
-
-1. **Scope root** — the Unity assets walking root.
-2. **Per-stage settings** — selected scenes, prefab directories,
-   selected terrain materials, output destinations.
-3. **Pipeline status** — last-run timestamps + summary counts per stage.
-4. **Outputs** — entity maps, asset index, coverage reports
-   (formerly `.ImporterData/` sidecars; now embedded in the project
-   file).
-5. **Sync state** — input-hash fingerprints per stage so the Dashboard
-   can tell you when the outputs on disk no longer match the project's
-   current settings.
-
-Projects live as `.u2oproj.json` files at any path you choose. The
-Dashboard's per-stage cards show readiness (what's configured) and
-sync state (whether outputs match settings), with a per-card Process
-button to fire that stage's worker without leaving the tab.
-
----
-
-## PID memory methodology
-
-Every non-trivial feature in this codebase has its design captured
-under `.serena/memories/<feature>/`. This is intentional — the
-project is co-developed with LLMs, and durable design memory is the
-mechanism that lets a fresh session pick up where the last one left
-off without re-deriving prior decisions.
-
-### File pair per feature
+## Workflow at a glance
 
 ```
-.serena/memories/<feature>/
-  <feature>_plan.md            Design-locked. The destination.
-  working_documentation.md     Living status log. The journey.
+1.  Open or create a Conversion Project       (.u2oproj.json)
+2.  Set Source Engine + Source Root           Dashboard banner
+3.  Mark prefabs / scenes / terrain           per-tab inventories
+4.  Customize per-asset overrides             Mesh / Material tabs
+5.  Edit shader mappings if needed            Materials → Edit Mappings
+6.  Check Mission Command pre-flight          green-light gate
+7.  Run All                                    full pipeline pass
+                                              OR
+    Patch All                                  re-emit dirty only
+8.  Review output state + state index         Dashboard cards
 ```
 
-### Reading order
-
-For any feature you want to understand or extend:
-
-1. **Skim the plan's `Goal` section** — one paragraph stating intent.
-2. **Read `Resolved Decisions (Q&A history)`** — every locked design
-   decision is captured with the *why* alongside the *what*. This is
-   the most valuable section for understanding why the code looks the
-   way it does.
-3. **Skim the `Design`** — data shapes, module boundaries, contracts.
-4. **Scan the `Implementation Plan`** — numbered phases (I.1 / I.2 /
-   ... ) with explicit "Done when" criteria.
-5. **Read the working doc's newest entry** — current shipped state +
-   any open follow-ups. Newest entries are at the top.
-
-### Writing convention
-
-- **Plan files are design-locked.** Edits add new Resolved Decisions
-  (Q&A); they don't rewrite history.
-- **Working docs are living.** Newest entries on top. Older entries
-  stay for context.
-- **Q&A history is sacred.** When a decision changes, append a new Q
-  + A that supersedes the old one. Don't delete.
-- Cross-link related memories with `[[memory-slug]]`.
-
-### Current memory clusters
-
-| Folder | What it covers |
-|---|---|
-| `project_system/` | Base Conversion Project system, file format, ProjectManager |
-| `project_scope/` | F-2 — project-level scope_root + per-stage source override |
-| `scene_marking/` | F-3 — multi-scene checklist + nested level output |
-| `dependency_banner/` | F-1 — startup dependency warning banner |
-| `ui_reorganization/` | UX-1 — banner + dashboard + tab reorder + readiness summaries |
-| `window_chrome/` | UX-2 — frameless window + custom title bar |
-| `state_management/` | Sidecar removal + sync-state engine + Process buttons |
-| `terrain/` | Terrain materials importer |
-| `material_conversion/` | Material pipeline (label resolution, slot mapping) |
-| `project/` | Pre-system converter notes |
-
-Each folder's working doc is the right entry point for understanding
-the current state of that subsystem.
+Switching the Source Engine mid-flight is non-destructive — every
+platform gets its own slot for `stages` and `outputs`. Your Unity
+selections + overrides survive a round-trip through Unreal and back.
 
 ---
 
-## Feature roadmap
+## Architecture (high level)
 
-`F-1` through `F-9` are the named features in the roadmap. The
-ordering reflects dependencies, not strict execution order — F-3
-shipped before F-4 because they turned out to be more independent
-than originally planned.
+```
+to-o3de_project_converter/
+    main_app.py                       Unified PySide6 GUI (entry point)
+    project_manager.py                Project model + ProjectManager
+    integrated_asset_processor.py     Worker — parse/emit orchestration
+    unity_scene_converter_gui.py      Stage 2 — scene to level conversion
+    terrain_material_processor.py     Terrain materials
+    preflight.py                      Pre-flight check registry
+    converter_settings.json           App-level state (recent projects)
+    Projects/                         Per-project .u2oproj.json files
 
-| ID | Feature | Status | Memory |
-|---|---|---|---|
-| F-1 | Startup dependency banner | **Shipped** | `dependency_banner/` |
-| F-2 | Project-level scope path + per-stage source override | **Shipped** | `project_scope/` |
-| F-3 | Multi-scene marking + nested O3DE level output | **Shipped** | `scene_marking/` |
-| F-4 | Scrubbed prefab checklist (replaces "process everything in source") | Pending | (no memory yet) |
-| F-5 | Mesh preprocessing — defaults + per-FBX overrides + patch primitives | Pending | (no memory yet) |
-| F-6 | Material shader-mapping library + unknown-shader detection | Pending | (no memory yet) |
-| F-7 | Terrain heightmap extraction (+ existing materials) | Partial — materials shipped, heightmap pending | `terrain/` |
-| F-8 | Staged orchestration + pre-flight checks | Pending | (no memory yet) |
-| F-9 | Output-state patching worker | Foundation laid by state-management | (no memory yet) |
+    platforms/                        Source-engine plugins
+        base.py                       SourcePlatform ABC (the contract)
+        types.py                      Neutral data shapes
+        unity/                        Unity reference plugin
+        README.md                     How to add a new platform
 
-Architectural / UX work that's already shipped:
+    targets/                          Output-target writers
+        o3de/                         O3DE prefab + assetinfo writers
 
-| Feature | Memory |
-|---|---|
-| Conversion Project base (save/load/recent, dashboard) | `project_system/` |
-| UI reorganization (banner + dashboard + tab order + readiness) | `ui_reorganization/` |
-| Custom window chrome (frameless + title bar) | `window_chrome/` |
-| State management (sidecar removal + sync state) | `state_management/` |
+    components/                       Legacy back-compat shim
+                                      (canonical home: platforms/unity/components/)
 
-Future polish carried explicitly across feature boundaries:
+    tests/                            Plain-Python test suite (no pytest)
+        run_all.py                    Walk + dispatch every test_*.py
+        unit/                         (9 modules, 62 tests)
+        integration/                  (4 modules, 16 tests)
+        ui/                           (4 modules, 15 tests)
+        README.md
 
-- **`Auto-Sync changes` Config toggle** — post-F-9. Opt-in background
-  patch worker that auto-re-emits when overrides change. Default off.
-  Captured in `state_management/state_management_plan.md` Q10.
+    tools/                            Standalone helper scripts
+        bake_fbx_transforms.py        Blender headless companion
+
+    .serena/memories/                 Design memory (P/I/T methodology)
+        <feature>/<feature>_plan.md
+        <feature>/working_documentation.md
+
+    AGENTICS_GUIDELINES.md            LLM co-development guide (READ FIRST if LLM)
+    README.md                         This file
+```
+
+The **Conversion Project** is the data unit that everything orbits.
+A project carries the source-engine selection, scope root, marked
+inventories, per-platform stage settings, output state index, and
+preflight acknowledgements — all in one `.u2oproj.json` file.
+
+The **platform plugin contract** is the seam between the engine-neutral
+orchestration core and the source-engine-specific parsers. See
+[`platforms/README.md`](platforms/README.md) for the contract spec.
 
 ---
 
-## What converts
+## What converts (Unity → O3DE)
 
 | Unity | O3DE | Status |
 |---|---|---|
 | Prefab hierarchy | Entity hierarchy in `.prefab` | Working |
-| Uniform transform | TransformComponent | Working |
-| Non-uniform scale | EditorNonUniformScaleComponent | Working |
+| Transform (uniform + non-uniform scale) | TransformComponent + EditorNonUniformScaleComponent | Working |
 | MeshFilter + MeshRenderer | EditorMeshComponent | Working |
-| Multi-material slots | EditorMaterialComponent `{}` default + `{0}`, `{1}`... | Working |
-| FBX `.assetinfo` per-entity MeshGroups | Named, predictable `.azmodel` asset hints | Working |
-| Texture maps (albedo, normal, metallic, roughness, occlusion, emissive) | StandardPBR properties | Working |
-| Transparency / alpha clip | `opacity.mode = Blended` + `alphaSource = Packed` | Working |
-| Metallic/roughness reconciliation (texture-aware) | Bound texture → no `metallic.factor`; `roughness.lowerBound/upperBound` from `_GlossMapScale` or `_Smoothness` | Working |
-| BoxCollider | EditorBoxShapeComponent + EditorShapeColliderComponent | Working |
-| SphereCollider | EditorSphereShapeComponent + EditorShapeColliderComponent | Working |
-| CapsuleCollider | EditorCapsuleShapeComponent + EditorShapeColliderComponent | Working |
-| MeshCollider | EditorMeshColliderComponent | Working |
-| Rigidbody (dynamic) | EditorRigidBodyComponent | Working |
-| No Rigidbody + collider | EditorStaticRigidBodyComponent | Working |
+| Multi-material slots | EditorMaterialComponent (`{}` default + `materialsByLabel`) | Working |
+| FBX `.assetinfo` per-entity MeshGroups | Named `.azmodel` asset hints | Working |
+| Texture maps (albedo, normal, metallic, roughness, occlusion, emissive) | StandardPBR property values | Working |
+| Transparency / alpha clip / cutout | `opacity.mode` + `alphaSource = Packed` | Working |
+| Metallic-gloss smoothness → roughness (texture-aware) | `roughness.lowerBound/upperBound` or `roughness.factor` | Working |
+| BoxCollider / SphereCollider / CapsuleCollider / MeshCollider | Editor*ShapeComponent + EditorShapeColliderComponent / EditorMeshColliderComponent | Working |
+| Rigidbody dynamic + static-with-collider | EditorRigidBodyComponent / EditorStaticRigidBodyComponent | Working |
 | Multiple colliders on one GO | Overflow → child entities `{Name}_Collider_N` | Working |
-| Nested prefab instances | Nested instance references | Working |
-| Prefab override — transform | Tier 1 JSON patches (`Translate/N`, `Rotate/N`, uniform `Scale`) | Working |
-| Prefab override — `m_Materials.Array.data[N]` | Tier 3 `assetHint` patches via project's entity-map records | Working |
+| Nested prefab instances | Nested O3DE instance references | Working |
+| Prefab override — transform | Tier 1 JSON patches | Working |
+| Prefab override — material slot (`m_Materials.Array.data[N]`) | Tier 3 `assetHint` patches via project entity-map records | Working |
 | Prefab override — `m_IsActive`, added/removed components | Logged to coverage, not emitted | Pending |
-| Directional light | EditorDirectionalLightComponent (intensity, shadows) + 180° pitch correction | Working |
-| Point / Spot / Area lights | EditorAreaLightComponent (Sphere / SimpleSpot / SimplePoint) | Working |
-| Scene placement + rotation | Prefab instance transforms in level | Working |
-| Scene → multi-output: `<output>/<SceneName>/<SceneName>.prefab` | O3DE nested level convention | Working |
+| Lights — Directional / Point / Spot / Area | EditorDirectionalLightComponent / EditorAreaLightComponent (180° pitch correction for directional) | Working |
+| Scene → `<output>/<SceneName>/<SceneName>.prefab` | O3DE nested level convention | Working |
 | Unowned scene entities (physics + lights) | Same component pipeline as prefab processing | Working |
-| Mesh pivot / coordinate rebake | — | Known issue (see below) |
 | Terrain `.mat` → TerrainBaseMaterial | Per-material `.material` file emit | Working |
 | Terrain heightmap extraction | — | Pending (F-7) |
+| Mesh pivot / coordinate rebake | — | [Known issue](#known-issues) |
 
 ---
 
-## Architecture
+## Adding a new source platform
 
-```
-unity_to_o3de_converter/
-  main_app.py                      Unified PySide6 GUI (entry point)
-  project_manager.py               Project model + ProjectManager singleton
-  integrated_asset_processor.py    Stage 1 — prefab + asset processing
-  unity_scene_converter_gui.py     Stage 2 — scene to level conversion
-  terrain_material_processor.py    Terrain materials (TerrainBaseMaterial)
-  converter_settings.json          App-level state (recent projects, config)
-  Projects/                        Per-project .u2oproj.json files
+The plugin contract is documented in [`platforms/README.md`](platforms/README.md).
+The Unity reference is at [`platforms/unity/README.md`](platforms/unity/README.md).
 
-  components/                      Pluggable component processor modules
-    __init__.py                    Auto-discovery and dispatch table
-    base.py                        ComponentProcessor ABC + ProcessingContext
-    mesh.py            weight=25   MeshFilter / MeshRenderer
-    material.py        weight=50   Material slot mapping
-    rigidbody.py       weight=75   Rigidbody (dynamic + static)
-    box_collider.py    weight=100  BoxCollider
-    sphere_collider.py weight=125  SphereCollider
-    capsule_collider.py weight=150 CapsuleCollider
-    mesh_collider.py   weight=175  MeshCollider
-    light.py           weight=510  All Unity Light types
+Quick summary: a new plugin is `platforms/<engine>/<engine>_platform.py`
+implementing the `SourcePlatform` ABC, plus a per-component-type
+processor directory mirroring [`platforms/unity/components/`](platforms/unity/components/).
+Estimated size: ~1500–2000 lines.
 
-  .serena/memories/                PID methodology — feature plans + working docs
-    <feature>/<feature>_plan.md
-    <feature>/working_documentation.md
+After authoring:
 
-  TestObjects/                     Local test fixtures (gitignored)
-    TestProject.u2oproj.json       Reference testbed for feature verification
-```
+1. Add a `SourceEngine` enum entry in [`project_manager.py`](project_manager.py).
+2. Register the platform in [`platforms/__init__.py`](platforms/__init__.py).
+3. Mirror the test coverage under [`tests/`](tests/) (the shared
+   harness picks up new files automatically).
 
-The Conversion Project is the data model that everything orbits.
-`Project` (in `project_manager.py`) owns `scope_root`, per-stage
-`stages` settings, `pipeline_status` summaries, and full `outputs`
-bookkeeping. Workers read project state at start, write outputs at
-finish; the Dashboard reads everything via `compute_stage_readiness`
-and `compute_stage_sync_state`.
-
-Component processors are auto-discovered: drop a new module in
-`components/`, set a `WEIGHT` for ordering and a `HANDLES` list of
-Unity component types, and it runs.
+Switching engines in the GUI is automatic — projects round-trip
+between platform slots non-destructively.
 
 ---
 
 ## Known issues
 
-**Mesh coordinate system.** Unity internally rebakes mesh coordinates
-in a way that does not match the raw FBX on disk. The converter
-applies the Unity → O3DE axis swap — position `(x, z, y)`, rotation
-`(qx, qz, qy, qw)`, scale `(sx, sz, sy)` — but cannot correct for
-Unity's internal mesh pivot bake. A Blender transform-bake pass was
-attempted and abandoned as ineffectual. This is the primary visual
-accuracy issue on some assets.
+- **Mesh coordinate / pivot rebake.** Unity internally rebakes mesh
+  coordinates in a way that doesn't match the raw FBX. The converter
+  applies the Unity → O3DE axis swap and composes a Y-up correction
+  quaternion into every assetinfo's `CoordinateSystemRule`, but
+  cannot correct for Unity's mesh-pivot bake. A Blender transform-bake
+  pass exists (`tools/bake_fbx_transforms.py`) and can be invoked
+  manually; integrating it into the pipeline is open.
 
-**Material pipeline.** Texture, normal, metallic, roughness, and
-opacity conversions are functional. Specular workflow, detail maps,
-and some edge-case shader properties are not yet mapped. F-6 is the
-formal fix.
+- **Specular workflow + detail maps not yet mapped.** The default
+  shader profile covers Standard, URP/Lit, URP/Simple Lit, and the
+  MK4 Alien Fantasy Forest pack. Custom shaders need a per-shader
+  profile entry; F-10 (Profile Editor) will surface this in the UI.
 
-**Smoothness alpha channel.** Unity's `_MetallicGlossMap` stores
-smoothness in the alpha channel. O3DE reads roughness from the alpha
-directly, so on materials using this map the shiny/dull values are
-inverted. The bounds remap (`roughness.lowerBound/upperBound`) is
-mathematically correct, but the texture content needs pre-inversion
-at copy time to look right. Optional Pillow-backed re-bake exists
-(`Config → Convert smoothness to roughness`) but is off by default.
+- **Smoothness alpha channel.** Unity's `_MetallicGlossMap` stores
+  smoothness in the alpha channel; O3DE reads roughness directly.
+  The bounds remap is mathematically correct but the texture content
+  needs pre-inversion. Optional Pillow-backed re-bake exists
+  (Config → Convert smoothness to roughness) but is off by default.
+
+- **F-8 per-worker failure routing.** Stage workers throwing
+  exceptions land as `processing_changed(False)` and don't propagate
+  a failure signal to the orchestrator. The orchestrator stops
+  dispatching on cancel; per-stage failure detection is deferred.
 
 ---
 
-## Authoring a component processor
+## Where the design lives
 
-The `components/` directory is a self-contained plugin system. Drop
-a new `.py` file in and it is auto-discovered, instantiated, and
-wired into the pipeline on the next run. No core changes needed.
+This project's design memory is captured under
+[`.serena/memories/`](.serena/memories/) as **P/I/T artefacts** —
+plan + working-documentation pairs per feature. The methodology is
+described in [`AGENTICS_GUIDELINES.md`](AGENTICS_GUIDELINES.md) §3.
 
-### Minimal example
-
-```python
-from typing import Callable, Dict, List
-from .base import ComponentProcessor, ProcessingContext
-
-
-class LightComponentProcessor(ComponentProcessor):
-    """Convert Unity Light components to O3DE EditorLightComponent."""
-
-    WEIGHT  = 200                  # lower = runs earlier; built-ins use multiples of 25
-    HANDLES = ['Light']            # Unity component types this processor parses
-    EMITS   = ['EditorLightComponent']   # informational
-
-    def parse(self, comp_type: str, comp_data: Dict,
-              go, log: Callable[[str], None]) -> None:
-        # Called once per Unity component during parse phase.
-        # Populate go.component_data (or standard fields like go.mesh_guid).
-        go.component_data['light'] = {
-            'intensity': float(comp_data.get('m_Intensity', 1.0)),
-        }
-
-    def emit(self, go, entity: Dict, ctx: ProcessingContext) -> List[str]:
-        # Called once per entity during the O3DE prefab generation phase.
-        # Mutate entity['Components']; return child entity IDs you created.
-        light = go.component_data.get('light')
-        if not light:
-            return []
-        entity['Components']['EditorLightComponent'] = {
-            '$type': 'EditorLightComponent',
-            'Id':    ctx.generate_component_id(),
-            'Controller': {'Configuration': {'Intensity': light['intensity']}},
-        }
-        ctx.log(f"  [Light] ✓ EditorLightComponent — intensity={light['intensity']}")
-        return []
-```
-
-### ProcessingContext reference
-
-| Field / method | Purpose |
+| Concern | Memory cluster |
 |---|---|
-| `ctx.material_mapping` | `dict[guid → asset_hint]` for Unity materials |
-| `ctx.mesh_mapping` | `dict[guid → asset_hint]` for Unity meshes |
-| `ctx.entities_dict` | All entities being built (mutate to add child entities) |
-| `ctx.entity_id_map` | `dict[file_id → entity_id]` |
-| `ctx.generate_component_id()` | Unique component ID string |
-| `ctx.generate_entity_id()` | Unique entity ID string |
-| `ctx.make_bare_entity(id, name, parent_id)` | Minimal child entity with standard boilerplate |
-| `ctx.log(msg)` | Emit to the GUI console |
+| Conversion Project base | `.serena/memories/project_system/` |
+| Project scope + per-stage source override (F-2) | `.serena/memories/project_scope/` |
+| Multi-scene marking + nested level output (F-3) | `.serena/memories/scene_marking/` |
+| Scrubbed prefab marking (F-4) | `.serena/memories/prefab_marking/` |
+| Mesh preprocessing + per-FBX overrides (F-5) | `.serena/memories/mesh_preprocessing/` |
+| Material shader-mapping editor (F-6) | `.serena/memories/material_preprocessing/` |
+| Orchestration + Pre-flight (F-8) | `.serena/memories/orchestration/` |
+| Output propagation + state index + patch worker (F-9) | `.serena/memories/output_propagation/` |
+| Platform abstraction refactor (5 phases + 7 follow-ups) | `.serena/memories/platform_abstraction/` |
+| State management (sync-state engine) | `.serena/memories/state_management/` |
+| UI reorganization (banner + dashboard + tab order) | `.serena/memories/ui_reorganization/` |
+| Window chrome (frameless + title bar) | `.serena/memories/window_chrome/` |
+| Profile editor (F-10 — stub) | `.serena/memories/profile_editor/` |
 
-### Logging conventions
-
-```
-[MyComp] ✓ ...   Successful emit
-[MyComp] ⚠ ...   Warning — partial result, fallback used
-[MyComp] ✗ ...   Error — component skipped
-```
+Each cluster's `working_documentation.md` is the right entry point
+for understanding current state. The `<feature>_plan.md` files hold
+locked design decisions with Q&A history.
 
 ---
 
-## Change log (highlights)
+## Co-development methodology
 
-**2026-05-27 — State management refactor**
+This codebase is co-developed with LLMs. The
+[`AGENTICS_GUIDELINES.md`](AGENTICS_GUIDELINES.md) document captures
+the working model:
 
-- `.ImporterData/` directory removed. All entity maps, asset index
-  records, and coverage reports now live in the `.u2oproj.json` file
-  under `outputs.<stage>`. Schema version 2.
-- Input-hash-driven sync state added per stage: `unconfigured /
-  ready / synchronized / unsynchronized / writing / error`.
-- Dashboard status cards gained a Process button + sync-state row.
-- Stage 2 prefab database reads entity maps + asset index from the
-  project file instead of disk sidecars.
+- **P/I/T** — Plan (design-locked) / Implementation phases (with
+  Done-when criteria) / Testing matrix.
+- **Memory clustering** — every feature gets a folder under
+  `.serena/memories/<feature>/`.
+- **Verification at pivot points** — phase boundaries are stops where
+  the user verifies behaviour before the next phase starts.
+- **Q&A is sacred** — locked decisions append, never overwrite.
 
-**2026-05-26 — Project system + UX overhaul**
+If you're an LLM, read that file first. If you're a human, it's a
+useful map of how the codebase grew and where the design memory
+lives.
 
-- Conversion Project file format (`.u2oproj.json`) + ProjectManager.
-- Project header banner at the top of the window with File menu.
-- Dashboard tab (renamed from Project tab) with per-stage readiness
-  cards.
-- Tab order reflects configuration workflow: Dashboard → Scene →
-  Prefab → Terrain.
-- Frameless window with custom Catppuccin-styled title bar
-  (min/max/close + edge resize).
-- F-1 (dependency banner), F-2 (scope path), F-3 (multi-scene)
-  shipped.
+---
 
-**2026-05-25 — Prefab override propagation**
+## Goal: a conversion language
 
-- Tier 1 (transform), Tier 3 (material slot) overrides emit as O3DE
-  JSON patches. Tier 2 (`m_IsActive`) and Added/Removed components
-  recorded as unhandled overrides in coverage.
-- Per-prefab entity-map sidecars introduced (since absorbed into the
-  project file as of 2026-05-27).
-- Metallic/roughness texture-aware reconciliation; opacity
-  `alphaSource = Packed` for Cutout + Blended materials.
+The long-term goal is to formalize a vocabulary that other
+engine-pair converters can mirror:
 
-**2026-03-14 — Component pipeline + scene unowned entities**
+| Concept | What it does | Engine-specific code |
+|---|---|---|
+| **Scope** | Pin the walking root of a source project | Choose a folder |
+| **Mark** | Pick the subset to convert from scrubbed inventories | UI checklists |
+| **Override** | Per-asset configuration knobs | Per-asset editors |
+| **Profile** | Shared shader → materialtype + property remap library | Profile editor (F-10) |
+| **Orchestrate** | Pre-flight check → staged execution | Mission Command |
+| **Sync** | Track input hashes vs last-export per asset | State index |
+| **Patch** | Surgically re-emit only affected artifacts | Patch worker |
 
-- Component processing for unowned scene entities (physics + lights
-  on non-prefab scene GameObjects).
-- Unified `light.py` processor handling Directional / Point / Spot /
-  Area in one module. 180° pitch correction for directional lights.
-- X-axis inversion removed from coordinate conversion; final swap is
-  `(x, z, y)` / `(qx, qz, qy, qw)`.
-- FBX `.assetinfo` per-entity MeshGroups with binary FBX parser for
-  sub-objects.
+Unity → O3DE is the first concrete implementation. The plugin
+contract makes the second one (Unreal, Godot, Blender, …) a
+self-contained `platforms/<engine>/` drop. The conversion language
+is what survives when those plugins ship.
 
-**2026-03-13 — GUI consolidation**
+---
 
-- Unified PySide6 GUI with Catppuccin dark theme.
-- Component processing refactored into auto-discovered weighted
-  plugin modules.
-- Full physics pipeline: Box/Sphere/Capsule/MeshCollider +
-  Rigidbody / StaticRigidBody.
+## Tests
 
-**2026-02-06 — Initial functionality**
+Plain-Python assert-based test suite under [`tests/`](tests/). No
+pytest dependency.
 
-- Multi-material slot conversion.
-- Transparency / opacity conversion.
-- Collider + Rigidbody detection.
-- Mesh / model offsets identified as ongoing issue.
+```bash
+python tests/run_all.py                  # full suite (17 modules, 96 tests)
+python tests/run_all.py unit             # only tests/unit/
+python tests/run_all.py ui dirty         # filter by substring
+python tests/unit/test_<name>.py         # single module
+```
+
+The harness sets `QT_QPA_PLATFORM=offscreen` and
+`U2O_SKIP_CLOSE_PROMPT=1` so UI tests don't need a display server.
+See [`tests/README.md`](tests/README.md) for the test-writing recipe.
+
+---
+
+## License
+
+Public Domain. Use, fork, or strip-mine freely — the goal is a
+conversion vocabulary that more developers can mirror, and license
+friction would defeat that.
+
+---
+
+## Further reading
+
+- [`AGENTICS_GUIDELINES.md`](AGENTICS_GUIDELINES.md) — co-development
+  methodology (READ FIRST if you're an LLM).
+- [`platforms/README.md`](platforms/README.md) — source-platform
+  plugin contract.
+- [`platforms/unity/README.md`](platforms/unity/README.md) — Unity
+  reference plugin walkthrough.
+- [`tests/README.md`](tests/README.md) — test suite layout + recipe.
+- `.serena/memories/platform_abstraction/audit.md` — the platform-
+  agnostic-core vs source-platform-surface map.

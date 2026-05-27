@@ -1177,6 +1177,22 @@ class ProjectHeaderBanner(QFrame):
         form.addRow("File:",        self._file_lbl)
         v.addLayout(form)
 
+        # Phase E — transient toast for platform-switch confirmation.
+        # Hidden by default; populated + revealed by `_show_platform_switch_toast`
+        # on engine change; auto-cleared by `_switch_toast_timer` after 4s.
+        self._switch_toast = QLabel("")
+        self._switch_toast.setObjectName("platform_switch_toast")
+        self._switch_toast.setStyleSheet(
+            "background: #313244; color: #a6e3a1; padding: 6px 10px; "
+            "border: 1px solid #45475a; border-radius: 4px; font-size: 9pt;"
+        )
+        self._switch_toast.setWordWrap(True)
+        self._switch_toast.setVisible(False)
+        v.addWidget(self._switch_toast)
+        self._switch_toast_timer = QTimer(self)
+        self._switch_toast_timer.setSingleShot(True)
+        self._switch_toast_timer.timeout.connect(self._hide_platform_switch_toast)
+
         bottom = QHBoxLayout()
         bottom.setContentsMargins(0, 4, 0, 0)
         bottom.addStretch(1)
@@ -1353,8 +1369,91 @@ class ProjectHeaderBanner(QFrame):
         proj = pm.current()
         if proj is None: return
         value = self._scope_combo.itemData(idx)
-        proj.set_source_engine(SourceEngine.from_string(value))
+        new_engine = SourceEngine.from_string(value)
+        old_active = proj.active_platform
+        # Phase E — record a snapshot of the old platform's selections so
+        # the log entry can quantify "non-destructive". The switch happens
+        # via set_source_engine which is destructive at the active-slot
+        # level (live views rebind) but not at the data level (the old
+        # slot stays in stages_by_platform).
+        old_summary = self._platform_summary(proj, old_active)
+        proj.set_source_engine(new_engine)
         pm.commit_metadata()
+        # Visible confirmation. Both surfaces:
+        #   1. Transient toast on the banner (auto-clears after ~4s).
+        #   2. Detailed entry on the Dashboard activity log.
+        new_summary = self._platform_summary(proj, proj.active_platform)
+        self._show_platform_switch_toast(old_active, proj.active_platform,
+                                          old_summary)
+        self._log_platform_switch(old_active, proj.active_platform,
+                                   old_summary, new_summary)
+
+    @staticmethod
+    def _platform_summary(proj, plat_name: str) -> dict:
+        """Snapshot the per-platform stages for log/toast context."""
+        stages = (proj.stages_by_platform.get(plat_name) or {})
+        ap = stages.get("asset_processor") or {}
+        sc = stages.get("scene_converter") or {}
+        mp = stages.get("material_processor") or {}
+        return {
+            "prefabs":   len(ap.get("selected_prefabs") or []),
+            "scenes":    len(sc.get("selected_scenes")  or []),
+            "overrides": len((mp.get("overrides") or {})),
+        }
+
+    def _show_platform_switch_toast(self, old: str, new: str,
+                                     old_summary: dict) -> None:
+        """Brief inline label on the banner — auto-clears via a QTimer.
+        Lives in the toast slot so multiple rapid switches don't stack."""
+        if not hasattr(self, "_switch_toast"):
+            return
+        msg = (f"  Switched to {new.capitalize()} — "
+               f"{old.capitalize()} data preserved "
+               f"({old_summary['prefabs']} prefab(s), "
+               f"{old_summary['scenes']} scene(s), "
+               f"{old_summary['overrides']} override(s))")
+        self._switch_toast.setText(msg)
+        self._switch_toast.setVisible(True)
+        if hasattr(self, "_switch_toast_timer"):
+            self._switch_toast_timer.stop()
+            self._switch_toast_timer.start(4000)
+
+    def _hide_platform_switch_toast(self) -> None:
+        if hasattr(self, "_switch_toast"):
+            self._switch_toast.setVisible(False)
+
+    @staticmethod
+    def _log_platform_switch(old: str, new: str,
+                              old_summary: dict, new_summary: dict) -> None:
+        """Append a switch entry to the Dashboard's activity log.
+
+        Reaches the dashboard through MainWindow's `_log_to_dashboard`
+        helper if it's available; falls back to print() when running
+        headless (tests, smoke scripts)."""
+        msg = (
+            f"[Engine] Switched source engine: {old} -> {new}. "
+            f"Non-destructive — {old} slot kept "
+            f"({old_summary['prefabs']} prefab(s), "
+            f"{old_summary['scenes']} scene(s), "
+            f"{old_summary['overrides']} override(s)). "
+            f"{new} slot loaded "
+            f"({new_summary['prefabs']} prefab(s), "
+            f"{new_summary['scenes']} scene(s), "
+            f"{new_summary['overrides']} override(s))."
+        )
+        # Try to reach the Dashboard log. The window lives on
+        # QApplication.activeWindow() / the singleton in main_app; safest
+        # fallback is to walk MainWindow if it's been constructed.
+        try:
+            app = QApplication.instance()
+            for w in (app.topLevelWidgets() if app else []):
+                log_fn = getattr(w, "_log_to_dashboard", None)
+                if callable(log_fn):
+                    log_fn(msg)
+                    return
+        except Exception:
+            pass
+        print(msg)
 
     def _on_scope_root_changed(self) -> None:
         if self._suppress_emits: return
@@ -3495,7 +3594,7 @@ class SceneConverterTab(QWidget):
                              prefab_dirs: list, log) -> str:
         """Serial multi-scene conversion. Each scene gets its own
         UnitySceneConverter, output goes into <output>/<SceneName>/."""
-        from unity_scene_converter_gui import PrefabDatabase, UnitySceneConverter
+        from platforms.unity.scene_converter import PrefabDatabase, UnitySceneConverter
 
         log("\n" + "=" * 60)
         log("STARTING MULTI-SCENE CONVERSION")
@@ -5748,7 +5847,7 @@ class TerrainTab(QWidget):
 
     def _do_generation(self, source_path: str, output_path: str,
                        material_paths: list, log) -> str:
-        from terrain_material_processor import TerrainMaterialProcessor
+        from platforms.unity.terrain import TerrainMaterialProcessor
 
         log("\n" + "=" * 60)
         log("STARTING TERRAIN MATERIAL GENERATION")
@@ -6141,6 +6240,25 @@ class MainWindow(QMainWindow):
             "material_processor": material_idx,
             "terrain_processor":  terrain_idx,
         }
+        # Follow-up 6 — per-platform tab gating. Map each tab to its
+        # SUPPORTED_TABS key so platform switches can show/hide tabs
+        # based on the active plugin's declared support set. Dashboard
+        # + Config are always visible (cross-platform meta surfaces).
+        self._PLATFORM_TAB_KEYS = {
+            0:                       "dashboard",
+            scene_idx:               "scenes",
+            prefab_idx:              "prefabs",
+            mesh_idx:                "meshes",
+            material_idx:            "materials",
+            terrain_idx:             "terrain",
+            self._config_index:      "config",
+        }
+        # Hook the platform-tab refresh into project_changed so a
+        # source-engine switch auto-applies the visibility set.
+        project_manager().project_changed.connect(self._refresh_platform_tabs)
+        # Initial sync against the current project (or Unity defaults).
+        self._refresh_platform_tabs(project_manager().current())
+
         dashboard_tab.request_focus_stage.connect(self._focus_stage)
         dashboard_tab.request_process_stage.connect(self._process_stage)
         # F-8 — Mission Command-level dispatch.
@@ -6218,6 +6336,36 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------------------
     # F-8 — Mission Command actions
     # -------------------------------------------------------------------------
+
+    # -------------------------------------------------------------------------
+    # PLATFORM-AWARE TAB GATING (follow-up 6)
+    # -------------------------------------------------------------------------
+
+    def _refresh_platform_tabs(self, project) -> None:
+        """Show / hide tabs based on the active platform's
+        ``SUPPORTED_TABS`` list. Dashboard is always visible; Config
+        stays hidden by default (toggled by the corner button). Other
+        tabs flip visibility based on whether the platform supports
+        them.
+
+        Called on project_changed and on initial construction. When no
+        project is loaded the Unity default (all tabs supported) is
+        used so the chrome doesn't shift between "empty project" and
+        "Unity project loaded" states."""
+        from platforms import get as get_platform
+        plat_name = (getattr(project, "active_platform", None)
+                     or "unity") if project else "unity"
+        platform  = get_platform(plat_name)
+        supported = (set(platform.SUPPORTED_TABS) if platform is not None
+                     else set(self._PLATFORM_TAB_KEYS.values()))
+        for idx, key in self._PLATFORM_TAB_KEYS.items():
+            # Dashboard always visible. Config visibility is owned by the
+            # corner button (already excluded from the tab bar).
+            if key == "dashboard":
+                continue
+            if key == "config":
+                continue
+            self._tabs.tabBar().setTabVisible(idx, key in supported)
 
     def _log_to_dashboard(self, msg: str) -> None:
         """Append a line to the Dashboard's activity log. Robust to the
