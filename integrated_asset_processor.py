@@ -17,6 +17,7 @@ import shutil
 import math
 import random
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple, Optional, Set
 from dataclasses import dataclass, field
 
@@ -864,17 +865,20 @@ class IntegratedAssetProcessor:
         self.materials_dir = output_root / "Materials"
         self.textures_dir = output_root / "Textures"
         self.meshes_dir = output_root / "Meshes"
-        # Internal converter bookkeeping that O3DE does not consume:
-        # per-prefab .entitymap.json sidecars, asset_index.json, coverage.json.
-        # Kept out of Prefabs/ so the O3DE Asset Processor never scans them.
-        self.importer_data_dir = output_root / ".ImporterData"
 
         # Create directories
         self.prefabs_dir.mkdir(parents=True, exist_ok=True)
         self.materials_dir.mkdir(parents=True, exist_ok=True)
         self.textures_dir.mkdir(parents=True, exist_ok=True)
         self.meshes_dir.mkdir(parents=True, exist_ok=True)
-        self.importer_data_dir.mkdir(parents=True, exist_ok=True)
+
+        # The converter's bookkeeping (entity maps, asset index, coverage)
+        # used to live in `<output_root>/.ImporterData/`. That directory is
+        # gone: everything is now persisted into the project file by the
+        # tab worker via `processor.to_outputs()`. Per-prefab entity maps
+        # are also kept in `self._entity_map_cache` for cross-prefab
+        # override reads within the same run.
+        self._project_prefab_records: Dict[str, Dict] = {}
         
         # Track processed assets
         self.processed_materials: Dict[str, str] = {}  # guid -> output_path
@@ -1097,59 +1101,37 @@ class IntegratedAssetProcessor:
     # =========================================================================
 
     def finalize(self) -> None:
-        """
-        Write the run's coverage.json and asset_index.json into <output_root>.
+        """End-of-run hook. No disk writes — the tab worker fetches
+        `to_outputs()` and persists it into the project file.
 
-        Call this exactly once, after every process_prefab() invocation in this
-        run has completed. The coverage report enumerates every Unity component
-        type seen, every prefab override propertyPath seen, every missing GUID,
-        and every warning the converter wanted to surface. The asset index lets
-        a follow-up Stage 2 scene conversion (or a re-run) resolve material /
-        mesh / prefab GUIDs to O3DE asset hints without re-walking everything.
-        """
-        # Roll up Unity-light counts from the in-memory GameObject coverage
-        # (the light processor stashes m_Type into go.component_data).
-        # No-op when no prefab was processed.
-        self._write_asset_index()
-        self._write_coverage_report()
+        Logs a one-line summary of what the run accumulated so the user
+        sees the same end-of-run signal they used to get from the
+        `.ImporterData/` writes."""
+        ai = self.asset_index
+        cov = self.coverage.to_dict()
+        self.log(f"\n  ✓ Run recorded: "
+                 f"{len(self._project_prefab_records)} prefabs, "
+                 f"{len(ai['materials'])} mats, "
+                 f"{len(ai['meshes'])} meshes, "
+                 f"{len(cov.get('unhandled_component_types', {}))} unhandled "
+                 f"component type(s), "
+                 f"{len(cov.get('unhandled_override_paths', {}))} unhandled "
+                 f"override path(s)")
 
-    def _write_asset_index(self) -> None:
-        path = self.importer_data_dir / "asset_index.json"
-        payload = {
-            "project_name": self.project_name,
-            "materials":    self.asset_index["materials"],
-            "meshes":       self.asset_index["meshes"],
-            "prefabs":      self.asset_index["prefabs"],
-            "counts": {
-                "materials": len(self.asset_index["materials"]),
-                "meshes":    len(self.asset_index["meshes"]),
-                "prefabs":   len(self.asset_index["prefabs"]),
-            },
+    def to_outputs(self) -> dict:
+        """Consolidate this run's bookkeeping into the dict the project
+        file stores under `outputs.asset_processor`. Replaces the old
+        `.ImporterData/` sidecars entirely.
+
+        Caller (the tab worker) augments this with `last_run`,
+        `last_input_hash`, and `last_status` before calling
+        `pm.update_outputs("asset_processor", ...)`."""
+        return {
+            "prefabs":   dict(self._project_prefab_records),
+            "materials": dict(self.asset_index["materials"]),
+            "meshes":    dict(self.asset_index["meshes"]),
+            "coverage":  self.coverage.to_dict(),
         }
-        try:
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(payload, f, indent=2)
-            self.log(f"\n  ✓ Wrote asset index: .ImporterData/{path.name} "
-                     f"({payload['counts']['materials']} mats, "
-                     f"{payload['counts']['meshes']} meshes, "
-                     f"{payload['counts']['prefabs']} prefabs)")
-        except Exception as exc:
-            self.log(f"  ⚠ Failed to write asset_index.json: {exc}")
-
-    def _write_coverage_report(self) -> None:
-        path = self.importer_data_dir / "coverage.json"
-        payload = self.coverage.to_dict()
-        try:
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(payload, f, indent=2)
-            unh_comp = len(payload['unhandled_component_types'])
-            unh_over = len(payload['unhandled_override_paths'])
-            self.log(f"  ✓ Wrote coverage report: .ImporterData/{path.name} "
-                     f"({unh_comp} unhandled component type(s), "
-                     f"{unh_over} unhandled override path(s), "
-                     f"{len(payload['warnings'])} warning(s))")
-        except Exception as exc:
-            self.log(f"  ⚠ Failed to write coverage.json: {exc}")
     
     def _parse_unity_prefab(self, prefab_path: Path) -> Tuple[Dict[str, GameObject], Dict[str, str]]:
         """Parse Unity prefab and extract GameObjects"""
@@ -1802,36 +1784,37 @@ class IntegratedAssetProcessor:
                                   entity_id_map: Dict[str, str],
                                   fbx_material_labels: Dict[str, List[str]]) -> None:
         """
-        Persist the fileID→entity_alias map and per-entity material slot list
-        into <output>/.ImporterData/<prefab_stem>.entitymap.json so the O3DE
-        Asset Processor never scans these (they are converter bookkeeping, not
-        O3DE-consumed). Sidecar format:
+        Build the per-prefab entity-map record and stash it in:
+          1. `self._project_prefab_records[guid_or_stem]` — persisted to
+             the project file at end-of-run via `to_outputs()`.
+          2. `self._entity_map_cache[source_path]` — used during the SAME
+             run by override propagation to translate Unity fileIDs into
+             O3DE entity aliases when a consumer prefab nests this one.
+
+        Replaces the old `<output>/.ImporterData/<stem>.entitymap.json`
+        sidecar file. Schema unchanged otherwise:
 
             {
               "source_guid":     "<unity_prefab_guid>",
-              "source_path":     "Assets/Foo.prefab",   (best-effort)
+              "source_path":     "Assets/Foo.prefab",
+              "output_path":     "Prefabs/Foo.prefab",
               "root_entity":     "Entity_[1000001]",
               "container_alias": "ContainerEntity",
               "entity_aliases":     {"<unity_file_id>": "Entity_[N]", ...},
               "material_slots":     {"<unity_file_id>": ["<mat_guid_0>", ...]},
               "material_slot_labels": {"<unity_file_id>": ["<fbx_name_0>", ...]},
-              "go_names":           {"<unity_file_id>": "Cube_001", ...}
+              "go_names":           {"<unity_file_id>": "Cube_001", ...},
+              "written_at":         "<iso-8601>"
             }
 
-        `material_slot_labels` holds the FBX-internal material names (one per
-        Unity MeshRenderer slot, ordinally paired). It is the only valid key
-        source for the runtime `materialsByLabel` map, so any Tier 3 override
-        emission needs to look up the slot's label here rather than guessing
-        from the assetHint stem.
+        `material_slot_labels` is the FBX-internal material name list per
+        MeshRenderer slot, ordinally paired — the only valid key source
+        for the runtime `materialsByLabel` map. Tier 3 override emission
+        must look up labels here rather than guessing from the assetHint
+        stem.
         """
-        # The root in entity_id_map keys was indexed by Unity file_id, which is
-        # exactly what nested-instance overrides target. ContainerEntity is the
-        # outer shell — overrides on the prefab instance's own root go to
-        # ContainerEntity at the consumer side, while overrides on internal
-        # children go to /Entities/<alias>/...
-
-        # Recover the source Unity prefab path/guid from output_path.stem (the
-        # converter writes outputs named after the source prefab's stem).
+        # Recover the source Unity prefab path/guid from output_path.stem
+        # (the converter writes outputs named after the source prefab's stem).
         source_path: Optional[Path] = None
         source_guid: Optional[str]  = None
         for guid, path in self.asset_db.guid_to_path.items():
@@ -1857,50 +1840,40 @@ class IntegratedAssetProcessor:
             go.file_id: go.name for go in all_game_objects.values() if go.name
         }
 
-        sidecar = {
-            "source_guid":         source_guid or "",
-            "source_path":         str(source_path) if source_path else "",
-            "root_entity":         entity_id_map.get(root_go.file_id, ""),
-            "container_alias":     "ContainerEntity",
-            "entity_aliases":      dict(entity_id_map),
-            "material_slots":      material_slots,
+        try:
+            output_rel = str(prefab_output_path.relative_to(self.output_root)).replace("\\", "/")
+        except Exception:
+            output_rel = prefab_output_path.name
+
+        record = {
+            "source_guid":          source_guid or "",
+            "source_path":          str(source_path) if source_path else "",
+            "output_path":          output_rel,
+            "root_entity":          entity_id_map.get(root_go.file_id, ""),
+            "container_alias":      "ContainerEntity",
+            "entity_aliases":       dict(entity_id_map),
+            "material_slots":       material_slots,
             "material_slot_labels": material_slot_labels,
-            "go_names":            go_names,
+            "go_names":             go_names,
+            "written_at":           datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
 
-        sidecar_path = self.importer_data_dir / f"{prefab_output_path.stem}.entitymap.json"
-        try:
-            with open(sidecar_path, 'w', encoding='utf-8') as f:
-                json.dump(sidecar, f, indent=2)
-            self.log(f"  ✓ Wrote entity map sidecar: .ImporterData/{sidecar_path.name}")
-        except Exception as exc:
-            self.log(f"  ⚠ Failed to write entity map sidecar: {exc}")
+        # Project-outputs map keyed by GUID where available, else by stem.
+        outputs_key = source_guid or f"path:{prefab_output_path.stem}"
+        self._project_prefab_records[outputs_key] = record
+
+        # In-memory cache keyed by source path for cross-prefab reads.
+        if source_path:
+            self._entity_map_cache[str(source_path)] = record
+
+        self.log(f"  ✓ Recorded entity map for {prefab_output_path.stem} "
+                 f"(guid={source_guid or 'n/a'})")
 
     def _load_entity_map_sidecar(self, source_prefab_path: Path) -> Optional[Dict]:
-        """Load the converted-side sidecar for a Unity source prefab path.
-
-        Sidecars now live in <output>/.ImporterData/<stem>.entitymap.json.
-        Returns None when the source prefab hasn't been converted yet (or the
-        sidecar is missing for some other reason). Cached after first load.
-        """
-        key = str(source_prefab_path)
-        if key in self._entity_map_cache:
-            return self._entity_map_cache[key]
-
-        candidate = self.importer_data_dir / f"{source_prefab_path.stem}.entitymap.json"
-        if not candidate.exists():
-            self._entity_map_cache[key] = None
-            return None
-
-        try:
-            with open(candidate, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            self._entity_map_cache[key] = data
-            return data
-        except Exception as exc:
-            self.log(f"  ⚠ Failed to load entity map sidecar {candidate.name}: {exc}")
-            self._entity_map_cache[key] = None
-            return None
+        """Return the entity-map record for the given Unity source prefab,
+        or None if it hasn't been processed in the current run. Reads from
+        the in-memory cache populated by `_write_entity_map_sidecar`."""
+        return self._entity_map_cache.get(str(source_prefab_path))
     
     def _create_container_entity(self, root_go: GameObject) -> Dict:
         """Create ContainerEntity for prefab"""

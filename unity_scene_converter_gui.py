@@ -149,7 +149,18 @@ class PrefabDatabase:
 class UnitySceneConverter:
     """Converts Unity scenes to O3DE levels with prefab support"""
 
-    def __init__(self, prefab_db: PrefabDatabase, log_callback=None):
+    def __init__(self, prefab_db: PrefabDatabase, log_callback=None, *,
+                 entity_maps_by_stem: Optional[Dict[str, Dict]] = None,
+                 asset_index: Optional[Dict] = None):
+        """
+        `entity_maps_by_stem` and `asset_index` are sourced from the
+        project file's `outputs.asset_processor` section by the tab
+        worker. They replace the old sidecar files
+        (`<output>/.ImporterData/<stem>.entitymap.json` and
+        `<output>/.ImporterData/asset_index.json`). Both default to {}
+        for callers that don't have project state available (e.g.
+        ad-hoc scripts).
+        """
         self.prefab_db = prefab_db
         self.log = log_callback or print
         self.game_objects: Dict[str, GameObject] = {}
@@ -176,16 +187,17 @@ class UnitySceneConverter:
         self.components_data: Dict[str, Dict] = {}
 
         # =====================================================================
-        # Coverage tracker — populated incrementally; written by finalize()
+        # Coverage tracker — populated incrementally; reported via to_coverage()
         # =====================================================================
         self.coverage = CoverageTracker()
 
-        # Asset index (loaded from disk on first material override that needs
-        # GUID→assetHint resolution). Searched in the parents of prefab dirs.
-        self._asset_index: Optional[Dict] = None
-
-        # Cache for source-prefab entity-map sidecars, keyed by absolute path.
-        self._entity_map_cache: Dict[str, Optional[Dict]] = {}
+        # Project-supplied lookups (formerly sidecar reads). Keyed by the
+        # output prefab stem (e.g. "Foo") so the lookup matches a Stage 2
+        # prefab reference like `<output>/Prefabs/Foo.prefab`.
+        self._entity_maps_by_stem: Dict[str, Dict] = dict(entity_maps_by_stem or {})
+        # Asset index shape: {materials: {guid: hint}, meshes: {guid: stem},
+        # prefabs: {guid: source_path}}.
+        self._asset_index: Dict = dict(asset_index or {})
     
     def parse_unity_scene(self, scene_path: str) -> None:
         """Parse Unity scene file"""
@@ -865,79 +877,46 @@ class UnitySceneConverter:
     # =========================================================================
 
     def _load_entity_map_sidecar(self, prefab_path: Path) -> Optional[Dict]:
-        """Load `<stem>.entitymap.json` from <output>/.ImporterData/.
+        """Return the entity-map record for the given output prefab path.
 
-        Sidecars are written by Stage 1 (IntegratedAssetProcessor) into the
-        same output root's `.ImporterData/` subdirectory. When Stage 2 runs
-        after Stage 1, the sidecar is found there; otherwise this returns
-        None and non-transform overrides are recorded as unhandled.
+        Reads from `self._entity_maps_by_stem` which the tab worker
+        populates from `project.outputs.asset_processor.prefabs` at
+        construction time. Replaces the old
+        `<output>/.ImporterData/<stem>.entitymap.json` sidecar read.
+        Returns None when no record exists for that stem (i.e. Stage 1
+        hasn't processed the prefab in the active project)."""
+        return self._entity_maps_by_stem.get(prefab_path.stem)
 
-        `prefab_path` is the converted O3DE prefab path, e.g.
-        `<output>/Prefabs/Foo.prefab`. The sidecar is therefore at
-        `<output>/.ImporterData/Foo.entitymap.json`.
-        """
-        key = str(prefab_path)
-        if key in self._entity_map_cache:
-            return self._entity_map_cache[key]
-
-        candidate = (prefab_path.parent.parent
-                     / ".ImporterData"
-                     / f"{prefab_path.stem}.entitymap.json")
-        if not candidate.exists():
-            self._entity_map_cache[key] = None
-            return None
-        try:
-            with open(candidate, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            self._entity_map_cache[key] = data
-            return data
-        except Exception as exc:
-            self.log(f"  ⚠ Failed to load entity map sidecar {candidate.name}: {exc}")
-            self._entity_map_cache[key] = None
-            return None
-
-    def _get_asset_index(self, hint_path: Path) -> Optional[Dict]:
-        """Lazy-load asset_index.json from <output>/.ImporterData/.
-
-        `hint_path` is a converted prefab path like
-        `<output>/Prefabs/Foo.prefab`. The index now lives in
-        `<output>/.ImporterData/asset_index.json`. Cached after first load.
-        """
-        if self._asset_index is not None:
-            return self._asset_index
-        candidate = hint_path.parent.parent / ".ImporterData" / "asset_index.json"
-        if candidate.exists():
-            try:
-                with open(candidate, 'r', encoding='utf-8') as f:
-                    self._asset_index = json.load(f)
-                self.log(f"  ✓ Loaded asset index: {candidate}")
-                return self._asset_index
-            except Exception as exc:
-                self.log(f"  ⚠ Failed to load asset index {candidate}: {exc}")
-        self._asset_index = {}
+    def _get_asset_index(self, hint_path: Path) -> Dict:
+        """Return the project's asset index (materials / meshes / prefabs
+        sub-dicts). Populated by the tab worker from
+        `project.outputs.asset_processor` at construction time. Replaces
+        the old `<output>/.ImporterData/asset_index.json` read.
+        `hint_path` retained for API compatibility; ignored."""
         return self._asset_index
 
     # =========================================================================
     # FINALIZE — write the scene-side coverage report
     # =========================================================================
 
-    def finalize(self, output_dir: Path) -> None:
-        """Write coverage.json into <output_dir>/.ImporterData/."""
-        importer_data = Path(output_dir) / ".ImporterData"
-        importer_data.mkdir(parents=True, exist_ok=True)
-        path = importer_data / "coverage.json"
-        payload = self.coverage.to_dict()
-        try:
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(payload, f, indent=2)
-            unh_comp = len(payload['unhandled_component_types'])
-            unh_over = len(payload['unhandled_override_paths'])
-            self.log(f"  ✓ Wrote coverage report: .ImporterData/{path.name} "
-                     f"({unh_comp} unhandled component type(s), "
-                     f"{unh_over} unhandled override path(s), "
-                     f"{len(payload['warnings'])} warning(s))")
-        except Exception as exc:
-            self.log(f"  ⚠ Failed to write coverage.json: {exc}")
+    def finalize(self, output_dir: Path = None) -> None:
+        """End-of-run hook. No disk writes — the tab worker reads
+        `to_coverage()` and persists into the project file's
+        `outputs.scene_converter.coverage`. `output_dir` accepted for
+        backwards-API compatibility with callers that still pass it; the
+        parameter is ignored."""
+        cov = self.coverage.to_dict()
+        unh_comp = len(cov.get('unhandled_component_types', {}))
+        unh_over = len(cov.get('unhandled_override_paths', {}))
+        self.log(f"  ✓ Coverage recorded: "
+                 f"{unh_comp} unhandled component type(s), "
+                 f"{unh_over} unhandled override path(s), "
+                 f"{len(cov.get('warnings', []))} warning(s)")
+
+    def to_coverage(self) -> dict:
+        """Return the scene's coverage report dict. Stored by the tab
+        worker into `project.outputs.scene_converter.coverage`."""
+        return self.coverage.to_dict()
     
     def _generate_component_id(self) -> int:
         """Generate unique component ID"""

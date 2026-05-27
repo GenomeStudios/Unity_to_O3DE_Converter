@@ -42,7 +42,7 @@ from PySide6.QtCore import QObject, Signal
 # =============================================================================
 
 PROJECT_FILE_EXT     = ".u2oproj.json"
-SCHEMA_VERSION       = 1
+SCHEMA_VERSION       = 2
 DEFAULT_RECENT_LIMIT = 10
 
 REPO_ROOT            = Path(__file__).parent
@@ -90,13 +90,52 @@ def _utc_now_iso() -> str:
 def _default_stages() -> dict:
     return {
         "asset_processor":   {"source_path": "", "output_path": ""},
-        "scene_converter":   {"scene_path":  "", "output_path": "", "prefab_dirs": []},
+        "scene_converter":   {
+            "source_path":     "",   # F-2 override (walking root for scene scrubbing)
+            "selected_scenes": [],   # F-3 relative paths under effective_source
+            "output_path":     "",
+            "prefab_dirs":     [],
+        },
         "terrain_processor": {"source_path": "", "output_path": "", "selected_materials": []},
     }
 
 
 def _default_status() -> dict:
     return {key: {"last_run": None} for key in STAGE_KEYS}
+
+
+def _default_outputs() -> dict:
+    """Per-stage outputs bookkeeping — replaces the old `.ImporterData/`
+    sidecar files. Each stage records the input-hash + last-run metadata
+    plus the per-asset records (entity maps, asset index entries, etc.)
+    that downstream consumers used to read from sidecars."""
+    return {
+        "asset_processor": {
+            "last_run":        None,
+            "last_input_hash": None,
+            "last_status":     None,
+            "prefabs":   {},   # guid → {source_path, output_path, container_alias,
+                               #         entity_aliases, material_slots, go_names, written_at}
+            "materials": {},   # guid → {output_path, written_at}
+            "meshes":    {},   # guid → {output_path, written_at}
+            "coverage":  {},
+        },
+        "scene_converter": {
+            "last_run":        None,
+            "last_input_hash": None,
+            "last_status":     None,
+            "scenes":   {},    # rel_path → {output_path, entities, prefab_references,
+                               #             missing_prefabs, written_at}
+            "coverage": {},
+        },
+        "terrain_processor": {
+            "last_run":        None,
+            "last_input_hash": None,
+            "last_status":     None,
+            "materials": {},   # source_abs_path → {output_path, textures, written_at}
+            "coverage":  {},
+        },
+    }
 
 
 def _normalize_project_path(path: Path) -> Path:
@@ -121,6 +160,8 @@ class Project:
     modified:        str
     stages:          dict
     pipeline_status: dict
+    outputs:         dict = field(default_factory=_default_outputs)
+    scope_root:      Optional[Path] = None
     _dirty:          bool = field(default=False, repr=False)
 
     # -------------------------------------------------------------------------
@@ -132,11 +173,13 @@ class Project:
             "schema_version":  SCHEMA_VERSION,
             "name":            self.name,
             "scope":           self.scope.value,
+            "scope_root":      str(self.scope_root) if self.scope_root else "",
             "notes":           self.notes,
             "created":         self.created,
             "modified":        self.modified,
             "stages":          self.stages,
             "pipeline_status": self.pipeline_status,
+            "outputs":         self.outputs,
         }
 
     @classmethod
@@ -145,6 +188,18 @@ class Project:
         stages.update(data.get("stages", {}))
         status = _default_status()
         status.update(data.get("pipeline_status", {}))
+        outputs = _default_outputs()
+        # Deep merge: keep new defaults for missing stages but copy any
+        # existing data over.
+        for k, v in (data.get("outputs", {}) or {}).items():
+            if k in outputs and isinstance(v, dict):
+                outputs[k].update(v)
+            else:
+                outputs[k] = v
+
+        raw_root = (data.get("scope_root") or "").strip()
+        scope_root = Path(raw_root) if raw_root else None
+
         return cls(
             path=path,
             name=data.get("name", "Untitled"),
@@ -154,6 +209,8 @@ class Project:
             modified=data.get("modified", _utc_now_iso()),
             stages=stages,
             pipeline_status=status,
+            outputs=outputs,
+            scope_root=scope_root,
         )
 
     # -------------------------------------------------------------------------
@@ -171,6 +228,12 @@ class Project:
         self.pipeline_status[key] = dict(status)
         self._mark_dirty()
 
+    def update_outputs(self, key: str, outputs: dict) -> None:
+        """Replace the stage's outputs record. The outputs dict carries the
+        bookkeeping that used to live in `.ImporterData/` sidecars."""
+        self.outputs[key] = dict(outputs)
+        self._mark_dirty()
+
     def set_name(self, name: str) -> None:
         if name != self.name:
             self.name = name
@@ -185,6 +248,28 @@ class Project:
         if notes != self.notes:
             self.notes = notes
             self._mark_dirty()
+
+    def set_scope_root(self, path: Optional[Path]) -> None:
+        """Set the project's Unity scope-root walking directory, or None
+        to clear. Per-stage source paths fall back to this when blank."""
+        new_value: Optional[Path] = Path(path) if path else None
+        if new_value != self.scope_root:
+            self.scope_root = new_value
+            self._mark_dirty()
+
+    def effective_source(self, stage_key: str) -> str:
+        """Resolve the walking root a stage should actually use:
+          - The stage's own `source_path` override if non-empty,
+          - else the project's `scope_root` if set,
+          - else "" (caller decides what to do with an empty result).
+
+        Returned as a string for direct use with Path(...)/QFileDialog
+        plumbing. Callers should treat "" as "no source configured"."""
+        stage = self.stage_settings(stage_key)
+        override = (stage.get("source_path") or "").strip()
+        if override:
+            return override
+        return str(self.scope_root) if self.scope_root else ""
 
     def is_dirty(self) -> bool:
         return self._dirty
@@ -209,8 +294,9 @@ class ProjectManager(QObject):
     use `project_manager()` to obtain the process-wide instance.
     """
 
-    project_changed = Signal(object)   # emits Project or None
-    status_changed  = Signal(str)      # emits the stage key whose status updated
+    project_changed     = Signal(object)        # emits Project or None
+    status_changed      = Signal(str)           # stage key whose status updated
+    processing_changed  = Signal(str, bool)     # stage key, is-currently-writing
 
     def __init__(self, settings_path: Optional[Path] = None, parent=None):
         super().__init__(parent)
@@ -339,6 +425,23 @@ class ProjectManager(QObject):
             self.save()
         self.status_changed.emit(stage_key)
 
+    def update_outputs(self, stage_key: str, outputs: dict) -> None:
+        """Worker call: persist the stage's outputs bookkeeping (entity
+        maps, asset index, coverage, etc.) into the project file.
+        Replaces the old `.ImporterData/` sidecar pattern."""
+        if self._current is None:
+            return
+        self._current.update_outputs(stage_key, outputs)
+        if self._current.path is not None:
+            self.save()
+        # Reuse status_changed since dashboard cards refresh on either.
+        self.status_changed.emit(stage_key)
+
+    def set_processing(self, stage_key: str, writing: bool) -> None:
+        """Worker call at start/end of a run. Drives the dashboard card's
+        `writing` sync-state badge."""
+        self.processing_changed.emit(stage_key, writing)
+
     def commit_metadata(self) -> None:
         """Persist + re-emit project_changed after the caller has mutated the
         current project's metadata fields (name / scope / notes) directly via
@@ -461,6 +564,41 @@ def project_manager() -> ProjectManager:
 
 
 # =============================================================================
+# GLOBAL-SETTINGS HELPERS (non-project state shared across the install)
+#
+# These read/write the same converter_settings.json the ProjectManager owns,
+# but for sections unrelated to any specific project. Keeping them on the
+# manager keeps a single file-I/O entrypoint.
+# =============================================================================
+
+def get_dismissed_dependency_signature() -> Optional[str]:
+    """Return the missing-deps signature the user has dismissed, or None
+    if no dismissal is recorded."""
+    pm = project_manager()
+    cfg = pm._read_settings()
+    return cfg.get("dependencies", {}).get("dismissed_signature")
+
+
+def set_dismissed_dependency_signature(signature: Optional[str]) -> None:
+    """Persist (or clear) the dismissed-dependency signature.
+
+    Passing None clears the key so the banner re-arms on the next missing
+    set, regardless of contents. Passing a string records the user's
+    "don't bother me about this exact set again" choice.
+    """
+    pm = project_manager()
+    cfg = pm._read_settings()
+    deps_section = cfg.setdefault("dependencies", {})
+    if signature is None:
+        deps_section.pop("dismissed_signature", None)
+        if not deps_section:
+            cfg.pop("dependencies", None)
+    else:
+        deps_section["dismissed_signature"] = signature
+    pm._write_settings(cfg)
+
+
+# =============================================================================
 # SMOKE TEST
 # =============================================================================
 
@@ -556,6 +694,122 @@ if __name__ == "__main__":
         assert pm_mig2.current() is not None
         rewritten2 = json.loads(legacy_settings.read_text())
         assert rewritten == rewritten2, "second migration mutated global settings"
+
+        # 9. scope_root + effective_source round-trips.
+        import os
+        def _norm(p): return os.path.normpath(p) if p else p
+        pm.close()
+        proj_root = pm.new_project("Scope Test", ProjectScope.ASSET_SET)
+        proj_root_path = tmp / "scoped.u2oproj.json"
+        # Initially no scope_root, no override → effective_source is ""
+        assert proj_root.effective_source("asset_processor") == ""
+        # Set scope_root → effective is the scope_root
+        proj_root.set_scope_root(Path("C:/fake/scope"))
+        assert _norm(proj_root.effective_source("asset_processor")) == _norm("C:/fake/scope")
+        # Set per-stage override → effective is the override
+        proj_root.update_stage("asset_processor", {
+            "source_path": "C:/fake/override",
+            "output_path": "C:/fake/out",
+        })
+        assert _norm(proj_root.effective_source("asset_processor")) == _norm("C:/fake/override")
+        # Save + reload preserves both
+        pm.save_as(proj_root_path)
+        pm.close()
+        reopened_root = pm.open(proj_root_path)
+        assert reopened_root.scope_root == Path("C:/fake/scope")
+        assert _norm(reopened_root.effective_source("asset_processor")) == _norm("C:/fake/override")
+        # Clearing override falls back to scope_root again
+        reopened_root.update_stage("asset_processor", {
+            "source_path": "",
+            "output_path": "C:/fake/out",
+        })
+        assert _norm(reopened_root.effective_source("asset_processor")) == _norm("C:/fake/scope")
+        # Clearing scope_root + no override → empty
+        reopened_root.set_scope_root(None)
+        assert reopened_root.effective_source("asset_processor") == ""
+
+        # 9b. Loading a project file with no scope_root key (old format) works.
+        old_format = tmp / "no_scope_root.u2oproj.json"
+        old_format.write_text(json.dumps({
+            "schema_version": 1,
+            "name": "Old",
+            "scope": "whole_game",
+            "notes": "",
+            "created":  _utc_now_iso(),
+            "modified": _utc_now_iso(),
+            "stages":          _default_stages(),
+            "pipeline_status": _default_status(),
+        }, indent=4))
+        pm.close()
+        old_proj = pm.open(old_format)
+        assert old_proj.scope_root is None
+        assert old_proj.effective_source("asset_processor") == ""
+
+        # 10. outputs round-trip (replaces .ImporterData/ sidecars).
+        pm.close()
+        proj_out = pm.new_project("Outputs Test")
+        outputs_path = tmp / "outputs.u2oproj.json"
+        sample_outputs = {
+            "last_run":        _utc_now_iso(),
+            "last_input_hash": "abc123",
+            "last_status":     "ok",
+            "prefabs": {
+                "guid-1": {
+                    "source_path":     "C:/u/foo.prefab",
+                    "output_path":     "Prefabs/foo.prefab",
+                    "container_alias": "container",
+                    "entity_aliases":  {"100000": "Entity_[1]"},
+                    "material_slots":  {"200000": ["mat-guid-1"]},
+                    "go_names":        {"Entity_[1]": "Foo"},
+                    "written_at":      _utc_now_iso(),
+                },
+            },
+            "materials": {},
+            "meshes":    {},
+            "coverage":  {"warnings": ["nothing to report"]},
+        }
+        pm.update_outputs("asset_processor", sample_outputs)
+        pm.save_as(outputs_path)
+        pm.close()
+        reopened_out = pm.open(outputs_path)
+        ap = reopened_out.outputs["asset_processor"]
+        assert ap["last_input_hash"] == "abc123"
+        assert ap["last_status"] == "ok"
+        assert ap["prefabs"]["guid-1"]["container_alias"] == "container"
+        assert ap["prefabs"]["guid-1"]["entity_aliases"]["100000"] == "Entity_[1]"
+        assert ap["coverage"]["warnings"] == ["nothing to report"]
+        # An old-format project file with no `outputs` key still loads.
+        no_outputs = tmp / "no_outputs.u2oproj.json"
+        no_outputs.write_text(json.dumps({
+            "name": "Old", "scope": "whole_game", "notes": "",
+            "created": _utc_now_iso(), "modified": _utc_now_iso(),
+            "stages":          _default_stages(),
+            "pipeline_status": _default_status(),
+        }, indent=4))
+        pm.close()
+        old_no_out = pm.open(no_outputs)
+        assert "asset_processor" in old_no_out.outputs
+        assert old_no_out.outputs["asset_processor"]["prefabs"] == {}
+
+        # 11. Dismissed-dependency-signature round-trip (uses singleton).
+        # Temporarily swap the singleton to point at the same temp settings
+        # the migration test created so we don't write to the real file.
+        import project_manager as _pm_mod  # noqa: F401 (self-import for swap)
+        saved_singleton = _pm_mod._singleton
+        _pm_mod._singleton = pm_mig  # bound to legacy_settings
+        try:
+            assert get_dismissed_dependency_signature() is None
+            set_dismissed_dependency_signature("Pillow")
+            assert get_dismissed_dependency_signature() == "Pillow"
+            set_dismissed_dependency_signature("PyYAML,Pillow")
+            assert get_dismissed_dependency_signature() == "PyYAML,Pillow"
+            set_dismissed_dependency_signature(None)
+            assert get_dismissed_dependency_signature() is None
+            # ...and the dependencies section is fully cleared, not left empty
+            rewritten3 = json.loads(legacy_settings.read_text())
+            assert "dependencies" not in rewritten3
+        finally:
+            _pm_mod._singleton = saved_singleton
 
         print("project_manager smoke test: OK")
     finally:
