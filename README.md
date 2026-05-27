@@ -1,9 +1,4 @@
-> System co-developed with Claude LLMs. Public Domain.
->
-> Guide video (project goals and usage walkthrough):
-> https://youtu.be/peQf-9lWNYA
-
----
+==USAGE VIDEO==
 
 # Unity → O3DE Converter
 
@@ -12,6 +7,8 @@ tool itself is the surface layer; the long-term goal is to **formalize
 a conversion language** — a vocabulary of stages, scopes, marks,
 overrides, sync states, and patches — that other engines can mirror to
 solve their own one-off conversion problems systematically.
+
+> System co-developed with Claude LLMs. Public Domain.
 
 ---
 
