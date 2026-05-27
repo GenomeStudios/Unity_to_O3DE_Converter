@@ -12,6 +12,7 @@ Run:
     python main_app.py --tab=scene
 """
 
+import copy
 import json
 import os
 import sys
@@ -19,7 +20,7 @@ import traceback
 from pathlib import Path
 
 from PySide6.QtCore    import Qt, QThread, Signal, QObject, QTimer
-from PySide6.QtGui     import QFont, QTextCursor, QAction, QDoubleValidator
+from PySide6.QtGui     import QFont, QTextCursor, QAction, QDoubleValidator, QColor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout,
     QHBoxLayout, QLabel, QLineEdit, QPushButton, QTextEdit,
@@ -30,9 +31,10 @@ from PySide6.QtWidgets import (
 )
 
 from project_manager import (
-    Project, ProjectScope, ProjectManager, project_manager,
+    Project, SourceEngine, ProjectScope, ProjectManager, project_manager,
     PROJECT_FILE_EXT, STAGE_KEYS, _utc_now_iso,
     get_dismissed_dependency_signature, set_dismissed_dependency_signature,
+    detect_externally_modified,
 )
 
 
@@ -128,6 +130,70 @@ QLineEdit {
 }
 QLineEdit:focus {
     border: 1px solid #89b4fa;
+}
+
+/* Dropdowns share the QLineEdit look — same surface colour, same border
+   radius, same focus glow — plus a styled arrow and a dark popup so the
+   list doesn't fall back to the host OS's system-default beige rendering. */
+QComboBox {
+    background: #313244;
+    border: 1px solid #45475a;
+    border-radius: 4px;
+    color: #cdd6f4;
+    padding: 5px 28px 5px 10px;       /* extra right pad clears the arrow */
+    min-height: 22px;
+    font-size: 10pt;
+    selection-background-color: #89b4fa;
+}
+QComboBox:hover {
+    border: 1px solid #585b70;
+}
+QComboBox:focus,
+QComboBox:on {
+    border: 1px solid #89b4fa;
+}
+QComboBox:disabled {
+    background: #1e1e2e;
+    color: #6c7086;
+    border: 1px solid #313244;
+}
+QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 22px;
+    border-left: 1px solid #45475a;
+    background: transparent;
+}
+QComboBox::down-arrow {
+    image: none;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid #cdd6f4;
+    margin-right: 8px;
+}
+QComboBox::down-arrow:disabled {
+    border-top: 5px solid #6c7086;
+}
+QComboBox QAbstractItemView {
+    background: #313244;
+    color: #cdd6f4;
+    border: 1px solid #45475a;
+    border-radius: 4px;
+    padding: 4px 0;
+    outline: 0;
+    selection-background-color: #89b4fa;
+    selection-color: #1e1e2e;
+}
+QComboBox QAbstractItemView::item {
+    padding: 6px 12px;
+    min-height: 22px;
+}
+QComboBox QAbstractItemView::item:hover {
+    background: #45475a;
+}
+QComboBox QAbstractItemView::item:selected {
+    background: #89b4fa;
+    color: #1e1e2e;
 }
 
 QPushButton {
@@ -475,6 +541,126 @@ class WorkerThread(QThread):
             self.emitter.message.emit(f"\n✗ EXCEPTION: {exc}")
             self.emitter.message.emit(traceback.format_exc())
             self.finished.emit(False, str(exc))
+
+
+class PipelineOrchestrator(QObject):
+    """F-8 — drives Run All across stages.
+
+    Listens to `project_manager.processing_changed` to know when each
+    per-stage worker finishes, then dispatches the next stage in the
+    queue. Each stage uses its existing per-tab worker (set up by F-9);
+    the orchestrator is glue, not a reimplementation.
+
+    Stage queue is derived from the project's current selections:
+      - asset_processor   if ≥1 prefab is selected
+      - scene_converter   if ≥1 scene is selected
+      - terrain_processor if ≥1 terrain material is selected
+
+    `dispatch_callable(stage_key)` is what actually fires the worker;
+    MainWindow passes `_process_stage` so the same code path the
+    Dashboard's per-stage Process buttons use is reused.
+    """
+
+    stage_started  = Signal(str)
+    stage_finished = Signal(str)
+    run_finished   = Signal(bool, str)   # success, summary
+    log            = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._queue:    list = []
+        self._current:  Optional[str] = None
+        self._dispatch = None
+        self._running  = False
+
+    def is_running(self) -> bool:
+        return self._running
+
+    def cancel(self) -> None:
+        """Best-effort cancel. The orchestrator stops dispatching new
+        stages; the currently-running stage runs to completion. Mid-stage
+        cancellation requires worker-level cooperation that the per-tab
+        workers don't yet expose — that's a follow-up."""
+        if not self._running:
+            return
+        if self._queue:
+            self.log.emit(
+                f"[orchestrator] Cancel — dropping {len(self._queue)} "
+                f"queued stage(s); current stage will finish."
+            )
+            self._queue = []
+        else:
+            self.log.emit("[orchestrator] Cancel — current stage will finish.")
+
+    def run_all(self, project, dispatch_callable) -> None:
+        if self._running:
+            self.log.emit("[orchestrator] already running — ignoring duplicate Run All")
+            return
+        self._queue = self._compute_queue(project)
+        if not self._queue:
+            self.run_finished.emit(False,
+                                    "No stages have selections — nothing to run.")
+            return
+        self._dispatch = dispatch_callable
+        self._running  = True
+        pm = project_manager()
+        # Connect once per run; we disconnect on completion to avoid
+        # piling up handlers across multiple invocations.
+        pm.processing_changed.connect(self._on_processing_changed)
+        self.log.emit(
+            f"[orchestrator] queue: {', '.join(self._queue)}"
+        )
+        self._advance()
+
+    def _compute_queue(self, project) -> list:
+        if project is None:
+            return []
+        q: list = []
+        ap = project.stage_settings("asset_processor")
+        if ap.get("selected_prefabs"):
+            q.append("asset_processor")
+        sc = project.stage_settings("scene_converter")
+        if sc.get("selected_scenes"):
+            q.append("scene_converter")
+        tp = project.stage_settings("terrain_processor")
+        if tp.get("selected_materials"):
+            q.append("terrain_processor")
+        return q
+
+    def _advance(self) -> None:
+        if not self._queue:
+            self._teardown(ok=True, summary="All stages completed.")
+            return
+        self._current = self._queue.pop(0)
+        self.log.emit(f"[orchestrator] → starting {self._current}")
+        self.stage_started.emit(self._current)
+        try:
+            self._dispatch(self._current)
+        except Exception as exc:
+            self.log.emit(f"[orchestrator] dispatch failed: {exc}")
+            self._teardown(ok=False,
+                            summary=f"Failed to dispatch {self._current}: {exc}")
+
+    def _on_processing_changed(self, stage_key: str, is_processing: bool) -> None:
+        if is_processing:
+            return
+        if stage_key != self._current:
+            return
+        self.log.emit(f"[orchestrator] ✓ {stage_key} finished")
+        self.stage_finished.emit(stage_key)
+        self._current = None
+        self._advance()
+
+    def _teardown(self, ok: bool, summary: str) -> None:
+        pm = project_manager()
+        try:
+            pm.processing_changed.disconnect(self._on_processing_changed)
+        except (TypeError, RuntimeError):
+            pass
+        self._running  = False
+        self._current  = None
+        self._dispatch = None
+        self.run_finished.emit(ok, summary)
 
 
 # =============================================================================
@@ -952,8 +1138,8 @@ class ProjectHeaderBanner(QFrame):
         self._name_edit.editingFinished.connect(self._on_name_changed)
 
         self._scope_combo = QComboBox()
-        for scope in ProjectScope:
-            self._scope_combo.addItem(scope.display_name(), scope.value)
+        for engine in SourceEngine:
+            self._scope_combo.addItem(engine.display_name(), engine.value)
         self._scope_combo.currentIndexChanged.connect(self._on_scope_changed)
 
         self._scope_root_edit, root_browse_btn = _path_row(
@@ -981,9 +1167,9 @@ class ProjectHeaderBanner(QFrame):
         self._file_lbl.setWordWrap(True)
         self._file_lbl.setStyleSheet("color: #a6adc8;")
 
-        form.addRow("Name:",        self._name_edit)
-        form.addRow("Scope:",       self._scope_combo)
-        form.addRow("Source Root:", root_wrap)
+        form.addRow("Name:",          self._name_edit)
+        form.addRow("Source Engine:", self._scope_combo)
+        form.addRow("Source Root:",   root_wrap)
         form.addRow("",             self._scope_root_status)
         form.addRow("Notes:",       self._notes_edit)
         form.addRow("Created:",     self._created_lbl)
@@ -1086,7 +1272,7 @@ class ProjectHeaderBanner(QFrame):
 
             # Compact row 1
             self._name_label.setText(project.name if has_project else "(no project loaded)")
-            self._scope_label.setText(project.scope.display_name() if has_project else "")
+            self._scope_label.setText(project.source_engine.display_name() if has_project else "")
             root_basename = self._root_basename(project) if has_project else ""
             self._root_label.setText(root_basename)
             self._root_label.setToolTip(str(project.scope_root) if (has_project and project.scope_root) else "")
@@ -1108,7 +1294,7 @@ class ProjectHeaderBanner(QFrame):
             # Expanded form
             if has_project:
                 self._name_edit.setText(project.name)
-                idx = self._scope_combo.findData(project.scope.value)
+                idx = self._scope_combo.findData(project.source_engine.value)
                 self._scope_combo.setCurrentIndex(idx if idx >= 0 else 0)
                 self._scope_root_edit.setText(str(project.scope_root) if project.scope_root else "")
                 self._refresh_scope_root_status(project)
@@ -1167,7 +1353,7 @@ class ProjectHeaderBanner(QFrame):
         proj = pm.current()
         if proj is None: return
         value = self._scope_combo.itemData(idx)
-        proj.set_scope(ProjectScope.from_string(value))
+        proj.set_source_engine(SourceEngine.from_string(value))
         pm.commit_metadata()
 
     def _on_scope_root_changed(self) -> None:
@@ -1857,6 +2043,263 @@ def compute_stage_sync_state(stage_key: str, project, *, writing: bool = False) 
             "details": f"Inputs changed since last export ({last_run})"}
 
 
+class _PreflightPanel(QWidget):
+    """Mission Command's Pre-flight surface.
+
+    Renders the result of `preflight.run_preflight(project)` as a vertical
+    list of severity-tagged rows grouped by category. Per-yellow-row
+    `Acknowledge` buttons write the row's snapshot hash to
+    `project.preflight_acks`; the row's gate clears as a result.
+
+    Signals:
+        run_all_clicked   — user wants to start a full Run All pass.
+        patch_all_clicked — user wants to patch-emit dirty assets.
+        refresh_clicked   — user requested an explicit re-run of the checks.
+    """
+
+    run_all_clicked   = Signal()
+    patch_all_clicked = Signal()
+    refresh_clicked   = Signal()
+
+    SEVERITY_COLOR = {
+        "green":  "#a6e3a1",
+        "yellow": "#f9e2af",
+        "red":    "#f38ba8",
+    }
+    SEVERITY_DOT = {
+        "green":  "●",
+        "yellow": "⚠",
+        "red":    "✗",
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._report = None
+        self._build_ui()
+
+    # -------------------------------------------------------------------------
+    # UI
+    # -------------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        from preflight import CATEGORY_LABELS  # noqa: F401  (forward ref OK)
+
+        self._box, lay = _section_groupbox("Pre-flight")
+        lay.setSpacing(10)
+
+        # Top status banner + action buttons.
+        top = QHBoxLayout()
+        top.setSpacing(8)
+
+        self._summary_lbl = QLabel("(no project loaded)")
+        self._summary_lbl.setWordWrap(True)
+        self._summary_lbl.setStyleSheet(
+            "color: #cdd6f4; font-size: 10pt; font-weight: bold;"
+        )
+        top.addWidget(self._summary_lbl, 1)
+
+        self._refresh_btn = QPushButton("Refresh")
+        self._refresh_btn.setCursor(Qt.PointingHandCursor)
+        self._refresh_btn.clicked.connect(self.refresh_clicked.emit)
+        top.addWidget(self._refresh_btn)
+
+        self._patch_all_btn = QPushButton("Patch All")
+        self._patch_all_btn.setCursor(Qt.PointingHandCursor)
+        self._patch_all_btn.clicked.connect(self.patch_all_clicked.emit)
+        self._patch_all_btn.setToolTip(
+            "Re-emit only the assets whose inputs (profile / override / "
+            "source file) have changed since the last run. Cheap iterative "
+            "loop."
+        )
+        top.addWidget(self._patch_all_btn)
+
+        self._run_all_btn = QPushButton("Run All")
+        self._run_all_btn.setObjectName("primary")
+        self._run_all_btn.setCursor(Qt.PointingHandCursor)
+        self._run_all_btn.clicked.connect(self.run_all_clicked.emit)
+        self._run_all_btn.setToolTip(
+            "Full pipeline pass — every stage runs in dependency order. "
+            "Pre-flight gates apply; resolve every red and acknowledge "
+            "every yellow first."
+        )
+        top.addWidget(self._run_all_btn)
+
+        lay.addLayout(top)
+
+        # Rows container — populated by `apply_report`.
+        self._rows_container = QWidget()
+        self._rows_layout    = QVBoxLayout(self._rows_container)
+        self._rows_layout.setSpacing(4)
+        self._rows_layout.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self._rows_container)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(self._box)
+
+    # -------------------------------------------------------------------------
+    # APPLY REPORT
+    # -------------------------------------------------------------------------
+
+    def apply_report(self, report, project) -> None:
+        from preflight import CATEGORY_LABELS
+
+        self._report = report
+        # Tear down existing rows.
+        while self._rows_layout.count():
+            item = self._rows_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+        if report is None or project is None:
+            self._summary_lbl.setText("(no project loaded)")
+            self._run_all_btn.setEnabled(False)
+            self._patch_all_btn.setEnabled(False)
+            return
+
+        # Overall status banner.
+        n_red    = len(report.reds)
+        n_yellow = len(report.yellows)
+        n_unack  = len(report.needs_ack)
+        n_green  = len(report.greens)
+        if report.can_run:
+            color = self.SEVERITY_COLOR["green"]
+            mark  = self.SEVERITY_DOT["green"]
+            self._summary_lbl.setText(
+                f"{mark}  Ready — {n_green} check(s) passed."
+            )
+        elif n_red:
+            color = self.SEVERITY_COLOR["red"]
+            mark  = self.SEVERITY_DOT["red"]
+            self._summary_lbl.setText(
+                f"{mark}  Blocked — {n_red} red, {n_unack} unacknowledged yellow."
+            )
+        else:
+            color = self.SEVERITY_COLOR["yellow"]
+            mark  = self.SEVERITY_DOT["yellow"]
+            self._summary_lbl.setText(
+                f"{mark}  Hold — {n_unack} yellow row(s) need Acknowledge before Run All."
+            )
+        self._summary_lbl.setStyleSheet(
+            f"color: {color}; font-size: 10pt; font-weight: bold;"
+        )
+
+        # Render each category.
+        for cat in report.categories():
+            self._rows_layout.addWidget(
+                self._build_category_widget(cat, CATEGORY_LABELS.get(cat, cat),
+                                            report, project),
+            )
+
+        # Run All gates on `report.can_run`. Patch All can always run since
+        # patching only touches assets already in the state index — its own
+        # internal dirty check decides what to do.
+        self._run_all_btn.setEnabled(report.can_run)
+        self._patch_all_btn.setEnabled(True)
+
+    def _build_category_widget(self, cat: str, label: str, report, project) -> QWidget:
+        from preflight import CATEGORY_LABELS  # noqa: F401
+
+        bucket = report.by_category(cat)
+        worst  = report.worst_severity(cat)
+        wrap = QFrame()
+        wrap.setObjectName("preflight_category")
+        wrap.setFrameShape(QFrame.NoFrame)
+        v = QVBoxLayout(wrap)
+        v.setContentsMargins(0, 4, 0, 4)
+        v.setSpacing(4)
+
+        # Header line — one-glance summary of the category.
+        header = QLabel(
+            f"<span style='color: {self.SEVERITY_COLOR[worst]};'>"
+            f"{self.SEVERITY_DOT[worst]}</span> "
+            f"<b>{label}</b>  "
+            f"<span style='color: #6c7086;'>· {len(bucket)} check(s)</span>"
+        )
+        header.setTextFormat(Qt.RichText)
+        v.addWidget(header)
+
+        # Per-item rows.
+        for item in bucket:
+            v.addWidget(self._build_item_row(item, report, project))
+        return wrap
+
+    def _build_item_row(self, item, report, project) -> QWidget:
+        wrap = QWidget()
+        h = QHBoxLayout(wrap)
+        h.setContentsMargins(20, 0, 0, 0)
+        h.setSpacing(8)
+
+        # Severity-aware text. Yellow that's already acknowledged renders
+        # in a softer tone so the user knows it's gated through.
+        acked = (item.ack_key is not None
+                 and report.acks.get(item.ack_key) == (item.ack_snapshot or "")
+                 and item.severity == "yellow")
+        color = self.SEVERITY_COLOR[item.severity if not acked else "green"]
+        dot   = self.SEVERITY_DOT  [item.severity if not acked else "green"]
+        text_parts = [item.title]
+        if item.detail:
+            text_parts.append(f"<span style='color: #6c7086;'>· {item.detail}</span>")
+        if acked:
+            text_parts.append("<span style='color: #a6e3a1;'>(acknowledged)</span>")
+        body = QLabel(
+            f"<span style='color: {color};'>{dot}</span> " + " ".join(text_parts)
+        )
+        body.setTextFormat(Qt.RichText)
+        body.setWordWrap(True)
+        if item.fix_hint:
+            body.setToolTip(item.fix_hint)
+        h.addWidget(body, 1)
+
+        # Per-yellow-row Acknowledge / Clear button. Reds get nothing —
+        # they must be fixed, not waved away.
+        if item.severity == "yellow" and item.ack_key:
+            if acked:
+                btn = QPushButton("Clear Ack")
+                btn.setObjectName("preflight_clear_ack")
+                btn.setCursor(Qt.PointingHandCursor)
+                btn.clicked.connect(
+                    lambda _=False, k=item.ack_key: self._on_clear_ack(k)
+                )
+            else:
+                btn = QPushButton("Acknowledge")
+                btn.setObjectName("preflight_ack")
+                btn.setCursor(Qt.PointingHandCursor)
+                btn.clicked.connect(
+                    lambda _=False, k=item.ack_key, s=(item.ack_snapshot or ""):
+                        self._on_ack(k, s)
+                )
+            btn.setMinimumWidth(0)
+            h.addWidget(btn)
+
+        return wrap
+
+    # -------------------------------------------------------------------------
+    # ACK HANDLERS
+    # -------------------------------------------------------------------------
+
+    def _on_ack(self, ack_key: str, snapshot: str) -> None:
+        pm = project_manager()
+        proj = pm.current()
+        if proj is None:
+            return
+        proj.set_preflight_ack(ack_key, snapshot)
+        pm.commit_metadata()
+        # Refresh so the row flips colour without waiting for the next
+        # project_changed event.
+        self.refresh_clicked.emit()
+
+    def _on_clear_ack(self, ack_key: str) -> None:
+        pm = project_manager()
+        proj = pm.current()
+        if proj is None:
+            return
+        proj.clear_preflight_ack(ack_key)
+        pm.commit_metadata()
+        self.refresh_clicked.emit()
+
+
 class DashboardTab(QWidget):
     """Pipeline status dashboard. Hosts the dep banner (rehomed from
     MainWindow), three pipeline-status rows in configuration-workflow order
@@ -1865,6 +2308,12 @@ class DashboardTab(QWidget):
 
     request_focus_stage   = Signal(str)
     request_process_stage = Signal(str)
+    # F-8 — Mission Command-level actions. MainWindow routes these to the
+    # PipelineOrchestrator (Run All) and to MaterialTab._start_patch
+    # (Patch All). Kept as signals so DashboardTab doesn't have to know
+    # the tab layout.
+    request_run_all       = Signal()
+    request_patch_all     = Signal()
 
     def __init__(self, dep_banner=None):
         super().__init__()
@@ -1898,6 +2347,13 @@ class DashboardTab(QWidget):
 
         if self._dep_banner is not None:
             root.addWidget(self._dep_banner)
+
+        # F-8 Pre-flight panel — gates Run All / Patch All.
+        self._preflight = _PreflightPanel()
+        self._preflight.refresh_clicked.connect(self._refresh_preflight)
+        self._preflight.run_all_clicked.connect(self._on_run_all)
+        self._preflight.patch_all_clicked.connect(self._on_patch_all)
+        root.addWidget(self._preflight)
 
         # Pipeline Status — one StageStatusCard per stage, workflow order.
         status_box, status_lay = _section_groupbox("Pipeline Status")
@@ -1934,6 +2390,35 @@ class DashboardTab(QWidget):
     def apply_project(self, project) -> None:
         for key in self._status_cards:
             self._refresh_status_card(key, project)
+        self._refresh_preflight()
+
+    def _refresh_preflight(self) -> None:
+        """Re-run the pre-flight checks against the current project and
+        apply the resulting report to the panel."""
+        from preflight import run_preflight
+        pm = project_manager()
+        proj = pm.current()
+        # Dependencies are surfaced by the F-1 banner. Mirror its state
+        # into the preflight check; absent banner means "assume present"
+        # so we don't double-red on a state we already surface elsewhere.
+        deps_present = True
+        if self._dep_banner is not None and hasattr(self._dep_banner, "missing"):
+            deps_present = not bool(getattr(self._dep_banner, "missing", []))
+        report = run_preflight(proj, deps_present=deps_present) if proj else None
+        self._preflight.apply_report(report, proj)
+
+    def _on_run_all(self) -> None:
+        self.request_run_all.emit()
+
+    def _on_patch_all(self) -> None:
+        self.request_patch_all.emit()
+
+    def showEvent(self, event) -> None:
+        """Tab activation re-runs preflight so opening the dashboard
+        sees the freshest project state (e.g. after the user edited
+        material settings on another tab)."""
+        super().showEvent(event)
+        self._refresh_preflight()
 
     def _refresh_status_card(self, stage_key: str, project) -> None:
         card = self._status_cards[stage_key]
@@ -2390,15 +2875,31 @@ class PrefabProcessorTab(QWidget):
         self._save_settings()
         self._process_btn.setEnabled(False)
         self._log_edit.clear()
-        project_manager().set_processing(self.STAGE_KEY, True)
+        pm = project_manager()
+        pm.set_processing(self.STAGE_KEY, True)
 
-        self._worker = WorkerThread(self._do_processing, source, output, resolved)
+        # F-9 — snapshot the material + mesh settings on the UI thread so
+        # the worker doesn't reach back into the singleton. Both are
+        # already in-process dicts; copy.deepcopy keeps the worker
+        # isolated from concurrent edits while it runs.
+        proj = pm.current()
+        material_settings = (copy.deepcopy(proj.stage_settings("material_processor"))
+                              if proj else None)
+        mesh_settings     = (copy.deepcopy(proj.stage_settings("mesh_processor"))
+                              if proj else None)
+
+        self._worker = WorkerThread(
+            self._do_processing, source, output, resolved,
+            material_settings, mesh_settings,
+        )
         self._worker.emitter.message.connect(self._log)
         self._worker.finished.connect(self._on_finished)
         self._worker.start()
 
     def _do_processing(self, source_path: str, output_path: str,
-                       prefab_files: list, log) -> str:
+                       prefab_files: list,
+                       material_settings: dict, mesh_settings: dict,
+                       log) -> str:
         from integrated_asset_processor import IntegratedAssetProcessor
 
         log("\n" + "=" * 60)
@@ -2411,6 +2912,8 @@ class PrefabProcessorTab(QWidget):
             Path(output_path),
             log_callback=log,
             convert_smoothness_to_roughness=cfg["convert_smoothness_to_roughness"],
+            material_settings=material_settings,
+            mesh_settings=mesh_settings,
         )
 
         log(f"\nProcessing {len(prefab_files)} selected Unity prefab(s)")
@@ -2453,6 +2956,20 @@ class PrefabProcessorTab(QWidget):
             self.STAGE_KEY, project_manager().current()
         )
         project_manager().update_outputs(self.STAGE_KEY, proc_outputs)
+
+        # F-9.I.4 — merge this run's state_index onto the existing one so
+        # assets the run didn't touch keep their prior fingerprints. The
+        # patch worker (I.5) consults the merged index when deciding what's
+        # dirty on the next run.
+        run_state = processor.state_index()
+        proj = project_manager().current()
+        if proj is not None:
+            existing = dict(proj.outputs.get("state_index") or {})
+            for bucket_name, bucket in run_state.items():
+                merged = dict(existing.get(bucket_name) or {})
+                merged.update(bucket)
+                existing[bucket_name] = merged
+            project_manager().update_outputs("state_index", existing)
 
         project_manager().update_status(self.STAGE_KEY, {
             "last_run":          run_ts,
@@ -3985,6 +4502,7 @@ class ShaderMappingsDialog(QDialog):
 
         cfg = project.stage_settings(self.STAGE_KEY)
         mappings = dict(cfg.get("shader_mappings", {}) or {})
+        profile_names = sorted((cfg.get("shader_profiles") or {}).keys())
 
         ap_meta = (project.outputs.get("asset_processor", {}) or {}).get(
             "material_metadata", {}) or {}
@@ -4013,7 +4531,7 @@ class ShaderMappingsDialog(QDialog):
         for sname in ordered:
             self._rows_layout.insertWidget(
                 self._rows_layout.count() - 1,
-                self._build_row(sname, mappings.get(sname, "")),
+                self._build_row(sname, mappings.get(sname, ""), profile_names),
             )
 
         self._summary.setText(
@@ -4021,8 +4539,9 @@ class ShaderMappingsDialog(QDialog):
             f"{len(unmapped)} unmapped"
         )
 
-    def _build_row(self, shader_name: str, current_mapping: str) -> QWidget:
-        has_mapping = bool(current_mapping)
+    def _build_row(self, shader_name: str, current_profile: str,
+                   profile_names: list) -> QWidget:
+        has_mapping = bool(current_profile)
         row = QWidget()
         lay = QHBoxLayout(row)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -4032,7 +4551,7 @@ class ShaderMappingsDialog(QDialog):
         label.setMinimumWidth(280)
         label.setToolTip(
             "Mapping present" if has_mapping else
-            "Unmapped — falls back to default materialtype"
+            "Unmapped — falls back to the default profile"
         )
         label.setStyleSheet(
             "color: #cdd6f4; font-size: 9pt;" if has_mapping else
@@ -4040,18 +4559,29 @@ class ShaderMappingsDialog(QDialog):
         )
         lay.addWidget(label, 1)
 
-        field = _PathField(
-            dialog_caption=f"Select materialtype for '{shader_name}'",
-            dialog_filter="Material type (*.materialtype);;All files (*.*)",
+        # Profile picker (F-9). Replaces the legacy materialtype-path field.
+        # The combo lists every profile in the project's shader_profiles
+        # library; F-9 ships exactly one ("Default — Anything to PBR"), F-10
+        # will add the authoring UI for additional profiles.
+        combo = QComboBox()
+        for name in profile_names:
+            combo.addItem(name)
+        # Preserve a value the user already had even if the profile no longer
+        # exists (rendered with a distinguishable prefix so the mismatch is
+        # visible). F-10's profile editor will surface a proper repair flow.
+        if current_profile and current_profile not in profile_names:
+            combo.addItem(f"(missing) {current_profile}")
+            combo.setCurrentText(f"(missing) {current_profile}")
+        elif current_profile:
+            combo.setCurrentText(current_profile)
+        elif profile_names:
+            combo.setCurrentIndex(-1)
+        combo.currentTextChanged.connect(
+            lambda val, s=shader_name: self._on_mapping_changed(
+                s, val if not val.startswith("(missing) ") else ""
+            )
         )
-        field.set_common(current_mapping)
-        field.committed.connect(
-            lambda val, s=shader_name: self._on_mapping_changed(s, val)
-        )
-        field.cleared.connect(
-            lambda s=shader_name: self._on_mapping_changed(s, "")
-        )
-        lay.addWidget(field, 2)
+        lay.addWidget(combo, 2)
         return row
 
     # -------------------------------------------------------------------------
@@ -4130,26 +4660,24 @@ class MaterialTab(QWidget):
         # ── Default Material Settings ───────────────────────────────────
         defaults_box, defaults_lay = _section_groupbox("Default Material Settings")
         info = QLabel(
-            "Fallback O3DE materialtype applied when a material's Unity "
-            "shader has no entry in the mappings below. Per-material "
-            "overrides further down win over both."
+            "Fallback shader profile applied when a Unity shader has no "
+            "explicit entry in the mappings list. Profiles bundle the "
+            "target O3DE materialtype with the property remap (texture "
+            "slots, scalar/colour properties). New profiles are authored "
+            "in the upcoming Profile Editor."
         )
         info.setStyleSheet("color: #6c7086; font-size: 9pt;")
         info.setWordWrap(True)
         defaults_lay.addWidget(info)
 
-        self._default_materialtype = _PathField(
-            dialog_caption="Select default .materialtype",
-            dialog_filter="Material type (*.materialtype);;All files (*.*)",
-        )
-        self._default_materialtype.committed.connect(self._on_default_materialtype_changed)
-        self._default_materialtype.cleared.connect(
-            lambda: self._on_default_materialtype_changed("StandardPBR.materialtype")
+        self._default_profile = QComboBox()
+        self._default_profile.currentTextChanged.connect(
+            self._on_default_profile_changed
         )
         defaults_form = QFormLayout()
         defaults_form.setSpacing(8)
         defaults_form.setContentsMargins(0, 4, 0, 4)
-        defaults_form.addRow("Default materialtype:", self._default_materialtype)
+        defaults_form.addRow("Default profile:", self._default_profile)
         defaults_lay.addLayout(defaults_form)
         root.addWidget(defaults_box)
 
@@ -4267,19 +4795,30 @@ class MaterialTab(QWidget):
         self._last_run_box.setVisible(False)
         root.addWidget(self._last_run_box)
 
-        # ── Disabled Process button — worker integration lands later ────
-        process_btn = QPushButton("Process (re-emit materials — coming)")
-        process_btn.setObjectName("primary")
-        process_btn.setEnabled(False)
-        process_btn.setToolTip(
-            "Material overrides are stored in the project file; the worker "
-            "that re-emits .material files with override values arrives in "
-            "a follow-up iteration of F-6."
+        # ── Patch button (F-9.I.5/I.6) ─────────────────────────────────
+        # Re-emits only the materials whose inputs (profile / mappings /
+        # overrides / source mtime) have drifted since the last run. The
+        # full prefab pass still lives on the Prefabs tab; this surface is
+        # the cheap iterative loop.
+        self._dirty_summary = QLabel("")
+        self._dirty_summary.setStyleSheet("color: #6c7086; font-size: 9pt;")
+        self._dirty_summary.setWordWrap(True)
+
+        self._patch_btn = QPushButton("Patch Dirty Materials")
+        self._patch_btn.setObjectName("primary")
+        self._patch_btn.setToolTip(
+            "Re-emit .material files for every material whose resolved "
+            "profile / override / source file has changed since the last "
+            "Prefab Processor run. Material rows marked ↻ point at outputs "
+            "missing on disk."
         )
+        self._patch_btn.clicked.connect(self._start_patch)
+
         action_row = QHBoxLayout()
         action_row.setSpacing(8)
+        action_row.addWidget(self._dirty_summary, 1)
         action_row.addStretch(1)
-        action_row.addWidget(process_btn)
+        action_row.addWidget(self._patch_btn)
         root.addLayout(action_row)
 
         outer.addWidget(_scroll_wrap(content))
@@ -4295,6 +4834,19 @@ class MaterialTab(QWidget):
         self._refresh_override_fields()
         self._refresh_last_run(project)
 
+    def showEvent(self, event) -> None:
+        """F-9.I.6b — refresh on tab activation so the externally-modified
+        detection (output mtime vs `last_emitted`) catches edits made in
+        O3DE while the user was on a different tab. The full
+        `apply_project` is intentionally re-run rather than just the
+        inventory: a user editing a .material in-engine often goes hand in
+        hand with editing a .materialtype the profile / default points
+        at, and the dependent UI rows should reflect both."""
+        super().showEvent(event)
+        proj = project_manager().current()
+        if proj is not None:
+            self.apply_project(proj)
+
     def _on_status_changed(self, stage_key: str) -> None:
         if stage_key not in ("asset_processor", self.STAGE_KEY):
             return
@@ -4305,29 +4857,47 @@ class MaterialTab(QWidget):
     def _refresh_defaults(self, project) -> None:
         self._suppress_field_signals = True
         try:
+            self._default_profile.clear()
             if project is None:
-                self._default_materialtype.set_disabled_blank()
+                self._default_profile.setEnabled(False)
                 return
+            self._default_profile.setEnabled(True)
             cfg = project.stage_settings(self.STAGE_KEY)
-            mt = (cfg.get("defaults", {}) or {}).get("target_materialtype",
-                                                     "StandardPBR.materialtype")
-            self._default_materialtype.set_common(mt or "")
+            profile_names = sorted((cfg.get("shader_profiles") or {}).keys())
+            for name in profile_names:
+                self._default_profile.addItem(name)
+            current = (cfg.get("defaults", {}) or {}).get("profile", "")
+            if current and current not in profile_names:
+                # Stale default — keep the user's choice visible but flagged so
+                # F-10's editor can repair it.
+                self._default_profile.addItem(f"(missing) {current}")
+                self._default_profile.setCurrentText(f"(missing) {current}")
+            elif current:
+                self._default_profile.setCurrentText(current)
+            elif profile_names:
+                self._default_profile.setCurrentIndex(0)
         finally:
             self._suppress_field_signals = False
 
-    def _on_default_materialtype_changed(self, value: str) -> None:
+    def _on_default_profile_changed(self, value: str) -> None:
         if self._suppress_field_signals:
             return
         pm = project_manager()
         proj = pm.current()
         if proj is None:
             return
+        # Strip the "(missing) " prefix the refresh adds when the saved
+        # default points at a profile no longer in the library.
+        clean = value[len("(missing) "):] if value.startswith("(missing) ") else value
+        if not clean:
+            return
         cfg = dict(proj.stage_settings(self.STAGE_KEY))
         defaults = dict(cfg.get("defaults", {}) or {})
-        defaults["target_materialtype"] = value or "StandardPBR.materialtype"
+        defaults["profile"] = clean
         cfg["defaults"] = defaults
         pm.update_stage(self.STAGE_KEY, cfg)
-        # Refresh shader-mapping rows (unmapped fall back to default text).
+        # Refresh shader-mapping summary — unmapped resolution chain ends at
+        # this default, so changing it can flip the section status.
         self._refresh_shader_mappings(proj)
 
     # ── Shader mappings ─────────────────────────────────────────────────
@@ -4423,6 +4993,116 @@ class MaterialTab(QWidget):
         self._refresh_shader_mappings(proj)
         self._refresh_inventory(proj)
 
+    # -------------------------------------------------------------------------
+    # F-9.I.6 — Patch dirty materials
+    # -------------------------------------------------------------------------
+
+    def _start_patch(self) -> None:
+        """Spawn a WorkerThread that runs IntegratedAssetProcessor.patch().
+        Snapshots project state on the UI thread so the worker is isolated
+        from concurrent edits."""
+        pm = project_manager()
+        proj = pm.current()
+        if proj is None:
+            QMessageBox.information(self, "Patch Materials",
+                                     "Open a project first.")
+            return
+        ap_outputs = proj.outputs.get("asset_processor") or {}
+        source_root = (ap_outputs.get("last_run") and
+                       proj.stage_settings("asset_processor").get("source_path")) \
+                      or str(proj.scope_root or "")
+        output_root = proj.stage_settings("asset_processor").get("output_path") or ""
+        if not source_root or not output_root:
+            QMessageBox.warning(
+                self, "Patch Materials",
+                "Patch needs the Prefab Processor's source + output folders "
+                "(set on the Prefabs tab). Run the Prefab Processor at least "
+                "once before patching.",
+            )
+            return
+
+        material_settings = copy.deepcopy(proj.stage_settings("material_processor"))
+        state_index       = copy.deepcopy(proj.outputs.get("state_index") or {})
+
+        self._patch_btn.setEnabled(False)
+        self._patch_worker = WorkerThread(
+            self._do_patch, source_root, output_root,
+            material_settings, state_index,
+        )
+        self._patch_worker.emitter.message.connect(self._on_patch_log)
+        self._patch_worker.finished.connect(self._on_patch_finished)
+        self._patch_worker.start()
+
+    def _do_patch(self, source_root: str, output_root: str,
+                   material_settings: dict, state_index: dict, log) -> str:
+        from integrated_asset_processor import IntegratedAssetProcessor
+        log("=" * 60)
+        log("PATCH — re-emit dirty materials")
+        log("=" * 60)
+        cfg = get_config()
+        proc = IntegratedAssetProcessor(
+            Path(source_root), Path(output_root),
+            log_callback=log,
+            convert_smoothness_to_roughness=cfg["convert_smoothness_to_roughness"],
+            material_settings=material_settings,
+            state_index=state_index,
+        )
+        # Asset hint root matches the Prefab Processor's convention so the
+        # re-emitted .material's asset_hint string lines up with the existing
+        # prefab references.
+        proj_name = (project_manager().current().name
+                     if project_manager().current() else "project")
+        proc.asset_hint_root = f"assets/{proj_name.lower().replace(' ', '_')}"
+        summary = proc.patch()
+        # Return the resulting state-index delta encoded as a JSON string so
+        # _on_patch_finished can merge it back on the UI thread.
+        run_state = proc.state_index()
+        return json.dumps({
+            "dirty":    summary["materials_dirty"],
+            "emitted":  summary["materials_emitted"],
+            "state":    run_state,
+        })
+
+    def _on_patch_log(self, msg: str) -> None:
+        # No dedicated log widget on this tab; surface via the project
+        # status bus so the Prefab tab's log shows the patch trail.
+        print(msg)
+
+    def _on_patch_finished(self, success: bool, payload: str) -> None:
+        self._patch_btn.setEnabled(True)
+        if not success:
+            QMessageBox.critical(self, "Patch Materials",
+                                  f"Patch failed:\n{payload}")
+            return
+        try:
+            info = json.loads(payload)
+        except Exception:
+            info = {"dirty": [], "emitted": [], "state": {}}
+        dirty   = info.get("dirty")   or []
+        emitted = info.get("emitted") or []
+        run_state = info.get("state") or {}
+
+        # Merge the worker's state_index back onto the project file.
+        pm = project_manager()
+        proj = pm.current()
+        if proj is not None and run_state:
+            existing = dict(proj.outputs.get("state_index") or {})
+            for bucket_name, bucket in run_state.items():
+                merged = dict(existing.get(bucket_name) or {})
+                merged.update(bucket)
+                existing[bucket_name] = merged
+            pm.update_outputs("state_index", existing)
+
+        msg = (f"{len(dirty)} dirty · {len(emitted)} re-emitted"
+               if dirty else "No dirty materials found.")
+        if dirty:
+            QMessageBox.information(self, "Patch Materials",
+                                     f"{msg}\n\n" + "\n".join(f"  • {g}" for g in dirty[:20]))
+        else:
+            QMessageBox.information(self, "Patch Materials", msg)
+        # Refresh the inventory so any ↻ markers clear.
+        self.apply_project(pm.current())
+
     # ── Inventory ───────────────────────────────────────────────────────
 
     def _refresh_inventory(self, project) -> None:
@@ -4445,15 +5125,30 @@ class MaterialTab(QWidget):
         mp = project.stage_settings(self.STAGE_KEY)
         overrides = mp.get("overrides", {}) or {}
         mappings  = mp.get("shader_mappings", {}) or {}
+        # F-9.I.6 — per-material state-index entry (None when no run has
+        # recorded the material yet). The cheap dirty check is: was the
+        # output ever emitted, and does it still exist on disk?
+        state_index_root = project.outputs.get("state_index") or {}
+        state_materials  = state_index_root.get("materials") or {}
+        # F-9.I.6b — externally-modified set. An entry lands in here when
+        # one of its `output_files[i].mtime` is newer than the saved
+        # `last_emitted` timestamp — i.e., someone opened the file in O3DE
+        # and edited it between the converter's last emission and this
+        # refresh. Re-emitting will overwrite those edits.
+        ext_mod = detect_externally_modified(state_index_root)
+        externally_modified = ext_mod.get("materials") or set()
 
         if not meta:
             self._inv_summary.setText(
                 "No materials extracted yet. Mark prefabs and run the Prefab Processor."
             )
+            self._dirty_summary.setText("")
             return
 
         unmapped_count  = 0
         override_count  = 0
+        dirty_count     = 0
+        ext_mod_count   = 0
         for guid, rec in sorted(meta.items(),
                                 key=lambda kv: str(kv[1].get("source_stem")
                                                    or kv[1].get("asset_hint")
@@ -4462,16 +5157,34 @@ class MaterialTab(QWidget):
             shader      = rec.get("shader_name", "") or "(unknown)"
             has_override = guid in overrides
             has_mapping  = shader in mappings if shader != "(unknown)" else False
+
+            state_entry  = state_materials.get(guid)
+            if state_entry is None:
+                is_dirty = True
+            else:
+                outputs = state_entry.get("output_files") or []
+                is_dirty = (not outputs) or any(not Path(p).exists() for p in outputs)
+
+            is_externally_modified = guid in externally_modified
+
             if not has_mapping:
                 unmapped_count += 1
             if has_override:
                 override_count += 1
+            if is_dirty:
+                dirty_count += 1
+            if is_externally_modified:
+                ext_mod_count += 1
 
             prefix = ""
             if has_override:
                 prefix += "★ "
             if not has_mapping:
                 prefix += "⚠ "
+            if is_dirty:
+                prefix += "↻ "
+            if is_externally_modified:
+                prefix += "✎ "
             if not prefix:
                 prefix = "   "
 
@@ -4484,9 +5197,25 @@ class MaterialTab(QWidget):
             if has_override:
                 tip_lines.append("Override applied")
             if not has_mapping:
-                tip_lines.append("Shader unmapped — falls back to default")
+                tip_lines.append("Shader has no explicit profile — uses the default profile")
+            if is_dirty:
+                tip_lines.append("Dirty — output is missing or stale; run Patch")
+            if is_externally_modified:
+                tip_lines.append(
+                    "✎ Output edited in-engine since last emit — "
+                    "re-patching will OVERWRITE those changes."
+                )
             item.setToolTip("\n".join(tip_lines))
-            if has_override:
+            # Foreground colour priority (most → least urgent): external-mod
+            # (orange — destructive risk) > override (cyan, bold) > unmapped
+            # (yellow). Dirty is signalled by the ↻ glyph alone since the
+            # row's primary attention cue is the marker prefix.
+            if is_externally_modified:
+                item.setForeground(QColor("#fab387"))
+                f = item.font()
+                f.setBold(True)
+                item.setFont(f)
+            elif has_override:
                 f = item.font()
                 f.setBold(True)
                 item.setFont(f)
@@ -4495,10 +5224,37 @@ class MaterialTab(QWidget):
                 item.setForeground(Qt.darkYellow)
             self._inv_list.addItem(item)
 
-        self._inv_summary.setText(
-            f"{len(meta)} material(s) · {override_count} with override(s) · "
-            f"{unmapped_count} with unmapped shader(s)"
-        )
+        summary_parts = [
+            f"{len(meta)} material(s)",
+            f"{override_count} with override(s)",
+            f"{unmapped_count} with unmapped shader(s)",
+            f"{dirty_count} dirty",
+        ]
+        if ext_mod_count:
+            summary_parts.append(f"{ext_mod_count} edited externally")
+        self._inv_summary.setText(" · ".join(summary_parts))
+        # Dirty summary band — external modifications take precedence
+        # because they signal destructive risk, not just stale outputs.
+        if ext_mod_count:
+            self._dirty_summary.setText(
+                f"✎ {ext_mod_count} material(s) modified in-engine since "
+                f"last emit — re-patching will overwrite their changes."
+            )
+            self._dirty_summary.setStyleSheet(
+                "color: #fab387; font-size: 9pt; font-weight: bold;"
+            )
+        elif dirty_count:
+            self._dirty_summary.setText(
+                f"↻ {dirty_count} material(s) need re-emission"
+            )
+            self._dirty_summary.setStyleSheet(
+                "color: #89dceb; font-size: 9pt; font-weight: bold;"
+            )
+        else:
+            self._dirty_summary.setText("All materials up to date.")
+            self._dirty_summary.setStyleSheet(
+                "color: #a6e3a1; font-size: 9pt;"
+            )
 
     def _selected_material_guids(self) -> list:
         guids: list = []
@@ -4522,20 +5278,18 @@ class MaterialTab(QWidget):
             return
 
         cfg = proj.stage_settings(self.STAGE_KEY)
-        defaults  = cfg.get("defaults",  {}) or {}
         overrides = cfg.get("overrides", {}) or {}
-        mappings  = cfg.get("shader_mappings", {}) or {}
-        ap_meta   = (proj.outputs.get("asset_processor", {}) or {}).get(
-            "material_metadata", {}) or {}
 
+        # Under the F-9 profile model the override section's
+        # "Target materialtype" is the RAW escape hatch — it writes
+        # through to override.materialtype directly, bypassing the
+        # profile's target_materialtype. The field displays the raw
+        # value (or empty / "..." for mixed) so the user can see exactly
+        # what they're overriding without it being confused with the
+        # profile-driven default.
         def effective_materialtype(g):
             entry = overrides.get(g, {}) or {}
-            if entry.get("materialtype"):
-                return entry["materialtype"]
-            shader = (ap_meta.get(g, {}) or {}).get("shader_name", "") or ""
-            if shader and shader in mappings:
-                return mappings[shader]
-            return defaults.get("target_materialtype", "StandardPBR.materialtype")
+            return entry.get("materialtype", "") or ""
 
         def effective_texture(g, slot):
             entry = (overrides.get(g, {}) or {}).get("textures", {}) or {}
@@ -5389,8 +6143,19 @@ class MainWindow(QMainWindow):
         }
         dashboard_tab.request_focus_stage.connect(self._focus_stage)
         dashboard_tab.request_process_stage.connect(self._process_stage)
+        # F-8 — Mission Command-level dispatch.
+        dashboard_tab.request_run_all.connect(self._on_run_all)
+        dashboard_tab.request_patch_all.connect(self._on_patch_all)
         # Keep a reference so workers can flip the dashboard's writing flag.
         self._dashboard_tab = dashboard_tab
+
+        # F-8 — Pipeline orchestrator instance lives on MainWindow so it
+        # outlives any single Run All session.
+        self._material_tab_index = material_idx
+        self._orchestrator = PipelineOrchestrator(self)
+        self._orchestrator.log.connect(self._log_to_dashboard)
+        self._orchestrator.stage_started.connect(self._on_stage_started_in_run)
+        self._orchestrator.run_finished.connect(self._on_run_all_finished)
 
         # Corner button: Config, pinned to the top-right of the tab bar.
         self._config_btn = QPushButton("Config")
@@ -5449,6 +6214,67 @@ class MainWindow(QMainWindow):
             tab._start_processing()
         elif stage_key == "terrain_processor":
             tab._start_generation()
+
+    # -------------------------------------------------------------------------
+    # F-8 — Mission Command actions
+    # -------------------------------------------------------------------------
+
+    def _log_to_dashboard(self, msg: str) -> None:
+        """Append a line to the Dashboard's activity log. Robust to the
+        log widget not yet being constructed (early signal during init)."""
+        log = getattr(getattr(self, "_dashboard_tab", None),
+                       "_activity_log", None)
+        if log is not None:
+            log.append(msg)
+
+    def _on_run_all(self) -> None:
+        """Mission Command Run All clicked. The Pre-flight panel has
+        already gated the button on `report.can_run`; this is just the
+        dispatch."""
+        proj = project_manager().current()
+        if proj is None:
+            QMessageBox.warning(self, "Run All", "Open a project first.")
+            return
+        if self._orchestrator.is_running():
+            QMessageBox.information(self, "Run All",
+                                     "A Run All pass is already in progress.")
+            return
+        self._log_to_dashboard("=" * 60)
+        self._log_to_dashboard("RUN ALL — starting full pipeline pass")
+        self._log_to_dashboard("=" * 60)
+        self._orchestrator.run_all(proj, self._process_stage)
+
+    def _on_stage_started_in_run(self, stage_key: str) -> None:
+        """Focus the tab so the user sees the per-stage worker log
+        streaming as the orchestrator walks the queue."""
+        self._focus_stage(stage_key)
+
+    def _on_run_all_finished(self, ok: bool, summary: str) -> None:
+        self._log_to_dashboard(
+            f"[orchestrator] Run All finished: "
+            f"{'✓ ' if ok else '✗ '}{summary}"
+        )
+        # Bring focus back to the dashboard so the user sees the summary.
+        self._focus_stage("asset_processor")  # no-op if already there
+        if hasattr(self, "_dashboard_tab"):
+            self._tabs.setCurrentWidget(self._dashboard_tab)
+
+    def _on_patch_all(self) -> None:
+        """Mission Command Patch All clicked. Delegates to the
+        MaterialTab's existing F-9 patch path (the only stage with a
+        patch worker in F-9 scope). Future iterations will extend to
+        mesh + prefab patches when those tabs gain matching workers."""
+        proj = project_manager().current()
+        if proj is None:
+            QMessageBox.warning(self, "Patch All", "Open a project first.")
+            return
+        material_tab = self._tabs.widget(self._material_tab_index)
+        if material_tab is None or not hasattr(material_tab, "_start_patch"):
+            QMessageBox.warning(self, "Patch All",
+                                 "Material tab is unavailable.")
+            return
+        self._log_to_dashboard("PATCH ALL — re-emit dirty materials")
+        material_tab._start_patch()
 
     def _update_title(self, project) -> None:
         if project is None:

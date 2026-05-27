@@ -10,6 +10,7 @@ Add or remove processors by dropping files into that directory.
 """
 
 import yaml
+import hashlib
 import json
 import os
 import re
@@ -246,7 +247,14 @@ class AssetDatabase:
     def __init__(self, unity_assets_root: Path):
         self.unity_assets_root = unity_assets_root
         self.guid_to_path: Dict[str, Path] = {}
-        self.material_cache: Dict[str, Dict] = {}
+        # Raw parsed YAML body keyed by str(path). Separated from the
+        # profile-applied extraction cache so a re-parse under a different
+        # profile reuses the expensive YAML parse.
+        self.material_yaml_cache: Dict[str, Dict] = {}
+        # Profile-applied extraction. Key: (str(path), profile_id). The
+        # legacy "no profile" call sites (e.g. terrain_material_processor)
+        # use profile_id=0; F-9 worker calls pass profile_id=id(profile_dict).
+        self.material_cache: Dict[tuple, Dict] = {}
         self.texture_extensions = {'.png', '.jpg', '.jpeg', '.tga', '.tif', '.tiff', '.bmp', '.psd', '.exr', '.hdr'}
         self.mesh_extensions = {'.fbx', '.obj', '.dae', '.blend', '.3ds', '.max', '.ma', '.mb'}
         
@@ -288,115 +296,139 @@ class AssetDatabase:
             return None
         return None
     
-    def parse_material(self, material_path: Path) -> Optional[Dict]:
-        """Parse Unity material file"""
-        if str(material_path) in self.material_cache:
-            return self.material_cache[str(material_path)]
-        
-        if not material_path.exists() or material_path.suffix != '.mat':
-            return None
-        
-        try:
-            with open(material_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            
-            doc_pattern = r'---\s+!u!\d+\s+&(\d+)\n(.*?)(?=---\s+!u!|\Z)'
-            matches = re.findall(doc_pattern, content, re.DOTALL)
-            
-            for anchor, doc_content in matches:
-                clean_content = re.sub(r'!u!\d+', '', doc_content)
-                
-                try:
-                    doc = yaml.safe_load(clean_content)
-                    if doc and 'Material' in doc:
-                        material_data = self._extract_material_data(doc['Material'])
-                        self.material_cache[str(material_path)] = material_data
-                        return material_data
-                except yaml.YAMLError:
-                    continue
-            
-            return None
-        
-        except Exception as e:
-            print(f"Error parsing material {material_path}: {e}")
-            return None
-    
-    def _extract_material_data(self, material_data: Dict) -> Dict:
-        """Extract material properties and texture references"""
-        TEXTURE_MAP = {
-            # baseColor — Unity Standard, URP, HDRP, and common custom-shader aliases
-            '_MainTex':          'baseColor',
-            '_BaseMap':          'baseColor',
-            '_BaseColorMap':     'baseColor',
-            '_Albedo':           'baseColor',
-            '_AlbedoMap':        'baseColor',
-            '_AlbedoTex':        'baseColor',
-            '_Diffuse':          'baseColor',
-            '_DiffuseMap':       'baseColor',
-            '_DiffuseTex':       'baseColor',
-            '_ColorMap':         'baseColor',
-            # normal
-            '_BumpMap':          'normal',
-            '_NormalMap':        'normal',
-            '_NormalTex':        'normal',
-            # metallic — Standard packs gloss in alpha, treated below
-            '_MetallicGlossMap': 'metallic',
-            '_MetallicMap':      'metallic',
-            '_MetallicTex':      'metallic',
-            '_Metallic_Map':     'metallic',
-            # specular workflow
-            '_SpecGlossMap':     'specular',
-            '_SpecularMap':      'specular',
-            # occlusion / AO
-            '_OcclusionMap':     'occlusion.specular',  # O3DE uses occlusion.specularTextureMap
-            '_AOMap':            'occlusion.specular',
-            '_AmbientOcclusion': 'occlusion.specular',
-            '_AmbientOcclusionMap': 'occlusion.specular',
-            '_AO':               'occlusion.specular',  # MK4 / Alien Fantasy Forest foliage
-            # MK4 / Alien Fantasy Forest rock shader uses prefixed names for
-            # the primary surface (cover variants ignored — see IGNORE_UNMAPPED).
-            '_RockAlbedo':       'baseColor',
-            '_RockNormal':       'normal',
-            '_RockSpecular':     'specular',
-            # emissive
-            '_EmissionMap':      'emissive',
-            '_EmissionTex':      'emissive',
-            '_EmissiveMap':      'emissive',
-            '_Emissive':         'emissive',
-            # height / parallax
-            '_HeightMap':        'height',
-            '_ParallaxMap':      'height',
-            '_DisplacementMap':  'height',
-        }
+    def parse_material(self, material_path: Path,
+                       profile: Optional[Dict] = None) -> Optional[Dict]:
+        """Parse Unity material file and run the Unity → O3DE remap.
 
-        # Texture property names that are KNOWN to exist but intentionally not
-        # mapped — they don't have a clean 1:1 O3DE equivalent and silently
-        # mapping them would inject the wrong data. Listed here so the unmapped-
-        # property warning below doesn't yell about them on every material.
-        IGNORE_UNMAPPED = {
-            '_DetailAlbedoMap', '_DetailMask', '_DetailNormalMap',
-            '_LightTextureB0', '_VectorNoise', '_texcoord',
-            # _Composite is channel-packed and shader-specific (metallic/AO/rough
-            # in different channels per shader); needs a per-shader rule.
-            '_Composite', '_CompositeMap', '_MOHS', '_MaskMap',
-            # MK4 / Alien Fantasy Forest detail + cover layers — drop silently
-            # to avoid double-baking. The primary albedo / normal carries the
-            # surface look; the cover blend isn't reconstructible in O3DE
-            # StandardPBR without a second material layer.
-            '_Detail', '_AODetail',
-            '_CoverAlbedo', '_CoverNormal', '_CoverSpecular',
-        }
-        
-        # NOTE: _Metallic, _Smoothness, _Glossiness, _GlossMapScale are handled
-        # in the dedicated metallic/roughness post-pass below — O3DE's factor
-        # vs lowerBound/upperBound semantics depend on whether a texture is bound.
-        PROPERTY_MAP = {
-            '_Color': 'baseColor.color',
-            '_BaseColor': 'baseColor.color',
-            '_BumpScale': 'normal.factor',
-            '_OcclusionStrength': 'occlusion.specularFactor',  # O3DE uses occlusion.specularFactor
-            '_EmissionColor': 'emissive.color',
-        }
+        ``profile`` is an F-9 shader profile dict (see
+        ``project_manager.DEFAULT_SHADER_PROFILE``). When ``None``, falls back
+        to the legacy hard-coded TEXTURE_MAP / PROPERTY_MAP / IGNORE_UNMAPPED
+        + ``metallic_gloss_smoothness_to_roughness=True`` behaviour so
+        existing callers (terrain_material_processor, tests) keep working.
+        """
+        profile_id = id(profile) if profile is not None else 0
+        cache_key  = (str(material_path), profile_id)
+        if cache_key in self.material_cache:
+            return self.material_cache[cache_key]
+
+        raw_material = self.material_yaml_cache.get(str(material_path))
+        if raw_material is None:
+            if not material_path.exists() or material_path.suffix != '.mat':
+                return None
+            try:
+                with open(material_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                doc_pattern = r'---\s+!u!\d+\s+&(\d+)\n(.*?)(?=---\s+!u!|\Z)'
+                matches = re.findall(doc_pattern, content, re.DOTALL)
+                for _anchor, doc_content in matches:
+                    clean_content = re.sub(r'!u!\d+', '', doc_content)
+                    try:
+                        doc = yaml.safe_load(clean_content)
+                    except yaml.YAMLError:
+                        continue
+                    if doc and 'Material' in doc:
+                        raw_material = doc['Material']
+                        self.material_yaml_cache[str(material_path)] = raw_material
+                        break
+            except Exception as e:
+                print(f"Error parsing material {material_path}: {e}")
+                return None
+
+        if raw_material is None:
+            return None
+
+        extracted = self._extract_material_data(raw_material, profile=profile)
+        self.material_cache[cache_key] = extracted
+        return extracted
+    
+    def _extract_material_data(self, material_data: Dict,
+                                profile: Optional[Dict] = None) -> Dict:
+        """Extract material properties and texture references.
+
+        When ``profile`` is provided, the texture remap, property remap,
+        ignore list, and the metallic-gloss → roughness special rule come
+        from the profile data (see ``project_manager.DEFAULT_SHADER_PROFILE``).
+        When ``profile`` is ``None``, fall back to the legacy hard-coded
+        dicts so callers that don't know about profiles (e.g.
+        ``terrain_material_processor``) keep working.
+
+        Note: the legacy fallback dicts mirror the
+        ``Default — Anything to PBR`` profile byte-for-byte. They live here
+        AS WELL AS in ``project_manager`` so a tool import that doesn't pull
+        ``project_manager`` (e.g. a standalone CLI) can still run.
+        """
+        if profile is not None:
+            # Profile-driven mode (F-9). Flatten the {slot, transform}
+            # entries: F-9 only consumes the slot field — transforms beyond
+            # "passthrough" land in F-10 with the editor.
+            TEXTURE_MAP = {
+                unity_prop: entry["slot"]
+                for unity_prop, entry in (profile.get("texture_map") or {}).items()
+                if isinstance(entry, dict) and entry.get("slot")
+            }
+            IGNORE_UNMAPPED = set(profile.get("ignore_unmapped") or [])
+            PROPERTY_MAP = {
+                unity_prop: entry["target"]
+                for unity_prop, entry in (profile.get("property_map") or {}).items()
+                if isinstance(entry, dict) and entry.get("target")
+            }
+            special_rules        = profile.get("special_rules") or {}
+            smoothness_to_rough  = bool(special_rules.get(
+                "metallic_gloss_smoothness_to_roughness", True))
+        else:
+            # Legacy hard-coded behaviour. Kept verbatim so the no-profile
+            # call path is byte-identical to pre-F-9.
+            TEXTURE_MAP = {
+                '_MainTex':          'baseColor',
+                '_BaseMap':          'baseColor',
+                '_BaseColorMap':     'baseColor',
+                '_Albedo':           'baseColor',
+                '_AlbedoMap':        'baseColor',
+                '_AlbedoTex':        'baseColor',
+                '_Diffuse':          'baseColor',
+                '_DiffuseMap':       'baseColor',
+                '_DiffuseTex':       'baseColor',
+                '_ColorMap':         'baseColor',
+                '_BumpMap':          'normal',
+                '_NormalMap':        'normal',
+                '_NormalTex':        'normal',
+                '_MetallicGlossMap': 'metallic',
+                '_MetallicMap':      'metallic',
+                '_MetallicTex':      'metallic',
+                '_Metallic_Map':     'metallic',
+                '_SpecGlossMap':     'specular',
+                '_SpecularMap':      'specular',
+                '_OcclusionMap':         'occlusion.specular',
+                '_AOMap':                'occlusion.specular',
+                '_AmbientOcclusion':     'occlusion.specular',
+                '_AmbientOcclusionMap':  'occlusion.specular',
+                '_AO':                   'occlusion.specular',
+                '_RockAlbedo':       'baseColor',
+                '_RockNormal':       'normal',
+                '_RockSpecular':     'specular',
+                '_EmissionMap':      'emissive',
+                '_EmissionTex':      'emissive',
+                '_EmissiveMap':      'emissive',
+                '_Emissive':         'emissive',
+                '_HeightMap':        'height',
+                '_ParallaxMap':      'height',
+                '_DisplacementMap':  'height',
+            }
+            IGNORE_UNMAPPED = {
+                '_DetailAlbedoMap', '_DetailMask', '_DetailNormalMap',
+                '_LightTextureB0', '_VectorNoise', '_texcoord',
+                '_Composite', '_CompositeMap', '_MOHS', '_MaskMap',
+                '_Detail', '_AODetail',
+                '_CoverAlbedo', '_CoverNormal', '_CoverSpecular',
+            }
+            PROPERTY_MAP = {
+                '_Color':             'baseColor.color',
+                '_BaseColor':         'baseColor.color',
+                '_BumpScale':         'normal.factor',
+                '_OcclusionStrength': 'occlusion.specularFactor',
+                '_EmissionColor':     'emissive.color',
+            }
+            smoothness_to_rough = True
         
         # Unity materials store m_Shader as a reference, not a name. Record
         # the guid + fileID so _process_material can resolve the friendly
@@ -438,9 +470,10 @@ class AssetDatabase:
                     if o3de_prop not in extracted['textures']:
                         extracted['textures'][o3de_prop] = guid
 
-                    # Unity's _MetallicGlossMap contains metallic in RGB and smoothness in Alpha
-                    # O3DE needs the same texture for both metallic and roughness
-                    if prop_name == '_MetallicGlossMap':
+                    # Unity's _MetallicGlossMap contains metallic in RGB and smoothness in Alpha.
+                    # O3DE needs the same texture for both metallic and roughness, but only
+                    # when the profile's smoothness_to_roughness rule is enabled.
+                    if prop_name == '_MetallicGlossMap' and smoothness_to_rough:
                         if 'roughness' not in extracted['textures']:
                             extracted['textures']['roughness'] = guid
                         extracted['metallic_gloss_source_guids'].add(guid)
@@ -525,7 +558,11 @@ class AssetDatabase:
             extracted['properties']['metallic.factor'] = raw_metallic
 
         # Roughness: pick factor vs bounds based on whether a texture is bound.
-        if has_roughness_tex:
+        # The inversion below assumes Unity stored smoothness — profiles whose
+        # source shader already speaks roughness can flip
+        # `metallic_gloss_smoothness_to_roughness` off so the value passes
+        # through untouched.
+        if has_roughness_tex and smoothness_to_rough:
             # Standard's _GlossMapScale takes precedence over _Smoothness/_Glossiness
             # when a gloss map is present (URP collapses both into _Smoothness).
             multiplier = (raw_smoothness_mult
@@ -535,9 +572,14 @@ class AssetDatabase:
                 lower = max(0.0, min(1.0, 1.0 - float(multiplier)))
                 extracted['properties']['roughness.lowerBound'] = lower
                 extracted['properties']['roughness.upperBound'] = 1.0
-        elif raw_smoothness is not None:
+        elif raw_smoothness is not None and smoothness_to_rough:
             extracted['properties']['roughness.factor'] = max(
                 0.0, min(1.0, 1.0 - raw_smoothness)
+            )
+        elif raw_smoothness is not None and not smoothness_to_rough:
+            # Profile says the source is already roughness, not smoothness.
+            extracted['properties']['roughness.factor'] = max(
+                0.0, min(1.0, raw_smoothness)
             )
 
         # ---------------------------------------------------------------
@@ -757,9 +799,74 @@ def build_fbx_node_paths(mesh_entities: list, all_game_objects: dict,
     return result
 
 
+# Quaternion for 90° rotation around X axis (Y-up → Z-up correction).
+# Module-level so the F-9 mesh-settings composition path can read it.
+Y_UP_ROTATION = [0.7071067690849304, 0.0, 0.0, 0.7071067094802856]
+
+
+def _utc_now_iso() -> str:
+    """ISO-8601 UTC timestamp. Mirrors `project_manager._utc_now_iso` so
+    the worker doesn't pull project_manager just for a date string."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _euler_deg_to_quat(deg_xyz) -> list:
+    """Convert Euler XYZ degrees to a quaternion [x, y, z, w] using the
+    intrinsic ZYX rotation convention (same as Unity's TRS Quaternion.Euler).
+    Returns the identity for an all-zero input."""
+    rx = math.radians(float(deg_xyz[0] or 0.0))
+    ry = math.radians(float(deg_xyz[1] or 0.0))
+    rz = math.radians(float(deg_xyz[2] or 0.0))
+    cr, cp, cy = math.cos(rx * 0.5), math.cos(ry * 0.5), math.cos(rz * 0.5)
+    sr, sp, sy = math.sin(rx * 0.5), math.sin(ry * 0.5), math.sin(rz * 0.5)
+    return [
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+        cr * cp * cy + sr * sp * sy,
+    ]
+
+
+def _quat_mul(q1, q2) -> list:
+    """Hamilton-product quaternion multiplication: result = q1 ⊗ q2."""
+    x1, y1, z1, w1 = q1
+    x2, y2, z2, w2 = q2
+    return [
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+    ]
+
+
+def _resolve_mesh_settings(mesh_settings: Optional[Dict],
+                            mesh_guid: Optional[str]) -> dict:
+    """F-9 mesh settings chain — `overrides[mesh_guid]` (partial) merged on
+    top of `defaults`. Returns a fully-populated dict carrying the three
+    knobs the assetinfo writer cares about. When no settings supplied,
+    returns the conservative defaults (zero position, no rotation) so the
+    legacy call path keeps writing the same assetinfo content."""
+    defaults = {
+        "zero_position":    True,
+        "default_position": [0.0, 0.0, 0.0],
+        "default_rotation": [0.0, 0.0, 0.0],
+    }
+    if not mesh_settings:
+        return defaults
+    base = dict(defaults)
+    base.update(mesh_settings.get("defaults") or {})
+    override = ((mesh_settings.get("overrides") or {}).get(mesh_guid)
+                if mesh_guid else None)
+    if isinstance(override, dict):
+        base.update(override)
+    return base
+
+
 def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
                          entity_node_map: dict, log=print,
-                         collider_entity_node_map: dict = None) -> None:
+                         collider_entity_node_map: dict = None,
+                         mesh_settings: Optional[Dict] = None,
+                         mesh_guid: Optional[str] = None) -> None:
     """Write an O3DE .assetinfo with one named MeshGroup per mesh entity.
 
     Group name format: "{fbx_stem}-{entity_name}"  e.g. "Closet_A-Glass_L"
@@ -770,6 +877,15 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
     MaterialRule, CoordinateSystemRule (useAdvancedData=true), and LodRule.
     Y-up FBX files (Maya-style, up_axis==1) get a 90° pitch rotation baked into
     the CoordinateSystemRule so the mesh imports upright without a transform workaround.
+
+    F-9 mesh settings (defaults + overrides) layer on top of the Y-up
+    correction. `default_rotation` is XYZ Euler degrees, converted to a
+    quaternion and composed with the Y-up quaternion so the user transform
+    sits in mesh-local space. `default_position` is a metric translation —
+    written into the CoordinateSystemRule only when `zero_position=True`
+    (the documented "zero on import, then offset by default_position"
+    behaviour). When `zero_position=False` no translation field is emitted,
+    so the source FBX node transform passes through.
 
     When collider_entity_node_map is provided, one PhysX convex MeshGroup is also
     written per collider entity, targeting the parent node of the visual mesh node.
@@ -784,12 +900,30 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
     if is_y_up:
         log(f"    [Mesh] Y-up detected — adding 90° pitch to CoordinateSystemRule")
 
-    # Quaternion for 90° rotation around X axis (Y-up → Z-up correction)
-    Y_UP_ROTATION = [0.7071067690849304, 0.0, 0.0, 0.7071067094802856]
+    # F-9 — resolve the per-mesh settings chain (defaults + override).
+    eff = _resolve_mesh_settings(mesh_settings, mesh_guid)
+    user_rot   = list(eff.get("default_rotation") or [0.0, 0.0, 0.0])
+    user_pos   = list(eff.get("default_position") or [0.0, 0.0, 0.0])
+    zero_pos   = bool(eff.get("zero_position", True))
+    has_user_rotation = any(abs(float(v)) > 1e-6 for v in user_rot)
+    has_user_translation = any(abs(float(v)) > 1e-6 for v in user_pos)
 
     coordinate_rule = {"$type": "CoordinateSystemRule", "useAdvancedData": True}
-    if is_y_up:
-        coordinate_rule["rotation"] = Y_UP_ROTATION
+    # Compose rotation: Y-up correction first (mesh-local), then user rotation.
+    # Result quaternion is q_user ⊗ q_yup so the user's authored transform
+    # applies in the corrected coordinate space.
+    if is_y_up and has_user_rotation:
+        coordinate_rule["rotation"] = _quat_mul(
+            _euler_deg_to_quat(user_rot), Y_UP_ROTATION,
+        )
+    elif is_y_up:
+        coordinate_rule["rotation"] = list(Y_UP_ROTATION)
+    elif has_user_rotation:
+        coordinate_rule["rotation"] = _euler_deg_to_quat(user_rot)
+    # Translation only when zero_position=True. zero_position=False explicitly
+    # opts out of having the assetinfo touch position at all.
+    if zero_pos and has_user_translation:
+        coordinate_rule["translation"] = [float(v) for v in user_pos]
 
     all_node_paths = list(entity_node_map.values())
     groups = []
@@ -825,9 +959,9 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
     # Targets the parent node of the visual mesh node so all geometry is captured.
     # -------------------------------------------------------------------------
     if collider_entity_node_map:
-        physx_coord_rule = {"$type": "CoordinateSystemRule", "useAdvancedData": True}
-        if is_y_up:
-            physx_coord_rule["rotation"] = Y_UP_ROTATION
+        # PhysX collider lives in the same mesh-local space as the visual
+        # group, so the same composed rotation + translation applies.
+        physx_coord_rule = dict(coordinate_rule)
 
         for entity_name, node_path in collider_entity_node_map.items():
             parts = node_path.split(".")
@@ -871,13 +1005,41 @@ class IntegratedAssetProcessor:
     
     def __init__(self, unity_assets_root: Path, output_root: Path,
                  log_callback=None,
-                 convert_smoothness_to_roughness: bool = False):
+                 convert_smoothness_to_roughness: bool = False,
+                 *,
+                 material_settings: Optional[Dict] = None,
+                 mesh_settings:     Optional[Dict] = None,
+                 scope_root:        Optional[Path] = None,
+                 state_index:       Optional[Dict] = None):
         self.unity_assets_root = unity_assets_root
         self.output_root = output_root
         self.log = log_callback or print
 
         # Per-run config flags
         self.convert_smoothness_to_roughness = convert_smoothness_to_roughness
+
+        # F-9 settings copied at construction time so worker mutations don't
+        # round-trip back into the project state until to_outputs() runs.
+        # `material_settings` carries {defaults, shader_profiles,
+        # shader_mappings, overrides}; None falls back to the legacy
+        # hard-coded extraction path so older call sites keep working.
+        # `mesh_settings` is consumed in F-9.I.3. `state_index` carries the
+        # last-emitted per-asset fingerprints for the F-9.I.5 patch worker.
+        self._material_settings = material_settings or {}
+        self._mesh_settings     = mesh_settings or {}
+        self._scope_root        = scope_root
+        self._state_index_in    = state_index or {}
+        # F-9.I.4 — per-asset emission fingerprints. Populated as each
+        # asset is written. `to_outputs()` returns it under the "state_index"
+        # key; the call site merges onto `project.outputs.state_index`
+        # (rather than replacing) so a partial run doesn't drop entries for
+        # assets not touched in this pass.
+        self._state_index_out: Dict[str, Dict[str, dict]] = {
+            "materials": {},
+            "meshes":    {},
+            "textures":  {},
+            "prefabs":   {},
+        }
 
         self.asset_db = AssetDatabase(unity_assets_root)
         
@@ -1082,8 +1244,18 @@ class IntegratedAssetProcessor:
                     and any(c['type'] == 'MeshCollider' for c in go.colliders)
                 }
 
-                write_fbx_assetinfo(fbx_path, fbx_stem, entity_node_map, self.log,
-                                    collider_entity_node_map=collider_entity_node_map or None)
+                write_fbx_assetinfo(
+                    fbx_path, fbx_stem, entity_node_map, self.log,
+                    collider_entity_node_map=collider_entity_node_map or None,
+                    mesh_settings=self._mesh_settings,
+                    mesh_guid=mesh_guid,
+                )
+                # F-9.I.4 — record mesh fingerprint AFTER the assetinfo
+                # exists on disk so the recorded output_files list includes
+                # both the .fbx copy and the .assetinfo sidecar.
+                source_mesh_path = self.asset_db.resolve_guid(mesh_guid)
+                if source_mesh_path is not None:
+                    self._record_mesh_state(mesh_guid, source_mesh_path, fbx_path)
 
                 for go in entity_list:
                     if go.file_id in node_paths:
@@ -1116,7 +1288,20 @@ class IntegratedAssetProcessor:
                 fbx_material_labels,
                 output_path
             )
-            
+
+            # F-9.I.4 — record the prefab's fingerprint after every
+            # dependent material/mesh has its own entry. The prefab hash
+            # folds in their input_hashes so a profile or mesh-override
+            # change downstream marks this prefab dirty too.
+            prefab_guid = self.asset_db.path_to_guid(prefab_path) or str(prefab_path)
+            self._record_prefab_state(
+                prefab_guid,
+                prefab_path,
+                output_path,
+                sorted(g for g in all_material_guids if g),
+                sorted(g for g in all_mesh_guids if g),
+            )
+
             self.log(f"  ✓ Created O3DE prefab: {output_path.name}")
             return True
         
@@ -1148,6 +1333,91 @@ class IntegratedAssetProcessor:
                  f"{len(cov.get('unhandled_override_paths', {}))} unhandled "
                  f"override path(s)")
 
+    # -------------------------------------------------------------------------
+    # F-9.I.5 — Patch worker
+    # -------------------------------------------------------------------------
+
+    def patch(self) -> Dict[str, list]:
+        """Re-emit only the assets whose input fingerprint has changed
+        since the last run.
+
+        Compares each saved entry in `state_index_in` against a recomputed
+        current input_hash. Mismatches are dirty: their cache is cleared
+        and they're re-processed, which records a fresh entry in
+        `state_index_out`. Returns a summary `{materials_dirty, materials_emitted}`.
+
+        Scope: materials only in F-9. The two stretch cases are deferred:
+          - Mesh-only patches need a per-FBX re-entry point that rebuilds
+            entity_node_map without the prefab parse. The patch worker
+            could call write_fbx_assetinfo directly if the entity map were
+            cached per-mesh in state_index; not in F-9 scope.
+          - Prefab patches go via the orchestrator's "re-run dirty prefabs"
+            path in F-8, which calls process_prefab(...) on each dirty
+            prefab's source. That re-touches dependent materials/meshes
+            naturally.
+        """
+        summary: Dict[str, list] = {
+            "materials_dirty":   [],
+            "materials_emitted": [],
+        }
+        saved_materials = (self._state_index_in or {}).get("materials") or {}
+
+        for guid, saved_entry in saved_materials.items():
+            source_path_str = saved_entry.get("source_path") or ""
+            if not source_path_str:
+                continue
+            source_path = Path(source_path_str)
+            if not source_path.exists():
+                # Source disappeared — orphan cleanup is a future feature.
+                continue
+
+            # Resolve profile chain for THIS material under current settings.
+            shallow = self.asset_db.parse_material(source_path)
+            if not shallow:
+                continue
+            shader_guid = shallow.get("shader_guid", "") or ""
+            shader_fid  = shallow.get("shader_fileid", 0) or 0
+            shader_name = self._resolve_shader_name(shader_guid, shader_fid)
+            profile     = self._resolve_profile_for_material(guid, shader_name)
+            override    = (self._material_settings.get("overrides") or {}).get(guid) or {}
+
+            payload = {
+                "asset_kind":   "material",
+                "source_path":  str(source_path),
+                "source_mtime": self._mtime_or_zero(source_path),
+                "profile":      profile or {},
+                "override":     override,
+            }
+            current_hash = self._canonical_hash(payload)
+            saved_hash   = saved_entry.get("input_hash") or ""
+
+            # Also dirty when the prior output is missing on disk.
+            output_files = saved_entry.get("output_files") or []
+            outputs_missing = any(not Path(p).exists() for p in output_files) if output_files else True
+
+            if current_hash == saved_hash and not outputs_missing:
+                continue   # clean
+
+            summary["materials_dirty"].append(guid)
+
+            # Drop caches so _process_material actually re-emits rather
+            # than returning the cached asset_hint.
+            self.processed_materials.pop(guid, None)
+            self.asset_db.material_cache = {
+                k: v for k, v in self.asset_db.material_cache.items()
+                if k[0] != str(source_path)
+            }
+
+            result = self._process_material(guid)
+            if result is not None:
+                summary["materials_emitted"].append(guid)
+
+        self.log(
+            f"  Patch: {len(summary['materials_dirty'])} dirty, "
+            f"{len(summary['materials_emitted'])} re-emitted"
+        )
+        return summary
+
     def to_outputs(self) -> dict:
         """Consolidate this run's bookkeeping into the dict the project
         file stores under `outputs.asset_processor`. Replaces the old
@@ -1155,13 +1425,29 @@ class IntegratedAssetProcessor:
 
         Caller (the tab worker) augments this with `last_run`,
         `last_input_hash`, and `last_status` before calling
-        `pm.update_outputs("asset_processor", ...)`."""
+        `pm.update_outputs("asset_processor", ...)`. The F-9 state index
+        is a project-wide sibling of stage outputs, so the caller routes
+        `self.state_index()` separately via
+        `pm.update_outputs("state_index", ...)`.
+        """
         return {
             "prefabs":           dict(self._project_prefab_records),
             "materials":         dict(self.asset_index["materials"]),
             "material_metadata": dict(self._material_metadata),
             "meshes":             dict(self.asset_index["meshes"]),
             "coverage":           self.coverage.to_dict(),
+        }
+
+    def state_index(self) -> dict:
+        """F-9.I.4 — return the per-asset emission fingerprints recorded
+        during this run. The caller merges this onto the project file's
+        existing `outputs.state_index` so untouched assets keep their
+        prior entries."""
+        return {
+            "materials": dict(self._state_index_out["materials"]),
+            "meshes":    dict(self._state_index_out["meshes"]),
+            "textures":  dict(self._state_index_out["textures"]),
+            "prefabs":   dict(self._state_index_out["prefabs"]),
         }
     
     def _parse_unity_prefab(self, prefab_path: Path) -> Tuple[Dict[str, GameObject], Dict[str, str]]:
@@ -1484,6 +1770,170 @@ class IntegratedAssetProcessor:
         self._shader_name_cache[cache_key] = name
         return name
 
+    def _resolve_profile_for_material(self, material_guid: str,
+                                       shader_name: str) -> Optional[Dict]:
+        """F-9 profile chain resolver:
+
+            overrides[guid].profile
+              → shader_mappings[shader_name]
+              → defaults.profile
+
+        Returns the profile dict from `material_settings.shader_profiles`,
+        or None when no settings were supplied (legacy mode — extraction
+        falls back to the hard-coded TEXTURE_MAP / PROPERTY_MAP path).
+        """
+        settings = self._material_settings or {}
+        if not settings:
+            return None
+        profiles = settings.get("shader_profiles") or {}
+
+        overrides = settings.get("overrides") or {}
+        guid_entry = overrides.get(material_guid) or {}
+        profile_name = guid_entry.get("profile") or ""
+
+        if not profile_name:
+            mappings = settings.get("shader_mappings") or {}
+            profile_name = mappings.get(shader_name) or ""
+
+        if not profile_name:
+            defaults = settings.get("defaults") or {}
+            profile_name = defaults.get("profile") or ""
+
+        if not profile_name:
+            return None
+        return profiles.get(profile_name)
+
+    def _resolve_effective_materialtype(self, material_guid: str,
+                                         profile: Optional[Dict]) -> str:
+        """Resolve the materialType string that lands in the emitted
+        `.material` file. The chain is:
+
+            overrides[guid].materialtype  (raw escape hatch)
+              → profile.target_materialtype
+              → resolve_materialtype_path() default
+
+        The result always passes through `resolve_materialtype_path` so a
+        bare filename like 'StandardPBR.materialtype' expands to its
+        @gemroot path before landing on disk.
+        """
+        from project_manager import resolve_materialtype_path
+        settings = self._material_settings or {}
+        overrides = settings.get("overrides") or {}
+        raw_escape = (overrides.get(material_guid) or {}).get("materialtype") or ""
+        if raw_escape:
+            return resolve_materialtype_path(raw_escape)
+        if profile is not None:
+            return resolve_materialtype_path(profile.get("target_materialtype"))
+        return resolve_materialtype_path(None)
+
+    # -------------------------------------------------------------------------
+    # F-9.I.4 — State index recording
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _canonical_hash(payload) -> str:
+        """sha256 digest over a JSON-canonical encoding of `payload`. Keys
+        sorted, separators tight, default str fallback so Path / set show up
+        as strings — all to keep the hash stable across runs that differ only
+        in dict-iteration order or Python-version representation quirks."""
+        blob = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                          default=str)
+        return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _mtime_or_zero(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except (OSError, ValueError):
+            return 0.0
+
+    def _record_material_state(self, guid: str, source_path: Path,
+                                output_path: Path,
+                                profile: Optional[Dict]) -> None:
+        override_entry = (self._material_settings.get("overrides") or {}).get(guid) or {}
+        payload = {
+            "asset_kind":   "material",
+            "source_path":  str(source_path),
+            "source_mtime": self._mtime_or_zero(source_path),
+            "profile":      profile or {},
+            "override":     override_entry,
+        }
+        self._state_index_out["materials"][guid] = {
+            "source_path":  str(source_path),
+            "source_mtime": payload["source_mtime"],
+            "output_files": [str(output_path)],
+            "input_hash":   self._canonical_hash(payload),
+            "last_emitted": _utc_now_iso(),
+        }
+
+    def _record_texture_state(self, guid: str, source_path: Path,
+                               output_rel: str) -> None:
+        output_abs = (self.output_root / output_rel) if output_rel else None
+        payload = {
+            "asset_kind":   "texture",
+            "source_path":  str(source_path),
+            "source_mtime": self._mtime_or_zero(source_path),
+        }
+        self._state_index_out["textures"][guid] = {
+            "source_path":  str(source_path),
+            "source_mtime": payload["source_mtime"],
+            "output_files": [str(output_abs)] if output_abs else [],
+            "input_hash":   self._canonical_hash(payload),
+            "last_emitted": _utc_now_iso(),
+        }
+
+    def _record_mesh_state(self, guid: str, source_path: Path,
+                            output_path: Path) -> None:
+        eff = _resolve_mesh_settings(self._mesh_settings, guid)
+        assetinfo = Path(str(output_path) + ".assetinfo")
+        payload = {
+            "asset_kind":     "mesh",
+            "source_path":    str(source_path),
+            "source_mtime":   self._mtime_or_zero(source_path),
+            "mesh_settings":  eff,
+        }
+        outputs = [str(output_path)]
+        if assetinfo.exists():
+            outputs.append(str(assetinfo))
+        self._state_index_out["meshes"][guid] = {
+            "source_path":  str(source_path),
+            "source_mtime": payload["source_mtime"],
+            "output_files": outputs,
+            "input_hash":   self._canonical_hash(payload),
+            "last_emitted": _utc_now_iso(),
+        }
+
+    def _record_prefab_state(self, guid: str, source_path: Path,
+                              output_path: Path,
+                              dep_material_guids: List[str],
+                              dep_mesh_guids:     List[str]) -> None:
+        """Prefab hash is derivative — it folds in the input_hash of every
+        material/mesh the prefab references. Editing a profile invalidates
+        the dependent materials, which then invalidates this prefab via the
+        propagated hash."""
+        dep_material_hashes = sorted(
+            (self._state_index_out["materials"].get(g, {}) or {}).get("input_hash", "")
+            for g in (dep_material_guids or [])
+        )
+        dep_mesh_hashes = sorted(
+            (self._state_index_out["meshes"].get(g, {}) or {}).get("input_hash", "")
+            for g in (dep_mesh_guids or [])
+        )
+        payload = {
+            "asset_kind":     "prefab",
+            "source_path":    str(source_path),
+            "source_mtime":   self._mtime_or_zero(source_path),
+            "dep_materials":  dep_material_hashes,
+            "dep_meshes":     dep_mesh_hashes,
+        }
+        self._state_index_out["prefabs"][guid] = {
+            "source_path":  str(source_path),
+            "source_mtime": payload["source_mtime"],
+            "output_files": [str(output_path)],
+            "input_hash":   self._canonical_hash(payload),
+            "last_emitted": _utc_now_iso(),
+        }
+
     def _process_material(self, material_guid: str) -> Optional[str]:
         """Process Unity material and create O3DE material"""
         # Check if already processed
@@ -1498,27 +1948,44 @@ class IntegratedAssetProcessor:
             return None
         
         self.log(f"    Processing material: {material_path.name}")
-        
-        # Parse material
-        material_data = self.asset_db.parse_material(material_path)
-        if not material_data:
+
+        # F-9 profile resolution:
+        # 1. Shallow parse (no profile) to read the m_Shader ref. YAML body
+        #    is cached so the subsequent profile-aware parse is cheap.
+        # 2. Resolve the friendly shader name via the .shader file (or the
+        #    built-in lookup table for Unity Standard etc.).
+        # 3. Walk the profile chain  override → mapping → default. None
+        #    keeps the legacy hard-coded extraction.
+        # 4. Re-parse with the selected profile.
+        shallow = self.asset_db.parse_material(material_path)
+        if not shallow:
             self.log(f"      ⚠ Failed to parse material")
             return None
-        
-        # Warn about texture-bound property names the extractor doesn't know
-        # how to route. Almost always indicates a custom / asset-store shader
-        # that uses non-standard slot names (e.g. _Albedo, _Composite). Add
-        # the aliases to TEXTURE_MAP (or IGNORE_UNMAPPED) in
-        # _extract_material_data when one of these recurs across a pack.
+        shader_guid = shallow.get("shader_guid", "") or ""
+        shader_fid  = shallow.get("shader_fileid", 0) or 0
+        shader_name = self._resolve_shader_name(shader_guid, shader_fid)
+        profile     = self._resolve_profile_for_material(material_guid, shader_name)
+        if profile is not None:
+            material_data = self.asset_db.parse_material(material_path, profile=profile)
+            if not material_data:
+                self.log(f"      ⚠ Failed to re-parse material with profile")
+                return None
+        else:
+            material_data = shallow
+
+        # Warn about texture-bound property names the active extraction map
+        # doesn't know how to route. Almost always indicates a custom /
+        # asset-store shader using non-standard slot names. Author or pick a
+        # different profile in F-10 if one of these recurs across a pack.
         unmapped = material_data.get('unmapped_texture_props', [])
         if unmapped:
-            shader_path = material_data.get('shader') or '<unknown shader>'
+            shader_path = material_data.get('shader') or shader_name or '<unknown shader>'
             self.log(
                 f"      ⚠ '{material_path.stem}' has bound textures on "
                 f"unrecognized property names {unmapped} "
                 f"(shader: {shader_path}). Those textures will be skipped — "
-                f"add the names to TEXTURE_MAP in _extract_material_data to "
-                f"route them, or to IGNORE_UNMAPPED to silence this warning."
+                f"add the aliases to the active shader profile's texture_map "
+                f"(or its ignore_unmapped list) to handle them."
             )
 
         # Process textures
@@ -1536,13 +2003,28 @@ class IntegratedAssetProcessor:
                 texture_output = self._process_texture(texture_guid)
             if texture_output:
                 texture_paths[o3de_prop] = texture_output
-        
+
+        # F-9 per-slot texture overrides — overrides[guid].textures wins per
+        # slot. Stored as the user wrote them; no copy / repath. Set after
+        # the auto-extraction loop so the user override always wins over
+        # whatever Unity bound on that slot.
+        override_entry = (self._material_settings.get("overrides") or {}).get(material_guid) or {}
+        override_textures = override_entry.get("textures") or {}
+        for slot, override_path in override_textures.items():
+            if override_path:
+                texture_paths[slot] = override_path
+
         # Create O3DE material
         output_name = material_path.stem
         output_path = self.materials_dir / f"{output_name}.material"
-        
+
+        # F-9 materialType resolution: override.materialtype (raw escape
+        # hatch) → profile.target_materialtype → builtin StandardPBR
+        # fallback. The resolver expands bare filenames into @gemroot paths.
+        material_type_path = self._resolve_effective_materialtype(material_guid, profile)
+
         o3de_material = {
-            "materialType": "@gemroot:Atom_Feature_Common@/Assets/Materials/Types/StandardPBR.materialtype",
+            "materialType": material_type_path,
             "materialTypeVersion": 5,
             "propertyValues": {}
         }
@@ -1617,13 +2099,8 @@ class IntegratedAssetProcessor:
         asset_hint = f"{self.asset_hint_root}/materials/{output_path.stem}.azmaterial"
         self.processed_materials[material_guid] = asset_hint
         self.asset_index["materials"][material_guid] = asset_hint
-        # F-6 metadata. shader_name is resolved from the m_Shader GUID via
-        # the .shader file (user-content shaders) or a small built-in
-        # table (Unity Standard, etc.). Falls back to "" when neither
-        # path produces a name.
-        shader_guid = material_data.get("shader_guid", "") or ""
-        shader_fid  = material_data.get("shader_fileid", 0) or 0
-        shader_name = self._resolve_shader_name(shader_guid, shader_fid)
+        # F-6 metadata. shader_name was already resolved up front to drive
+        # the F-9 profile chain; reuse it here.
         self._material_metadata[material_guid] = {
             "asset_hint":     asset_hint,
             "shader_name":    shader_name,
@@ -1632,6 +2109,8 @@ class IntegratedAssetProcessor:
             "source_stem":    material_path.stem,
             "textures_bound": sorted(texture_paths.keys()),
         }
+        # F-9.I.4 — record fingerprint for the patch worker.
+        self._record_material_state(material_guid, material_path, output_path, profile)
 
         self.log(f"      ✓ Created material with {len(texture_paths)} textures")
 
@@ -1656,6 +2135,8 @@ class IntegratedAssetProcessor:
 
             relative_path = f"Textures/{output_path.name}"
             self.processed_textures[texture_guid] = relative_path
+            # F-9.I.4 — fingerprint for the patch worker.
+            self._record_texture_state(texture_guid, texture_path, relative_path)
 
             return relative_path
 

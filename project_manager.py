@@ -27,12 +27,13 @@ event loop is running, but plain method calls work in any context (incl.
 the __main__ smoke test at the bottom of this file).
 """
 
+import copy
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 from PySide6.QtCore import QObject, Signal
 
@@ -57,26 +58,42 @@ STAGE_KEYS = ("asset_processor", "scene_converter", "terrain_processor")
 # PROJECT SCOPE
 # =============================================================================
 
-class ProjectScope(str, Enum):
-    WHOLE_GAME        = "whole_game"
-    ASSET_CLUSTER     = "asset_cluster"
-    ASSET_SET         = "asset_set"
-    INDIVIDUAL_ACTION = "individual_action"
+class SourceEngine(str, Enum):
+    """The source engine the conversion project is reading FROM.
+
+    Cosmetic in v1 (every project today is Unity-sourced), but the
+    field exists so future iterations can select different extraction
+    profile libraries / file walkers based on the engine. Adding new
+    engines is a single-line addition here plus a `display_name()` row.
+    """
+    UNITY   = "unity"
+    UNREAL  = "unreal"
+    GODOT   = "godot"
+    BLENDER = "blender"
 
     @classmethod
-    def from_string(cls, value: str) -> "ProjectScope":
-        for scope in cls:
-            if scope.value == value:
-                return scope
-        return cls.WHOLE_GAME
+    def from_string(cls, value: str) -> "SourceEngine":
+        # Direct match.
+        for eng in cls:
+            if eng.value == value:
+                return eng
+        # Legacy ProjectScope values (whole_game / asset_cluster / asset_set
+        # / individual_action) belonged to a Unity-only world; migrate them
+        # to UNITY rather than dropping them.
+        return cls.UNITY
 
     def display_name(self) -> str:
         return {
-            ProjectScope.WHOLE_GAME:        "Whole Game",
-            ProjectScope.ASSET_CLUSTER:     "Asset Cluster",
-            ProjectScope.ASSET_SET:         "Asset Set",
-            ProjectScope.INDIVIDUAL_ACTION: "Individual Action",
+            SourceEngine.UNITY:   "Unity",
+            SourceEngine.UNREAL:  "Unreal",
+            SourceEngine.GODOT:   "Godot",
+            SourceEngine.BLENDER: "Blender",
         }[self]
+
+
+# Legacy alias — old code paths and any third-party importers that referenced
+# `ProjectScope` continue to work. New code uses `SourceEngine`.
+ProjectScope = SourceEngine
 
 
 # =============================================================================
@@ -85,6 +102,244 @@ class ProjectScope(str, Enum):
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# =============================================================================
+# MATERIALTYPE RESOLVER (F-9)
+#
+# Both the UI and the worker need to know what string a user-entered
+# materialtype value should resolve to inside an emitted `.material` file.
+# Centralising the rules here keeps the "common value" inspector display in
+# MaterialTab consistent with what IntegratedAssetProcessor actually writes.
+# =============================================================================
+
+# Bare filename → O3DE `@gemroot:...@` path. Extend as more builtin
+# materialtypes become commonly mapped.
+_O3DE_BUILTIN_MATERIALTYPES = {
+    "StandardPBR.materialtype":
+        "@gemroot:Atom_Feature_Common@/Assets/Materials/Types/StandardPBR.materialtype",
+    "BasePBR.materialtype":
+        "@gemroot:Atom_Feature_Common@/Assets/Materials/Types/BasePBR.materialtype",
+    "EnhancedPBR.materialtype":
+        "@gemroot:Atom_Feature_Common@/Assets/Materials/Types/EnhancedPBR.materialtype",
+}
+
+# Fallback when nothing resolves and the caller doesn't supply a default.
+DEFAULT_MATERIALTYPE_PATH = _O3DE_BUILTIN_MATERIALTYPES["StandardPBR.materialtype"]
+
+
+def resolve_materialtype_path(value: Optional[str]) -> str:
+    """Resolve a user-entered materialtype value to the string that should
+    land in the emitted `.material` file's `materialType` field.
+
+    Resolution rules (first match wins):
+    1. Empty / None → `DEFAULT_MATERIALTYPE_PATH`.
+    2. Already in O3DE `@gemroot:...@` form → pass through.
+    3. Absolute filesystem path (Windows drive letter, POSIX `/`) → pass
+       through. Useful for project-local materialtypes.
+    4. Bare filename in the builtin table → expanded.
+    5. Bare filename ending `.materialtype` → returned as-written; treated
+       as a project-local materialtype the asset processor will resolve.
+    6. Bare name without extension → `.materialtype` appended then re-run
+       through this resolver.
+    """
+    if not value:
+        return DEFAULT_MATERIALTYPE_PATH
+    s = str(value).strip()
+    if not s:
+        return DEFAULT_MATERIALTYPE_PATH
+    # @gemroot:...@ form, or any colon-bearing alias path.
+    if s.startswith("@") or ":" in s.split("/", 1)[0] or ":" in s.split("\\", 1)[0]:
+        return s
+    # Absolute filesystem path (POSIX or Windows).
+    if s.startswith("/") or (len(s) > 2 and s[1] == ":" and s[2] in ("/", "\\")):
+        return s
+    if s in _O3DE_BUILTIN_MATERIALTYPES:
+        return _O3DE_BUILTIN_MATERIALTYPES[s]
+    if s.endswith(".materialtype"):
+        return s
+    return resolve_materialtype_path(s + ".materialtype")
+
+
+
+# =============================================================================
+# EXTERNALLY-MODIFIED DETECTION (F-9.I.6b)
+#
+# After the converter writes a `.material` / `.assetinfo` / etc., the user
+# may open the file in O3DE and edit it directly (tweak property values, add
+# slots, etc.). Re-running Patch would silently overwrite those edits. The
+# tab UI surfaces a per-asset ✎ marker so the user knows re-emitting that
+# row is destructive.
+#
+# Detection compares each `output_files[i]` mtime against the saved
+# `last_emitted` ISO timestamp on the same state-index entry. mtime is
+# best-effort (subsecond resolution differs across filesystems), so a 1.0s
+# tolerance is added to absorb the write-then-record gap and FS rounding.
+# =============================================================================
+
+def _parse_iso_to_epoch(iso: str) -> Optional[float]:
+    """Parse an ISO-8601 'YYYY-MM-DDTHH:MM:SSZ' string to epoch seconds.
+    Returns None when the string is empty or unparsable."""
+    if not iso:
+        return None
+    try:
+        # Accept the trailing 'Z' (UTC marker) used by `_utc_now_iso`. fromisoformat
+        # on Python 3.10+ accepts the suffix natively; older versions need it stripped.
+        s = iso.rstrip("Z")
+        dt = datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+def detect_externally_modified(state_index: Optional[dict],
+                                tolerance_seconds: float = 1.0,
+                                ) -> dict:
+    """Return a dict of `{bucket_name: set(guid)}` for assets whose output
+    file mtime exceeds the saved `last_emitted` timestamp by more than
+    `tolerance_seconds`.
+
+    Buckets: materials / meshes / textures / prefabs. Entries without
+    `last_emitted` or `output_files` are skipped (nothing to compare).
+    """
+    out = {k: set() for k in ("materials", "meshes", "textures", "prefabs")}
+    if not state_index:
+        return out
+    for bucket_name, bucket in (state_index or {}).items():
+        if bucket_name not in out or not isinstance(bucket, dict):
+            continue
+        for guid, entry in bucket.items():
+            if not isinstance(entry, dict):
+                continue
+            emitted_at = _parse_iso_to_epoch(entry.get("last_emitted") or "")
+            if emitted_at is None:
+                continue
+            threshold = emitted_at + tolerance_seconds
+            for p_str in (entry.get("output_files") or []):
+                try:
+                    mtime = Path(p_str).stat().st_mtime
+                except (OSError, ValueError):
+                    continue
+                if mtime > threshold:
+                    out[bucket_name].add(guid)
+                    break
+    return out
+
+
+# =============================================================================
+# SHADER PROFILES (F-9)
+#
+# A "shader profile" captures how a Unity shader's properties (textures +
+# scalars/colors) map onto an O3DE materialtype. Profiles supersede the
+# F-6 model where `shader_mappings` pointed at a materialtype path — that
+# path lacked the property-remap context required for divergent shader
+# packs. F-9 ships exactly one profile (`Default — Anything to PBR`) that
+# captures the legacy hard-coded TEXTURE_MAP / PROPERTY_MAP / IGNORE_UNMAPPED
+# behaviour verbatim. Profile authoring (creating new profiles, editing the
+# remap tables in the GUI) is the F-10 feature.
+#
+# Profile fields
+# --------------
+#   description           — human-readable purpose
+#   target_materialtype   — string fed to resolve_materialtype_path()
+#   texture_map           — Unity property → {slot, transform}
+#   property_map          — Unity property → {target, transform}
+#   ignore_unmapped       — names that don't have a clean O3DE equivalent;
+#                            silenced from the unmapped-property warnings
+#   special_rules         — named flags the worker honours; F-9 only consumes
+#                            `metallic_gloss_smoothness_to_roughness` to
+#                            preserve the existing Standard-shader behaviour.
+# =============================================================================
+
+DEFAULT_PROFILE_NAME = "Default — Anything to PBR"
+
+DEFAULT_SHADER_PROFILE = {
+    "description": (
+        "Catch-all Unity → O3DE PBR remap. Reproduces the legacy hard-coded "
+        "TEXTURE_MAP / PROPERTY_MAP / IGNORE_UNMAPPED behaviour exactly. "
+        "Acts as the fallback for every shader unless a project-specific "
+        "profile (authored in F-10) overrides it."
+    ),
+    "target_materialtype": "StandardPBR.materialtype",
+    # Unity property name → O3DE slot. Slots match the StandardPBR materialtype's
+    # texture binding shorthand (e.g. "baseColor" → "baseColor.textureMap").
+    "texture_map": {
+        # baseColor — Unity Standard, URP, HDRP, and common custom-shader aliases
+        "_MainTex":          {"slot": "baseColor",  "transform": "passthrough"},
+        "_BaseMap":          {"slot": "baseColor",  "transform": "passthrough"},
+        "_BaseColorMap":     {"slot": "baseColor",  "transform": "passthrough"},
+        "_Albedo":           {"slot": "baseColor",  "transform": "passthrough"},
+        "_AlbedoMap":        {"slot": "baseColor",  "transform": "passthrough"},
+        "_AlbedoTex":        {"slot": "baseColor",  "transform": "passthrough"},
+        "_Diffuse":          {"slot": "baseColor",  "transform": "passthrough"},
+        "_DiffuseMap":       {"slot": "baseColor",  "transform": "passthrough"},
+        "_DiffuseTex":       {"slot": "baseColor",  "transform": "passthrough"},
+        "_ColorMap":         {"slot": "baseColor",  "transform": "passthrough"},
+        # normal
+        "_BumpMap":          {"slot": "normal",     "transform": "passthrough"},
+        "_NormalMap":        {"slot": "normal",     "transform": "passthrough"},
+        "_NormalTex":        {"slot": "normal",     "transform": "passthrough"},
+        # metallic — Standard packs gloss in alpha, handled via
+        # special_rules.metallic_gloss_smoothness_to_roughness
+        "_MetallicGlossMap": {"slot": "metallic",   "transform": "passthrough"},
+        "_MetallicMap":      {"slot": "metallic",   "transform": "passthrough"},
+        "_MetallicTex":      {"slot": "metallic",   "transform": "passthrough"},
+        "_Metallic_Map":     {"slot": "metallic",   "transform": "passthrough"},
+        # specular workflow
+        "_SpecGlossMap":     {"slot": "specular",   "transform": "passthrough"},
+        "_SpecularMap":      {"slot": "specular",   "transform": "passthrough"},
+        # occlusion / AO — O3DE uses occlusion.specularTextureMap; the
+        # ".specular" suffix on the slot tells _process_material to expand
+        # the property name.
+        "_OcclusionMap":         {"slot": "occlusion.specular", "transform": "passthrough"},
+        "_AOMap":                {"slot": "occlusion.specular", "transform": "passthrough"},
+        "_AmbientOcclusion":     {"slot": "occlusion.specular", "transform": "passthrough"},
+        "_AmbientOcclusionMap":  {"slot": "occlusion.specular", "transform": "passthrough"},
+        "_AO":                   {"slot": "occlusion.specular", "transform": "passthrough"},  # MK4
+        # MK4 / Alien Fantasy Forest rock shader uses prefixed names for the
+        # primary surface (cover variants ignored — see ignore_unmapped).
+        "_RockAlbedo":       {"slot": "baseColor",  "transform": "passthrough"},
+        "_RockNormal":       {"slot": "normal",     "transform": "passthrough"},
+        "_RockSpecular":     {"slot": "specular",   "transform": "passthrough"},
+        # emissive
+        "_EmissionMap":      {"slot": "emissive",   "transform": "passthrough"},
+        "_EmissionTex":      {"slot": "emissive",   "transform": "passthrough"},
+        "_EmissiveMap":      {"slot": "emissive",   "transform": "passthrough"},
+        "_Emissive":         {"slot": "emissive",   "transform": "passthrough"},
+        # height / parallax
+        "_HeightMap":        {"slot": "height",     "transform": "passthrough"},
+        "_ParallaxMap":      {"slot": "height",     "transform": "passthrough"},
+        "_DisplacementMap":  {"slot": "height",     "transform": "passthrough"},
+    },
+    # Texture property names that are KNOWN to exist but intentionally not
+    # routed — they don't have a clean 1:1 O3DE equivalent. Listed here so the
+    # unmapped-property warnings don't fire for them.
+    "ignore_unmapped": [
+        "_DetailAlbedoMap", "_DetailMask", "_DetailNormalMap",
+        "_LightTextureB0", "_VectorNoise", "_texcoord",
+        # _Composite et al. are channel-packed and shader-specific.
+        "_Composite", "_CompositeMap", "_MOHS", "_MaskMap",
+        # MK4 / Alien Fantasy Forest detail + cover layers.
+        "_Detail", "_AODetail",
+        "_CoverAlbedo", "_CoverNormal", "_CoverSpecular",
+    ],
+    # Unity scalar / color property → O3DE materialtype property path.
+    # NOTE: _Metallic, _Smoothness, _Glossiness, _GlossMapScale are handled
+    # in the worker's metallic / roughness post-pass — O3DE's factor vs
+    # lowerBound/upperBound semantics depend on whether a texture is bound.
+    "property_map": {
+        "_Color":             {"target": "baseColor.color",         "transform": "passthrough"},
+        "_BaseColor":         {"target": "baseColor.color",         "transform": "passthrough"},
+        "_BumpScale":         {"target": "normal.factor",           "transform": "passthrough"},
+        "_OcclusionStrength": {"target": "occlusion.specularFactor", "transform": "passthrough"},
+        "_EmissionColor":     {"target": "emissive.color",          "transform": "passthrough"},
+    },
+    "special_rules": {
+        # When True, _MetallicGlossMap's alpha channel is inverted and routed
+        # to the roughness slot (Unity smoothness → O3DE roughness).
+        "metallic_gloss_smoothness_to_roughness": True,
+    },
+}
 
 
 def _default_stages() -> dict:
@@ -114,29 +369,42 @@ def _default_stages() -> dict:
             "overrides": {},
         },
         "material_processor": {
-            # F-6: defaults for the materialtype binding when no shader-
-            # specific mapping exists.
+            # F-9: defaults reference a profile name instead of a raw
+            # materialtype path. The profile carries both the target
+            # materialtype AND the property remap. Resolution chain at
+            # emission time is:
+            #   overrides[guid].profile
+            #     → shader_mappings[shader_name]
+            #     → defaults.profile
+            # The raw-materialtype escape hatch (overrides[guid].materialtype)
+            # bypasses the profile's target_materialtype after the profile
+            # is selected — texture/property remap from the profile still
+            # applies.
             "defaults": {
-                "target_materialtype": "StandardPBR.materialtype",
+                "profile": DEFAULT_PROFILE_NAME,
             },
-            # Unity shader name → O3DE materialtype path. Populated by the
-            # user; unmapped shaders fall through to the default. Pre-seeded
-            # with common Unity built-ins + the Alien Fantasy Forest pack's
-            # MK4 shaders (mapped to StandardPBR; the foliage variants
-            # drop the wind animation, the rock variant drops the cover
-            # blend — these are visual-only losses).
+            # F-9 profile library. One built-in entry; F-10 will add the
+            # authoring UI for custom profiles.
+            "shader_profiles": {
+                DEFAULT_PROFILE_NAME: copy.deepcopy(DEFAULT_SHADER_PROFILE),
+            },
+            # Unity shader name → profile name. Pre-seeded with common
+            # Unity built-ins + the Alien Fantasy Forest pack's MK4
+            # shaders, all routed through the catch-all profile.
             "shader_mappings": {
-                "Standard":                             "StandardPBR.materialtype",
-                "Universal Render Pipeline/Lit":        "StandardPBR.materialtype",
-                "Universal Render Pipeline/Simple Lit": "StandardPBR.materialtype",
-                "MK4/Foliage Fantasy":                  "StandardPBR.materialtype",
-                "MK4/Foliage Fantasy no wind":          "StandardPBR.materialtype",
-                "MK4/Foliage Fantasy no trans":         "StandardPBR.materialtype",
-                "MK4/Rock_cover":                       "StandardPBR.materialtype",
+                "Standard":                             DEFAULT_PROFILE_NAME,
+                "Universal Render Pipeline/Lit":        DEFAULT_PROFILE_NAME,
+                "Universal Render Pipeline/Simple Lit": DEFAULT_PROFILE_NAME,
+                "MK4/Foliage Fantasy":                  DEFAULT_PROFILE_NAME,
+                "MK4/Foliage Fantasy no wind":          DEFAULT_PROFILE_NAME,
+                "MK4/Foliage Fantasy no trans":         DEFAULT_PROFILE_NAME,
+                "MK4/Rock_cover":                       DEFAULT_PROFILE_NAME,
             },
-            # Per-material overrides keyed by material GUID. Each entry:
-            #   { "materialtype": "...",
-            #     "textures":     { "baseColor": "/abs/path", ... } }
+            # Per-material overrides keyed by material GUID. Each entry may
+            # carry any subset of:
+            #   "profile":       profile-name override (preferred)
+            #   "materialtype":  raw materialtype path (escape hatch)
+            #   "textures":      { slot: path, ... } per-slot texture rebinds
             "overrides": {},
         },
         "terrain_processor": {
@@ -181,6 +449,17 @@ def _default_outputs() -> dict:
             "materials": {},   # source_abs_path → {output_path, textures, written_at}
             "coverage":  {},
         },
+        # F-9 per-asset state index. Each entry records the input fingerprint
+        # of the most recent emission so the patch worker can detect dirty
+        # assets and re-emit only those. Buckets are keyed by asset GUID;
+        # each entry: { source_path, source_mtime, output_files,
+        # input_hash, last_emitted }.
+        "state_index": {
+            "materials": {},
+            "meshes":    {},
+            "prefabs":   {},
+            "textures":  {},
+        },
     }
 
 
@@ -216,7 +495,7 @@ def _normalize_project_path(path: Path) -> Path:
 class Project:
     path:            Optional[Path]
     name:            str
-    scope:           ProjectScope
+    source_engine:   SourceEngine
     notes:           str
     created:         str
     modified:        str
@@ -224,7 +503,24 @@ class Project:
     pipeline_status: dict
     outputs:         dict = field(default_factory=_default_outputs)
     scope_root:      Optional[Path] = None
+    # F-8: per-yellow-row Acknowledge state. Keys are `ack_key` strings
+    # the preflight check functions emit (e.g. "material.unmapped"); each
+    # value is the snapshot hash that was current when the user clicked
+    # Acknowledge. The pre-flight gate re-arms whenever the snapshot drifts.
+    preflight_acks:  Dict[str, str] = field(default_factory=dict)
     _dirty:          bool = field(default=False, repr=False)
+
+    # Backwards-compat alias: pre-F-9 the field was named `scope` and held a
+    # ProjectScope (Whole Game / Asset Cluster / ...). Replaced by
+    # `source_engine` (Unity / Unreal / Godot / Blender) but the old name
+    # stays readable so any in-flight tooling keeps building.
+    @property
+    def scope(self) -> SourceEngine:
+        return self.source_engine
+
+    @scope.setter
+    def scope(self, value: SourceEngine) -> None:
+        self.source_engine = value
 
     # -------------------------------------------------------------------------
     # Serialization
@@ -234,7 +530,7 @@ class Project:
         return {
             "schema_version":  SCHEMA_VERSION,
             "name":            self.name,
-            "scope":           self.scope.value,
+            "source_engine":   self.source_engine.value,
             "scope_root":      str(self.scope_root) if self.scope_root else "",
             "notes":           self.notes,
             "created":         self.created,
@@ -242,6 +538,7 @@ class Project:
             "stages":          self.stages,
             "pipeline_status": self.pipeline_status,
             "outputs":         self.outputs,
+            "preflight_acks":  dict(self.preflight_acks),
         }
 
     @classmethod
@@ -256,6 +553,24 @@ class Project:
                 stages[key] = _deep_merge(stages[key], saved)
             else:
                 stages[key] = saved
+        # F-9 one-shot normalization: material_processor switched from
+        # `defaults.target_materialtype` + path-valued shader_mappings to
+        # `defaults.profile` + profile-name-valued shader_mappings. Drop
+        # the stale field and coerce any non-profile-name mapping value
+        # back to the catch-all profile.
+        mp = stages.get("material_processor")
+        if isinstance(mp, dict):
+            defaults = mp.setdefault("defaults", {})
+            defaults.pop("target_materialtype", None)
+            defaults.setdefault("profile", DEFAULT_PROFILE_NAME)
+            profile_names = set((mp.get("shader_profiles") or {}).keys())
+            mappings = mp.get("shader_mappings") or {}
+            for shader, value in list(mappings.items()):
+                if value not in profile_names:
+                    mappings[shader] = DEFAULT_PROFILE_NAME
+            # Per-material overrides: legacy `materialtype` key stays as a
+            # raw escape hatch; `profile` is the new preferred override.
+            # No migration required — both keys coexist by design.
         status = _default_status()
         status.update(data.get("pipeline_status", {}))
         outputs = _default_outputs()
@@ -270,10 +585,22 @@ class Project:
         raw_root = (data.get("scope_root") or "").strip()
         scope_root = Path(raw_root) if raw_root else None
 
+        # Prefer the new `source_engine` key; fall back to the legacy `scope`
+        # field on existing project files. `SourceEngine.from_string` already
+        # maps legacy ProjectScope values (whole_game / asset_cluster /
+        # asset_set / individual_action) onto UNITY, so a load-save round-trip
+        # is enough to migrate a project file fully.
+        engine_value = data.get("source_engine") or data.get("scope") or "unity"
+
+        # F-8 — preflight acknowledgements survive load. Missing on legacy
+        # files is fine; defaults to empty so every yellow row re-arms on
+        # first open under the new schema.
+        preflight_acks = dict(data.get("preflight_acks") or {})
+
         return cls(
             path=path,
             name=data.get("name", "Untitled"),
-            scope=ProjectScope.from_string(data.get("scope", "whole_game")),
+            source_engine=SourceEngine.from_string(engine_value),
             notes=data.get("notes", ""),
             created=data.get("created",  _utc_now_iso()),
             modified=data.get("modified", _utc_now_iso()),
@@ -281,6 +608,7 @@ class Project:
             pipeline_status=status,
             outputs=outputs,
             scope_root=scope_root,
+            preflight_acks=preflight_acks,
         )
 
     # -------------------------------------------------------------------------
@@ -309,10 +637,31 @@ class Project:
             self.name = name
             self._mark_dirty()
 
-    def set_scope(self, scope: ProjectScope) -> None:
-        if scope != self.scope:
-            self.scope = scope
+    def set_source_engine(self, engine: SourceEngine) -> None:
+        if engine != self.source_engine:
+            self.source_engine = engine
             self._mark_dirty()
+
+    def set_preflight_ack(self, ack_key: str, snapshot: str) -> None:
+        """F-8 — record the user's Acknowledge for a yellow preflight row.
+        Storing the snapshot hash means a later condition drift (new
+        unmapped shader, etc.) re-arms the row without code changes."""
+        if not ack_key:
+            return
+        if self.preflight_acks.get(ack_key) != snapshot:
+            self.preflight_acks[ack_key] = snapshot
+            self._mark_dirty()
+
+    def clear_preflight_ack(self, ack_key: str) -> None:
+        if ack_key in self.preflight_acks:
+            del self.preflight_acks[ack_key]
+            self._mark_dirty()
+
+    # Backwards-compat alias — see the `scope` property above. Old callers
+    # that used `set_scope(...)` continue to work; new code should call
+    # `set_source_engine(...)`.
+    def set_scope(self, scope: SourceEngine) -> None:
+        self.set_source_engine(scope)
 
     def set_notes(self, notes: str) -> None:
         if notes != self.notes:
@@ -402,14 +751,14 @@ class ProjectManager(QObject):
 
     def new_project(
         self,
-        name:  str          = "Untitled Project",
-        scope: ProjectScope = ProjectScope.WHOLE_GAME,
+        name:          str           = "Untitled Project",
+        source_engine: SourceEngine  = SourceEngine.UNITY,
     ) -> Project:
         now = _utc_now_iso()
         proj = Project(
             path=None,
             name=name,
-            scope=scope,
+            source_engine=source_engine,
             notes="",
             created=now,
             modified=now,
@@ -594,7 +943,7 @@ class ProjectManager(QObject):
             proj = Project(
                 path=legacy_path,
                 name="Legacy (auto-migrated)",
-                scope=ProjectScope.WHOLE_GAME,
+                source_engine=SourceEngine.UNITY,
                 notes="Auto-migrated from converter_settings.json on first launch of the project system.",
                 created=now,
                 modified=now,
@@ -687,7 +1036,7 @@ if __name__ == "__main__":
         pm = ProjectManager(settings_path=settings_path)
 
         # 1. New project + save_as
-        proj = pm.new_project("Smoke Test", ProjectScope.ASSET_SET)
+        proj = pm.new_project("Smoke Test", SourceEngine.UNREAL)
         proj.set_notes("smoke notes")
         proj.stages["asset_processor"]["source_path"] = "C:/fake/source"
         proj_path = tmp / "smoke.u2oproj.json"
@@ -699,7 +1048,7 @@ if __name__ == "__main__":
         assert pm.current() is None
         opened = pm.open(proj_path)
         assert opened.name == "Smoke Test"
-        assert opened.scope == ProjectScope.ASSET_SET
+        assert opened.source_engine == SourceEngine.UNREAL
         assert opened.notes == "smoke notes"
         assert opened.stages["asset_processor"]["source_path"] == "C:/fake/source"
 
@@ -769,7 +1118,7 @@ if __name__ == "__main__":
         import os
         def _norm(p): return os.path.normpath(p) if p else p
         pm.close()
-        proj_root = pm.new_project("Scope Test", ProjectScope.ASSET_SET)
+        proj_root = pm.new_project("Scope Test", SourceEngine.GODOT)
         proj_root_path = tmp / "scoped.u2oproj.json"
         # Initially no scope_root, no override → effective_source is ""
         assert proj_root.effective_source("asset_processor") == ""
