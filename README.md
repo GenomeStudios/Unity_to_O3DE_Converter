@@ -1,6 +1,6 @@
 <img width="1349" height="1227" alt="image" src="https://github.com/user-attachments/assets/fd3482f2-499b-4397-aa31-78405fb6fae6" />
 
-<center>[Youtube Demo Video](https://youtu.be/amyFFLV5Dck)</center>
+[Youtube Demo Video](https://youtu.be/amyFFLV5Dck)
 
 # To‑O3DE Project Converter
 
