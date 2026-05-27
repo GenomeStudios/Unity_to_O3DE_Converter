@@ -4084,22 +4084,43 @@ class MeshTab(QWidget):
         self._last_run_box.setVisible(False)
         root.addWidget(self._last_run_box)
 
-        # ── Disabled action button — full processing pipeline lands later ─
-        process_btn = QPushButton("Process (per-mesh worker — coming)")
-        process_btn.setObjectName("primary")
-        process_btn.setEnabled(False)
-        process_btn.setToolTip(
-            "Mesh overrides are currently stored in the project file; the "
-            "worker that applies them at .assetinfo generation time arrives "
-            "in a follow-up iteration of F-5."
+        # ── Patch button — mesh side of the F-9 patch worker ─────────────
+        # Re-emits .assetinfo for every mesh whose effective mesh_settings
+        # / source mtime drifted since the last Run All, plus meshes whose
+        # output file was edited in-engine (the scrub workflow). See
+        # `mem:mesh_patch_worker/mesh_patch_worker_plan`.
+        self._dirty_summary = QLabel("")
+        self._dirty_summary.setStyleSheet("color: #6c7086; font-size: 9pt;")
+        self._dirty_summary.setWordWrap(True)
+
+        self._patch_btn = QPushButton("Patch Dirty Meshes")
+        self._patch_btn.setObjectName("primary")
+        self._patch_btn.setToolTip(
+            "Re-emit .assetinfo files for every mesh whose effective "
+            "mesh_settings / source mtime has drifted since the last "
+            "Prefab Processor run, or whose .assetinfo was edited in-engine. "
+            "Rows marked ↻ point at outputs missing on disk; rows marked ✎ "
+            "have in-engine edits that this action will OVERWRITE."
         )
+        self._patch_btn.clicked.connect(self._start_patch)
+
         action_row = QHBoxLayout()
         action_row.setSpacing(8)
+        action_row.addWidget(self._dirty_summary, 1)
         action_row.addStretch(1)
-        action_row.addWidget(process_btn)
+        action_row.addWidget(self._patch_btn)
         root.addLayout(action_row)
 
         outer.addWidget(_scroll_wrap(content))
+
+    def showEvent(self, event) -> None:
+        """Refresh inventory + dirty markers on tab activation so the
+        externally-modified detection catches in-engine edits made while
+        the user was on a different tab. Mirrors MaterialTab."""
+        super().showEvent(event)
+        proj = project_manager().current()
+        if proj is not None:
+            self.apply_project(proj)
 
     def _build_field_form(self, parent_lay: QVBoxLayout, *, scope: str) -> dict:
         """Construct widgets for every field in `_MESH_FIELDS`. Returns
@@ -4174,37 +4195,112 @@ class MeshTab(QWidget):
         self._inv_list.clear()
         if project is None:
             self._inv_summary.setText("(no project loaded)")
+            self._dirty_summary.setText("")
             return
         ap = project.outputs.get("asset_processor", {})
         meshes = ap.get("meshes", {}) or {}
         mp = project.stage_settings(self.STAGE_KEY)
         overrides = mp.get("overrides", {}) or {}
 
+        # State-index lookup for dirty + externally-modified markers.
+        state_index_root = project.outputs.get("state_index") or {}
+        state_meshes     = state_index_root.get("meshes") or {}
+        ext_mod          = detect_externally_modified(state_index_root)
+        externally_modified = ext_mod.get("meshes") or set()
+
         if not meshes:
             self._inv_summary.setText(
                 "No meshes extracted yet. Mark prefabs and run the Prefab Processor."
             )
+            self._dirty_summary.setText("")
             return
+
+        override_count = 0
+        dirty_count    = 0
+        ext_mod_count  = 0
 
         for guid, stem in sorted(meshes.items(), key=lambda kv: str(kv[1]).lower()):
             has_override = guid in overrides
-            text = f"{'★ ' if has_override else '   '}{stem}"
+
+            state_entry = state_meshes.get(guid)
+            if state_entry is None:
+                is_dirty = True
+            else:
+                outputs = state_entry.get("output_files") or []
+                is_dirty = (not outputs) or any(not Path(p).exists() for p in outputs)
+
+            is_externally_modified = guid in externally_modified
+
+            if has_override:
+                override_count += 1
+            if is_dirty:
+                dirty_count += 1
+            if is_externally_modified:
+                ext_mod_count += 1
+
+            prefix = ""
+            if has_override:
+                prefix += "★ "
+            if is_dirty:
+                prefix += "↻ "
+            if is_externally_modified:
+                prefix += "✎ "
+            if not prefix:
+                prefix = "   "
+
+            text = f"{prefix}{stem}"
             item = QListWidgetItem(text)
             item.setData(Qt.UserRole, guid)
-            item.setToolTip(f"GUID: {guid}\nOutput stem: {stem}"
-                            + ("\nOverride applied" if has_override else ""))
+            tip_lines = [f"GUID: {guid}", f"Output stem: {stem}"]
             if has_override:
+                tip_lines.append("Override applied")
+            if is_dirty:
+                tip_lines.append("Dirty — output missing or stale; run Patch")
+            if is_externally_modified:
+                tip_lines.append(
+                    "✎ Output edited in-engine since last emit — "
+                    "re-patching will OVERWRITE those changes."
+                )
+            item.setToolTip("\n".join(tip_lines))
+            # Foreground colour priority (most → least urgent): external-mod
+            # (orange — destructive risk) > override (cyan, bold).
+            if is_externally_modified:
+                item.setForeground(QColor("#fab387"))
+                f = item.font()
+                f.setBold(True)
+                item.setFont(f)
+            elif has_override:
                 f = item.font()
                 f.setBold(True)
                 item.setFont(f)
                 item.setForeground(Qt.cyan)
             self._inv_list.addItem(item)
 
-        override_count = sum(1 for g in meshes if g in overrides)
-        self._inv_summary.setText(
-            f"{len(meshes)} mesh(es) · {override_count} with overrides · "
-            f"select one or more to edit their settings"
-        )
+        summary_parts = [
+            f"{len(meshes)} mesh(es)",
+            f"{override_count} with override(s)",
+            f"{dirty_count} dirty",
+        ]
+        if ext_mod_count:
+            summary_parts.append(f"{ext_mod_count} edited externally")
+        self._inv_summary.setText(" · ".join(summary_parts))
+
+        # Dirty summary band — external mods take precedence (destructive risk).
+        if ext_mod_count:
+            self._dirty_summary.setText(
+                f"✎ {ext_mod_count} mesh(es) modified in-engine since "
+                f"last emit — re-patching will overwrite their changes."
+            )
+            self._dirty_summary.setStyleSheet(
+                "color: #fab387; font-size: 9pt; font-weight: bold;"
+            )
+        elif dirty_count:
+            self._dirty_summary.setText(
+                f"↻ {dirty_count} mesh(es) need re-emission"
+            )
+            self._dirty_summary.setStyleSheet("color: #6c7086; font-size: 9pt;")
+        else:
+            self._dirty_summary.setText("")
 
     def _selected_mesh_guids(self) -> list:
         guids: list = []
@@ -4328,6 +4424,11 @@ class MeshTab(QWidget):
                 self._apply_field_value(entry, key, value)
                 overrides[g] = entry
 
+        # Normalise: any override entry value-equal to defaults across
+        # every key it carries is redundant — drop it so the ★ marker
+        # honestly reflects "differs from default".
+        overrides = self._prune_redundant_overrides(overrides, defaults)
+
         cfg["defaults"]  = defaults
         cfg["overrides"] = overrides
         pm.update_stage(self.STAGE_KEY, cfg)
@@ -4350,6 +4451,36 @@ class MeshTab(QWidget):
             target[vec_key] = vec
         else:
             target[key] = value
+
+    @staticmethod
+    def _values_equal(a, b, tol: float = 1e-6) -> bool:
+        """Field-value equality with vec3 tolerance. ``None`` on either
+        side means "no opinion" and never compares equal to a real value."""
+        if a is None or b is None:
+            return False
+        if isinstance(a, list) and isinstance(b, list):
+            if len(a) != len(b):
+                return False
+            return all(abs(float(x) - float(y)) < tol for x, y in zip(a, b))
+        if isinstance(a, bool) or isinstance(b, bool):
+            return a == b
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            return abs(float(a) - float(b)) < tol
+        return a == b
+
+    @classmethod
+    def _prune_redundant_overrides(cls, overrides: dict, defaults: dict) -> dict:
+        """Strip any GUID whose override entry is value-equal to ``defaults``
+        on every key the entry carries. Missing keys in the entry are
+        "no opinion" and don't block pruning. Returns a fresh dict."""
+        out = {}
+        for guid, entry in (overrides or {}).items():
+            if not isinstance(entry, dict) or not entry:
+                continue   # empty entries are also redundant — drop
+            if all(cls._values_equal(entry[k], defaults.get(k)) for k in entry):
+                continue   # value-equal to defaults → drop
+            out[guid] = entry
+        return out
 
     def _clear_override_for_selection(self) -> None:
         pm = project_manager()
@@ -4404,6 +4535,118 @@ class MeshTab(QWidget):
             more.setStyleSheet("color: #6c7086; font-size: 9pt; font-style: italic;")
             self._last_run_box_lay.addWidget(more)
         self._last_run_box.setVisible(True)
+
+    # -------------------------------------------------------------------------
+    # PATCH — re-emit dirty .assetinfo files
+    # -------------------------------------------------------------------------
+    # Mesh side of the F-9 patch worker. Spawns a WorkerThread that runs
+    # `IntegratedAssetProcessor.patch()`; only the mesh loop fires here
+    # (materials run in parallel from MaterialTab's button). See
+    # `mem:mesh_patch_worker/mesh_patch_worker_plan` §I.3.
+    # -------------------------------------------------------------------------
+
+    def _start_patch(self) -> None:
+        pm = project_manager()
+        proj = pm.current()
+        if proj is None:
+            QMessageBox.information(self, "Patch Meshes",
+                                     "Open a project first.")
+            return
+        ap_settings = proj.stage_settings("asset_processor")
+        source_root = ap_settings.get("source_path") or str(proj.scope_root or "")
+        output_root = ap_settings.get("output_path") or ""
+        if not source_root or not output_root:
+            QMessageBox.warning(
+                self, "Patch Meshes",
+                "Patch needs the Prefab Processor's source + output folders "
+                "(set on the Prefabs tab). Run the Prefab Processor at least "
+                "once before patching.",
+            )
+            return
+
+        mesh_settings = copy.deepcopy(proj.stage_settings(self.STAGE_KEY))
+        state_index   = copy.deepcopy(proj.outputs.get("state_index") or {})
+
+        self._patch_btn.setEnabled(False)
+        self._patch_worker = WorkerThread(
+            self._do_patch, source_root, output_root,
+            mesh_settings, state_index,
+        )
+        self._patch_worker.emitter.message.connect(self._on_patch_log)
+        self._patch_worker.finished.connect(self._on_patch_finished)
+        self._patch_worker.start()
+
+    def _do_patch(self, source_root: str, output_root: str,
+                   mesh_settings: dict, state_index: dict, log) -> str:
+        from integrated_asset_processor import IntegratedAssetProcessor
+        log("=" * 60)
+        log("PATCH — re-emit dirty meshes")
+        log("=" * 60)
+        cfg = get_config()
+        proc = IntegratedAssetProcessor(
+            Path(source_root), Path(output_root),
+            log_callback=log,
+            convert_smoothness_to_roughness=cfg["convert_smoothness_to_roughness"],
+            mesh_settings=mesh_settings,
+            state_index=state_index,
+        )
+        proj_name = (project_manager().current().name
+                     if project_manager().current() else "project")
+        proc.asset_hint_root = f"assets/{proj_name.lower().replace(' ', '_')}"
+        summary = proc.patch()
+        run_state = proc.state_index()
+        return json.dumps({
+            "dirty":         summary["meshes_dirty"],
+            "emitted":       summary["meshes_emitted"],
+            "need_reparse":  summary["meshes_need_reparse"],
+            "state":         run_state,
+        })
+
+    def _on_patch_log(self, msg: str) -> None:
+        # No dedicated log widget — surface via stdout so the worker's
+        # output joins the Prefab tab log via the shared log stream.
+        print(msg)
+
+    def _on_patch_finished(self, success: bool, payload: str) -> None:
+        self._patch_btn.setEnabled(True)
+        if not success:
+            QMessageBox.critical(self, "Patch Meshes",
+                                  f"Patch failed:\n{payload}")
+            return
+        try:
+            info = json.loads(payload)
+        except Exception:
+            info = {"dirty": [], "emitted": [], "need_reparse": [], "state": {}}
+        dirty        = info.get("dirty")        or []
+        emitted      = info.get("emitted")      or []
+        need_reparse = info.get("need_reparse") or []
+        run_state    = info.get("state")        or {}
+
+        pm = project_manager()
+        proj = pm.current()
+        if proj is not None and run_state:
+            existing = dict(proj.outputs.get("state_index") or {})
+            for bucket_name, bucket in run_state.items():
+                merged = dict(existing.get(bucket_name) or {})
+                merged.update(bucket)
+                existing[bucket_name] = merged
+            pm.update_outputs("state_index", existing)
+
+        # Result dialog — surface need_reparse separately so the user
+        # knows Run All is required for those.
+        lines = [f"{len(dirty)} dirty · {len(emitted)} re-emitted"]
+        if need_reparse:
+            lines.append(
+                f"⚠ {len(need_reparse)} mesh(es) need full Run All "
+                f"(cached node map missing or stale):"
+            )
+            lines.extend(f"  • {g}" for g in need_reparse[:10])
+        elif not dirty:
+            lines = ["No dirty meshes found."]
+        QMessageBox.information(self, "Patch Meshes", "\n".join(lines))
+
+        # Refresh inventory + markers.
+        self.apply_project(pm.current())
 
 
 def _wrap_layout(layout) -> QWidget:

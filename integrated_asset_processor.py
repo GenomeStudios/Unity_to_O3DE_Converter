@@ -699,10 +699,18 @@ class IntegratedAssetProcessor:
                 )
                 # F-9.I.4 — record mesh fingerprint AFTER the assetinfo
                 # exists on disk so the recorded output_files list includes
-                # both the .fbx copy and the .assetinfo sidecar.
+                # both the .fbx copy and the .assetinfo sidecar. The cached
+                # entity-node maps + fbx_stem are what the Patch worker
+                # replays at re-emit time without re-parsing every prefab
+                # (see `mem:mesh_patch_worker/mesh_patch_worker_plan` §I.1).
                 source_mesh_path = self.asset_db.resolve_guid(mesh_guid)
                 if source_mesh_path is not None:
-                    self._record_mesh_state(mesh_guid, source_mesh_path, fbx_path)
+                    self._record_mesh_state(
+                        mesh_guid, source_mesh_path, fbx_path,
+                        fbx_stem=fbx_stem,
+                        entity_node_map=entity_node_map,
+                        collider_entity_node_map=collider_entity_node_map,
+                    )
 
                 for go in entity_list:
                     if go.file_id in node_paths:
@@ -791,21 +799,32 @@ class IntegratedAssetProcessor:
         Compares each saved entry in `state_index_in` against a recomputed
         current input_hash. Mismatches are dirty: their cache is cleared
         and they're re-processed, which records a fresh entry in
-        `state_index_out`. Returns a summary `{materials_dirty, materials_emitted}`.
+        `state_index_out`.
 
-        Scope: materials only in F-9. The two stretch cases are deferred:
-          - Mesh-only patches need a per-FBX re-entry point that rebuilds
-            entity_node_map without the prefab parse. The patch worker
-            could call write_fbx_assetinfo directly if the entity map were
-            cached per-mesh in state_index; not in F-9 scope.
-          - Prefab patches go via the orchestrator's "re-run dirty prefabs"
-            path in F-8, which calls process_prefab(...) on each dirty
-            prefab's source. That re-touches dependent materials/meshes
-            naturally.
+        Scope:
+          - **Materials** — hash diff on `{profile, override}` + missing
+            outputs. Re-emit via ``_process_material``.
+          - **Meshes** — hash diff on `mesh_settings_effective` + missing
+            outputs. Re-emit via ``write_fbx_assetinfo`` using the cached
+            ``entity_node_map`` / ``collider_entity_node_map`` /
+            ``fbx_stem`` stored on the state-index entry. See
+            `mem:mesh_patch_worker/mesh_patch_worker_plan` §I.2.
+          - **Prefabs** — deferred. Go via the orchestrator's
+            "re-run dirty prefabs" path in F-8, which calls
+            ``process_prefab(...)`` on each dirty prefab's source.
+
+        Returns a summary with keys: ``materials_dirty``,
+        ``materials_emitted``, ``meshes_dirty``, ``meshes_emitted``,
+        ``meshes_need_reparse``. The last bucket lists meshes whose
+        cached node map went stale (FBX nodes renamed) — Run All is the
+        recovery path.
         """
         summary: Dict[str, list] = {
-            "materials_dirty":   [],
-            "materials_emitted": [],
+            "materials_dirty":     [],
+            "materials_emitted":   [],
+            "meshes_dirty":        [],
+            "meshes_emitted":      [],
+            "meshes_need_reparse": [],
         }
         saved_materials = (self._state_index_in or {}).get("materials") or {}
 
@@ -859,11 +878,146 @@ class IntegratedAssetProcessor:
             if result is not None:
                 summary["materials_emitted"].append(guid)
 
+        # ----- Mesh loop ----------------------------------------------------
+        # Mirrors the material loop: hash diff + missing-output check +
+        # in-engine modification covered by missing-output (since touching
+        # the file in editor doesn't drop it).
+        self._patch_meshes(summary)
+
         self.log(
-            f"  Patch: {len(summary['materials_dirty'])} dirty, "
-            f"{len(summary['materials_emitted'])} re-emitted"
+            f"  Patch: materials {len(summary['materials_dirty'])} dirty / "
+            f"{len(summary['materials_emitted'])} re-emitted; "
+            f"meshes {len(summary['meshes_dirty'])} dirty / "
+            f"{len(summary['meshes_emitted'])} re-emitted "
+            f"({len(summary['meshes_need_reparse'])} need full reparse)"
         )
         return summary
+
+    def _patch_meshes(self, summary: Dict[str, list]) -> None:
+        """Mesh dirty-detect + assetinfo re-emit. Populates the three
+        mesh-keyed buckets on ``summary``.
+
+        Soundness gate: a saved entry without the cached
+        ``entity_node_map`` cannot be patched (no map to replay). Those
+        entries land in ``meshes_need_reparse`` and skip — one Run All
+        repopulates them with the full set of fields. The same bucket
+        catches the rare "FBX nodes were renamed in Unity" case where
+        the cached map references nodes that no longer exist.
+        """
+        import shutil
+
+        saved_meshes = (self._state_index_in or {}).get("meshes") or {}
+        if not saved_meshes:
+            return
+
+        platform_correction = getattr(self.platform, "correction_quat", None)
+
+        for guid, saved_entry in saved_meshes.items():
+            source_path_str = saved_entry.get("source_path") or ""
+            if not source_path_str:
+                continue
+            source_path = Path(source_path_str)
+            if not source_path.exists():
+                # Source disappeared — orphan cleanup is a future feature.
+                continue
+
+            output_files = saved_entry.get("output_files") or []
+            if not output_files:
+                continue
+            fbx_path = Path(output_files[0])
+
+            # Hash diff vs current effective mesh_settings.
+            eff = _resolve_mesh_settings(self._mesh_settings, guid)
+            payload = {
+                "asset_kind":    "mesh",
+                "source_path":   str(source_path),
+                "source_mtime":  self._mtime_or_zero(source_path),
+                "mesh_settings": eff,
+            }
+            current_hash = self._canonical_hash(payload)
+            saved_hash   = saved_entry.get("input_hash") or ""
+
+            outputs_missing = any(not Path(p).exists() for p in output_files)
+            if current_hash == saved_hash and not outputs_missing:
+                continue   # clean
+
+            summary["meshes_dirty"].append(guid)
+
+            entity_node_map          = dict(saved_entry.get("entity_node_map") or {})
+            collider_entity_node_map = dict(saved_entry.get("collider_entity_node_map") or {})
+            fbx_stem                 = saved_entry.get("fbx_stem") or ""
+
+            if not entity_node_map or not fbx_stem:
+                # Pre-I.1 entry, or one written by older code. Cannot
+                # replay without re-parsing the prefab — flag it.
+                summary["meshes_need_reparse"].append(guid)
+                self.log(
+                    f"  [Patch] WARNING: mesh {guid[:8]}… has no cached "
+                    f"entity_node_map — needs full Run All to repopulate."
+                )
+                continue
+
+            # Soundness check: cached node-path values must reference
+            # nodes that still exist in the current FBX.
+            current_node_names = set()
+            if fbx_path.exists():
+                try:
+                    current_node_names = set(read_fbx_mesh_node_names(fbx_path))
+                except Exception:
+                    current_node_names = set()
+            stale_paths = [
+                v for v in entity_node_map.values()
+                if v and v.split(".")[-1] not in current_node_names
+                and v.split(".")[-1] != fbx_stem
+            ]
+            if current_node_names and stale_paths:
+                summary["meshes_need_reparse"].append(guid)
+                self.log(
+                    f"  [Patch] WARNING: mesh {guid[:8]}… FBX node names "
+                    f"changed (stale: {stale_paths[:3]}) — needs full "
+                    f"Run All to re-derive node paths."
+                )
+                continue
+
+            # Re-copy the source FBX if its mtime advanced since last emit.
+            saved_mtime = float(saved_entry.get("source_mtime") or 0.0)
+            current_mtime = self._mtime_or_zero(source_path)
+            if current_mtime > saved_mtime and fbx_path.exists():
+                try:
+                    fbx_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source_path, fbx_path)
+                except Exception as exc:
+                    self.log(
+                        f"  [Patch] ERROR: failed to re-copy FBX "
+                        f"{source_path.name}: {exc}"
+                    )
+                    continue
+
+            # Re-emit the .assetinfo with current mesh_settings.
+            try:
+                write_fbx_assetinfo(
+                    fbx_path, fbx_stem, entity_node_map, self.log,
+                    collider_entity_node_map=collider_entity_node_map or None,
+                    mesh_settings=self._mesh_settings,
+                    mesh_guid=guid,
+                    correction_quat=platform_correction,
+                )
+            except Exception as exc:
+                self.log(
+                    f"  [Patch] ERROR: failed to re-emit assetinfo for "
+                    f"{fbx_path.name}: {exc}"
+                )
+                continue
+
+            # Refresh the state-index entry (input_hash, last_emitted,
+            # output_files reflect the post-patch state).
+            self._record_mesh_state(
+                guid, source_path, fbx_path,
+                fbx_stem=fbx_stem,
+                entity_node_map=entity_node_map,
+                collider_entity_node_map=collider_entity_node_map,
+            )
+            summary["meshes_emitted"].append(guid)
 
     def to_outputs(self) -> dict:
         """Consolidate this run's bookkeeping into the dict the project
@@ -1076,7 +1230,16 @@ class IntegratedAssetProcessor:
         }
 
     def _record_mesh_state(self, guid: str, source_path: Path,
-                            output_path: Path) -> None:
+                            output_path: Path,
+                            fbx_stem: str = "",
+                            entity_node_map: Optional[Dict[str, str]] = None,
+                            collider_entity_node_map: Optional[Dict[str, str]] = None,
+                            ) -> None:
+        """Record a mesh's fingerprint + the cached entity-node maps the
+        Patch worker needs to re-emit `.assetinfo` without re-parsing
+        every consumer prefab. ``fbx_stem`` + the two maps are the
+        cached subset of prefab-parse state — see
+        `mem:mesh_patch_worker/mesh_patch_worker_plan` §I.1."""
         eff = _resolve_mesh_settings(self._mesh_settings, guid)
         assetinfo = Path(str(output_path) + ".assetinfo")
         payload = {
@@ -1089,11 +1252,14 @@ class IntegratedAssetProcessor:
         if assetinfo.exists():
             outputs.append(str(assetinfo))
         self._state_index_out["meshes"][guid] = {
-            "source_path":  str(source_path),
-            "source_mtime": payload["source_mtime"],
-            "output_files": outputs,
-            "input_hash":   self._canonical_hash(payload),
-            "last_emitted": _utc_now_iso(),
+            "source_path":              str(source_path),
+            "source_mtime":             payload["source_mtime"],
+            "output_files":             outputs,
+            "input_hash":               self._canonical_hash(payload),
+            "last_emitted":             _utc_now_iso(),
+            "fbx_stem":                 fbx_stem,
+            "entity_node_map":          dict(entity_node_map or {}),
+            "collider_entity_node_map": dict(collider_entity_node_map or {}),
         }
 
     def _record_prefab_state(self, guid: str, source_path: Path,
