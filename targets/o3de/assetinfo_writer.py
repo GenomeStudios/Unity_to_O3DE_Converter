@@ -119,24 +119,32 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
     Group name format: "{fbx_stem}-{entity_name}"  e.g. "Closet_A-Glass_L"
     O3DE lowercases the output: closet_a-glass_l.fbx.azmodel
 
-    Each group selects exactly its FBX node; all other mesh nodes are unselected.
-    Rules mirror O3DE's auto-generated defaults: StaticMeshAdvancedRule (vertex color Col0),
-    MaterialRule, CoordinateSystemRule (useAdvancedData=true), and LodRule.
-    Y-up FBX files (Maya-style, up_axis==1) get a 90° pitch rotation baked into
-    the CoordinateSystemRule so the mesh imports upright without a transform workaround.
+    Each group selects exactly its FBX node; all other mesh nodes are
+    unselected. Rules mirror O3DE's auto-generated defaults:
+    StaticMeshAdvancedRule (vertex color Col0), MaterialRule,
+    CoordinateSystemRule (useAdvancedData=true), and LodRule.
 
-    F-9 mesh settings (defaults + overrides) layer on top of the Y-up
-    correction. `default_rotation` is XYZ Euler degrees, converted to a
-    quaternion and composed with the Y-up quaternion so the user transform
-    sits in mesh-local space. `default_position` is a metric translation —
-    written into the CoordinateSystemRule only when `zero_position=True`
-    (the documented "zero on import, then offset by default_position"
-    behaviour). When `zero_position=False` no translation field is emitted,
-    so the source FBX node transform passes through.
+    Rotation/translation are written **directly from mesh_settings**.
+    The earlier behaviour composed the user's rotation with a Y-up→Z-up
+    correction quaternion when the source FBX was Y-up; that legacy
+    auto-correction has been removed (2026-05-27). With per-mesh
+    defaults + overrides now part of the workflow, the user authors
+    whatever rotation they need explicitly: ``default_rotation``
+    [90, 0, 0] writes a 90°-X rotation, full stop. ``correction_quat``
+    is retained as a parameter for plugin authors who want to opt in
+    to a different default composition later but it is **not applied
+    by the writer**.
 
-    When collider_entity_node_map is provided, one PhysX convex MeshGroup is also
-    written per collider entity, targeting the parent node of the visual mesh node.
-    This produces the .pxmesh file that EditorMeshColliderComponent references.
+    ``default_position`` is a metric translation — written into the
+    CoordinateSystemRule only when ``zero_position=True`` (the
+    documented "zero on import, then offset by default_position"
+    behaviour). When ``zero_position=False`` no translation field is
+    emitted, so the source FBX node transform passes through.
+
+    When collider_entity_node_map is provided, one PhysX convex
+    MeshGroup is also written per collider entity, targeting the parent
+    node of the visual mesh node. This produces the .pxmesh file that
+    EditorMeshColliderComponent references.
     """
     import json as _json
     import uuid as _uuid
@@ -146,11 +154,12 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
     # at call time to avoid a circular import during module load.
     from integrated_asset_processor import read_fbx_up_axis
 
-    # Detect Y-up FBX — up_axis==1 means Y-up (Maya), 2 means Z-up (matches O3DE)
+    # Up-axis is logged for visibility but no longer drives an auto
+    # correction. The user authors rotation explicitly via mesh_settings.
     up_axis = read_fbx_up_axis(fbx_dest_path)
-    is_y_up = (up_axis == 1)
-    if is_y_up:
-        log(f"    [Mesh] Y-up detected — adding 90° pitch to CoordinateSystemRule")
+    if up_axis == 1:
+        log("    [Mesh] Y-up FBX detected (informational — no auto-correction "
+            "is applied; set default_rotation in mesh settings if needed).")
 
     # F-9 — resolve the per-mesh settings chain (defaults + override).
     eff = _resolve_mesh_settings(mesh_settings, mesh_guid)
@@ -160,23 +169,9 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
     has_user_rotation = any(abs(float(v)) > 1e-6 for v in user_rot)
     has_user_translation = any(abs(float(v)) > 1e-6 for v in user_pos)
 
-    # Platform-supplied correction quaternion. Defaults to Unity's
-    # Y-up → Z-up correction so callers that pre-date the parameter
-    # keep working. Plugins targeting other engines (Unreal, Godot,
-    # Blender, …) pass their own quaternion here.
-    correction = list(correction_quat) if correction_quat else list(Y_UP_ROTATION)
-
     coordinate_rule = {"$type": "CoordinateSystemRule", "useAdvancedData": True}
-    # Compose rotation: source-axis correction first (mesh-local), then
-    # user rotation. Result quaternion is q_user ⊗ q_correction so the
-    # user's authored transform applies in the corrected coordinate space.
-    if is_y_up and has_user_rotation:
-        coordinate_rule["rotation"] = _quat_mul(
-            _euler_deg_to_quat(user_rot), correction,
-        )
-    elif is_y_up:
-        coordinate_rule["rotation"] = correction
-    elif has_user_rotation:
+    # Direct mapping: the user's Euler degrees become the rule quaternion.
+    if has_user_rotation:
         coordinate_rule["rotation"] = _euler_deg_to_quat(user_rot)
     # Translation only when zero_position=True. zero_position=False explicitly
     # opts out of having the assetinfo touch position at all.

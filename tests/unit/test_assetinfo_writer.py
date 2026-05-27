@@ -120,9 +120,12 @@ def test_zero_position_false_suppresses_translation():
             f"zero_position=False should suppress translation: {rule}"
 
 
-def test_y_up_correction_composes_with_user_rotation():
-    """Y-up FBX (mocked via monkeypatched up-axis reader) + user
-    rotation → composed quaternion."""
+def test_y_up_does_not_auto_correct_rotation():
+    """The legacy Y-up auto-correction has been removed (2026-05-27).
+    Even when the source FBX is detected as Y-up, the writer emits the
+    user's authored rotation directly, with NO composition with the
+    platform's correction quaternion. The user authors whatever
+    rotation they want via mesh_settings."""
     settings = {
         "defaults":  {"zero_position": True, "default_position": [0, 0, 0],
                       "default_rotation": [0, 90, 0]},
@@ -140,8 +143,37 @@ def test_y_up_correction_composes_with_user_rotation():
         finally:
             iap.read_fbx_up_axis = original
         rule = _read_coord_rule(Path(str(fbx) + ".assetinfo"))
-        expected = _quat_mul(_euler_deg_to_quat([0, 90, 0]), Y_UP_ROTATION)
-        assert _quat_close(rule["rotation"], expected)
+        # Direct mapping — 90° Y → quaternion = [0, sin45, 0, cos45].
+        s = math.sin(math.radians(45))
+        c = math.cos(math.radians(45))
+        assert _quat_close(rule["rotation"], [0, s, 0, c]), \
+            f"Y-up FBX should NOT compose with correction; got {rule['rotation']}"
+
+
+def test_zero_user_rotation_on_y_up_writes_no_rotation():
+    """Y-up FBX + zero user rotation → CoordinateSystemRule has no
+    rotation field at all. The legacy auto-correction would have
+    injected the Y_UP_ROTATION quaternion here; the new behaviour
+    leaves the rule rotation absent."""
+    settings = {
+        "defaults":  {"zero_position": True, "default_position": [0, 0, 0],
+                      "default_rotation": [0, 0, 0]},
+        "overrides": {},
+    }
+    with tempfile.TemporaryDirectory() as td:
+        fbx = Path(td) / "Foo.fbx"
+        write_fake_fbx(fbx)
+        original = iap.read_fbx_up_axis
+        iap.read_fbx_up_axis = lambda _p: 1  # type: ignore[assignment]
+        try:
+            write_fbx_assetinfo(fbx, "Foo", {"Cube": "RootNode.Foo.Cube"},
+                                 log=lambda *_: None,
+                                 mesh_settings=settings, mesh_guid="mesh-x")
+        finally:
+            iap.read_fbx_up_axis = original
+        rule = _read_coord_rule(Path(str(fbx) + ".assetinfo"))
+        assert "rotation" not in rule, \
+            f"zero user rotation on Y-up should leave no rotation field; got {rule}"
 
 
 def test_physx_group_inherits_composed_rule():

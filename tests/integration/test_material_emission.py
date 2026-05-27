@@ -71,6 +71,49 @@ def test_default_profile_emits_standardpbr():
         _cleanup(td)
 
 
+def test_state_index_records_profile_provenance():
+    """The state-index entry for an emitted material carries
+    `profile_name` and `shader_name` so the MaterialTab tooltip can
+    surface which F-9 profile produced this .material on disk."""
+    settings = {
+        "defaults":        {"profile": DEFAULT_PROFILE_NAME},
+        "shader_profiles": {DEFAULT_PROFILE_NAME: dict(DEFAULT_SHADER_PROFILE)},
+        "shader_mappings": {"CustomPack/Foo": DEFAULT_PROFILE_NAME},
+        "overrides":       {},
+    }
+    _body, proc, td = _emit_with_settings(settings)
+    try:
+        entry = proc.state_index()["materials"][GUIDS["material"]]
+        assert entry["profile_name"] == DEFAULT_PROFILE_NAME, entry
+        assert entry["shader_name"]  == "CustomPack/Foo", entry
+    finally:
+        _cleanup(td)
+
+
+def test_state_index_provenance_blank_in_legacy_fallback():
+    """No `material_settings` supplied → legacy hardcoded extraction
+    path → the state-index entry's provenance fields are blank,
+    so the MaterialTab tooltip can show "Last emitted via legacy
+    hardcoded path"."""
+    td = tempfile.mkdtemp(prefix="u2o_legacy_prov_")
+    try:
+        unity = Path(td) / "unity"
+        out   = Path(td) / "out"
+        build_unity_tree(unity)
+        out.mkdir()
+        proc = IntegratedAssetProcessor(
+            unity, out, log_callback=lambda *_: None,
+            # No material_settings — legacy mode.
+        )
+        proc.asset_hint_root = "assets/test"
+        proc._process_material(GUIDS["material"])
+        entry = proc.state_index()["materials"][GUIDS["material"]]
+        assert entry["profile_name"] == "", entry
+        assert entry["shader_name"]  == "CustomPack/Foo", entry
+    finally:
+        _cleanup(td)
+
+
 def test_divergent_profile_via_shader_mapping():
     """An explicit mapping for the shader routes the material through
     a divergent profile with a custom target_materialtype."""

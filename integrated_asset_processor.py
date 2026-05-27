@@ -1119,19 +1119,31 @@ class IntegratedAssetProcessor:
 
     def _resolve_profile_for_material(self, material_guid: str,
                                        shader_name: str) -> Optional[Dict]:
-        """F-9 profile chain resolver:
+        """F-9 profile chain resolver — see :meth:`_resolve_profile_name_for_material`
+        for the lookup precedence. Returns the profile DICT only;
+        callers that need the profile *name* (for provenance / state-
+        index recording) should use the sibling method."""
+        return self._resolve_profile_name_for_material(material_guid, shader_name)[1]
+
+    def _resolve_profile_name_for_material(self, material_guid: str,
+                                            shader_name: str
+                                            ) -> Tuple[str, Optional[Dict]]:
+        """F-9 profile chain resolver returning ``(profile_name, profile_dict)``.
 
             overrides[guid].profile
               → shader_mappings[shader_name]
               → defaults.profile
 
-        Returns the profile dict from `material_settings.shader_profiles`,
-        or None when no settings were supplied (legacy mode — extraction
-        falls back to the hard-coded TEXTURE_MAP / PROPERTY_MAP path).
+        ``profile_name`` is the empty string when no settings were
+        supplied (legacy mode — extraction falls back to the
+        hard-coded TEXTURE_MAP / PROPERTY_MAP path) or when the chain
+        resolved no name. The two are returned together so the state-
+        index recorder can record provenance without re-walking the
+        chain.
         """
         settings = self._material_settings or {}
         if not settings:
-            return None
+            return "", None
         profiles = settings.get("shader_profiles") or {}
 
         overrides = settings.get("overrides") or {}
@@ -1147,8 +1159,8 @@ class IntegratedAssetProcessor:
             profile_name = defaults.get("profile") or ""
 
         if not profile_name:
-            return None
-        return profiles.get(profile_name)
+            return "", None
+        return profile_name, profiles.get(profile_name)
 
     def _resolve_effective_materialtype(self, material_guid: str,
                                          profile: Optional[Dict]) -> str:
@@ -1196,7 +1208,16 @@ class IntegratedAssetProcessor:
 
     def _record_material_state(self, guid: str, source_path: Path,
                                 output_path: Path,
-                                profile: Optional[Dict]) -> None:
+                                profile: Optional[Dict],
+                                profile_name: str = "",
+                                shader_name: str = "") -> None:
+        """Record fingerprint + F-9 provenance on the material's
+        state-index entry. ``profile_name`` and ``shader_name`` are
+        recorded as plain strings so the MaterialTab can surface
+        "last emitted by profile X (shader Y)" in the row tooltip — the
+        user's way to verify a .material on disk was produced by the
+        F-9 chain rather than legacy hardcoded extraction. Empty
+        strings mean "no profile resolved" (legacy fall-back path)."""
         override_entry = (self._material_settings.get("overrides") or {}).get(guid) or {}
         payload = {
             "asset_kind":   "material",
@@ -1211,6 +1232,8 @@ class IntegratedAssetProcessor:
             "output_files": [str(output_path)],
             "input_hash":   self._canonical_hash(payload),
             "last_emitted": _utc_now_iso(),
+            "profile_name": profile_name,
+            "shader_name":  shader_name,
         }
 
     def _record_texture_state(self, guid: str, source_path: Path,
@@ -1323,7 +1346,8 @@ class IntegratedAssetProcessor:
         shader_guid = shallow.get("shader_guid", "") or ""
         shader_fid  = shallow.get("shader_fileid", 0) or 0
         shader_name = self._resolve_shader_name(shader_guid, shader_fid)
-        profile     = self._resolve_profile_for_material(material_guid, shader_name)
+        profile_name, profile = self._resolve_profile_name_for_material(
+            material_guid, shader_name)
         if profile is not None:
             material_data = self.asset_db.parse_material(material_path, profile=profile)
             if not material_data:
@@ -1468,8 +1492,13 @@ class IntegratedAssetProcessor:
             "source_stem":    material_path.stem,
             "textures_bound": sorted(texture_paths.keys()),
         }
-        # F-9.I.4 — record fingerprint for the patch worker.
-        self._record_material_state(material_guid, material_path, output_path, profile)
+        # F-9.I.4 — record fingerprint for the patch worker, with the
+        # resolved profile name + shader name as provenance so the
+        # MaterialTab tooltip can show "last emitted by profile X".
+        self._record_material_state(
+            material_guid, material_path, output_path, profile,
+            profile_name=profile_name, shader_name=shader_name,
+        )
 
         self.log(f"      ✓ Created material with {len(texture_paths)} textures")
 

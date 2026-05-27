@@ -1,6 +1,6 @@
 # Unity-to-O3DE Converter — Working Status (last touched 2026-05-27)
 
-Note: this memory is a long-form snapshot of converter behaviour. Most sections describe the Unity → O3DE pipeline at a level of detail that survives refactors. File paths reflect post-Pass-2 reality: the Stage-2 scene converter and the Stage-3 terrain processor now live under `platforms/unity/`. See `mem:pass2_consolidation/working_documentation` for the migration log.
+Note: this memory is a long-form snapshot of converter behaviour. Most sections describe the Unity → O3DE pipeline at a level of detail that survives refactors. File paths reflect post-Pass-2 reality: the Stage-2 scene converter and the Stage-3 terrain processor now live under `platforms/unity/`. See `mem:pass2_consolidation/working_documentation` for the migration log and `mem:mesh_patch_worker/working_documentation` for the F-9 mesh patch worker landing.
 
 ## Project Overview
 Two-stage automated converter: Unity graphical assets/prefabs → O3DE prefabs, then Unity scenes → O3DE levels. The platform-abstraction refactor moved Unity-specific parsers into `platforms/unity/` and standardised on a `SourcePlatform` plugin contract; Pass-2 (2026-05-27) finished the migration by moving the Stage-2 scene converter and Stage-3 terrain processor into the same package and dropping the `components/` re-export shim.
@@ -41,15 +41,16 @@ Component processors live in `platforms/unity/components/`; auto-discovery is ro
   - F-9 shader profiles can override texture_map / property_map per Unity shader; the legacy hard-coded map lives in `DEFAULT_SHADER_PROFILE` and is used as the fallback chain root.
   - Writes `.material` files using `StandardPBR.materialtype`
   - Material file names **preserve case** from Unity source (e.g. `Door_MetalDark.azmaterial`)
+  - **Provenance recording** (added 2026-05-27): every emitted material's state-index entry carries `profile_name` and `shader_name` so the MaterialTab tooltip can surface which F-9 profile produced this `.material` on disk. Empty `profile_name` means the legacy hardcoded extraction path was used (no `material_settings` supplied). Missing state-index entry means the file was never emitted by this converter.
 - **Multi-material slots**: `EditorMaterialComponent` emits `{}` (default slot) + `{0}`, `{1}`, ... indexed slots matching Unity MeshRenderer material list order ✓
 - **O3DE prefab generation**: `targets.o3de.prefab_writer.create_o3de_prefab` builds valid `.prefab` JSON with container entity + child entities
 - **Nested prefab instances**: `parse_prefab_instance_in_prefab` and `create_nested_prefab_instance` handle prefabs-within-prefabs
-- **State index + Patch worker** (F-9): per-asset sha256 input fingerprints under `outputs.state_index`; Patch worker re-emits only dirty assets
-- **In-engine modification detection** (F-9.I.6b): mtime vs `last_emitted` (with 1s tolerance) flags assets edited in-engine since last patch
+- **State index + Patch worker** (F-9 + mesh extension 2026-05-27): per-asset sha256 input fingerprints under `outputs.state_index`. Patch worker re-emits dirty **materials AND meshes**. Mesh patch path replays the cached `entity_node_map` + `fbx_stem` stored on the state-index entry to call `write_fbx_assetinfo` without re-parsing every consumer prefab. Soundness gate detects renamed FBX nodes and recommends Run All for those. See `mem:mesh_patch_worker/working_documentation`.
+- **In-engine modification detection** (F-9.I.6b): mtime vs `last_emitted` (with 1s tolerance) flags assets edited in-engine since last patch. Both MaterialTab and MeshTab surface ✎ markers and a Patch button that overwrites (the "scrub" workflow).
 - **FBX .assetinfo generation**:
   - Per-entity named MeshGroups: one group per mesh entity, `{FBX_stem}-{entity_name}` format → predictable assetHint
   - `build_fbx_node_paths`: maps entity file_ids to `RootNode.ModelName.ChildName` FBX paths
-  - `write_fbx_assetinfo`: writes Y-up CoordinateSystemRule (per-mesh, complementing the per-Transform swizzle); takes `correction_quat` from the platform plugin
+  - `write_fbx_assetinfo`: writes a `CoordinateSystemRule` from the user's `mesh_settings.default_rotation` (Euler XYZ degrees) **directly** — no auto-composition. The legacy Y-up→Z-up auto-correction was removed 2026-05-27 because per-mesh defaults + overrides now let the user author rotation explicitly, and the auto-correction overcompensated. Y-up detection is retained only for an informational log line. `correction_quat` is still accepted as a writer parameter for future plugins to opt into but it is not applied.
   - `read_fbx_hierarchy` (binary FBX parser): extracts Model/Geometry/Material/LayerElement sub-objects (UV channels, vertex color layers) for full selectedNodes lists
 - **Shape component defaults**: `EditorBoxShapeComponent` emits `DisplayFilled: false` + `IsFilled: false`; all shape colliders emit `DebugDrawSettings: {LocallyEnabled: false}`
 
@@ -83,7 +84,7 @@ Unity → O3DE axis swap:
 - Scale: `(sx, sz, sy)`
 - Shape collider centers: `(cx, cz, cy)` — **no X negation**
 
-Canonical implementation lives in `targets.o3de.prefab_writer.convert_to_o3de_coordinates`. Stage 2's `UnitySceneConverter.convert_to_o3de_coordinates` delegates to it post-Pass-2-I.4 (the local duplicate was deleted). The `platforms/unity/coordinates.py` constant `UNITY_Y_UP_TO_O3DE_Z_UP_QUAT` carries the per-mesh CoordinateSystemRule quaternion.
+Canonical implementation lives in `targets.o3de.prefab_writer.convert_to_o3de_coordinates`. Stage 2's `UnitySceneConverter.convert_to_o3de_coordinates` delegates to it post-Pass-2-I.4 (the local duplicate was deleted). The `platforms/unity/coordinates.py` constant `UNITY_Y_UP_TO_O3DE_Z_UP_QUAT` is still defined as the platform's correction quaternion but is no longer applied by `write_fbx_assetinfo` after 2026-05-27 — see Stage-1 FBX .assetinfo bullet.
 
 ### Prefab Root Transform — Discarded on Inner Root (added 2026-05-26)
 Unity prefabs are always rooted at a single GameObject whose stored transform is dead data: Unity records every PrefabInstance modification as the FINAL `m_LocalPosition` / `m_LocalRotation` / `m_LocalScale`, not a delta on top of the prefab root. Preserving the root GO's stored transform on the converted prefab's inner root entity caused a double-offset (consumer's ContainerEntity patch positioned the world placement, then the inner root entity added the Unity-stored bake on top — observed as 800-unit offsets in the field).
@@ -101,7 +102,7 @@ Caveat: if a Unity prefab root has an intentionally non-identity scale (rare for
 - **User reports**: collision/rigidbody may have bugs in component linkage; shape offsets need field verification
 
 ### Known Issues ✗
-- **Mesh coordinate / pivot**: Unity internally rebakes mesh coordinates. Coordinate conversion handles Y-up→Z-up swap correctly now (no X negation), but Unity's internal mesh pivot bake vs raw FBX coordinates can still cause offsets on some assets.
+- **Mesh coordinate / pivot**: Unity internally rebakes mesh coordinates. Coordinate conversion handles Y-up→Z-up swap correctly now (no X negation), but Unity's internal mesh pivot bake vs raw FBX coordinates can still cause offsets on some assets. As of 2026-05-27 the user is expected to author the per-mesh correction explicitly via `mesh_settings.default_rotation` rather than relying on the auto Y-up correction (which was removed).
 - **Non-uniform scale**: `EditorNonUniformScaleComponent` is written when scale is non-uniform. Uniform scale path writes `scale[0]` as scalar. End-to-end verification not complete.
 - **Material pipeline**: Specular workflow, detail maps, some edge-case shader properties not yet mapped — F-9 profile editor (F-10) is the planned authoring tool for filling these gaps.
 - **assetinfo sub-object paths**: `read_fbx_hierarchy` implemented but full wiring of sub-paths (UVChannel, material nodes) into `selectedNodes` in `write_fbx_assetinfo` still in progress.
@@ -160,6 +161,10 @@ Canonical home: `platforms/unity/types.py`. Both Stage-1 worker and Stage-2 scen
 ```
 The project file `.u2oproj.json` carries `outputs.{asset_processor,scene_converter,terrain}.state_index` and per-stage `entity_maps`, `asset_index`, `coverage`. Converter bookkeeping no longer lands as sidecars on disk.
 
+State-index entry shapes:
+- `materials[guid]`: `{source_path, source_mtime, output_files, input_hash, last_emitted, profile_name, shader_name}`.
+- `meshes[guid]`: `{source_path, source_mtime, output_files, input_hash, last_emitted, fbx_stem, entity_node_map, collider_entity_node_map}` — the last three populated 2026-05-27 to support mesh-only patching.
+
 ---
 
 ## Override emission tiers (Stage 1 + Stage 2 nested/scene instances)
@@ -200,3 +205,5 @@ Sibling-field accounting (`m_AddedComponents`, `m_RemovedComponents`, `m_AddedGa
 7. F-10 profile editor UI for filling out the shader-profile library.
 8. Full Unity-parser unification (see Pass-2 I.4 deferred note) — needs a flag on the canonical parser to support both scene-placement and nested-reference PrefabInstance semantics.
 9. Non-uniform scale end-to-end verification.
+10. Per-row "force re-emit this mesh" button on MeshTab (tab-level Patch already exists).
+11. Smarter FBX node-rename handling for mesh patch worker (re-derive cached map rather than failing to "needs reparse").

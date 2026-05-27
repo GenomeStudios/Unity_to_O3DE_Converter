@@ -1600,15 +1600,19 @@ class StageStatusCard(QFrame):
     open_clicked    = Signal()
     process_clicked = Signal()
 
-    def __init__(self, stage_name: str):
+    def __init__(self, stage_name: str, *, action_label: str = "Process"):
         super().__init__()
         self.setObjectName("stage_status_card")
+        # Empty action_label hides the button entirely — used for stages
+        # whose status card has no meaningful one-shot action (or whose
+        # action label flips dynamically via ``set_action_label``).
+        self._action_label_default = action_label
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(12, 10, 12, 12)
         outer.setSpacing(6)
 
-        # --- Banner row: name + status + Process + Open ▸ ------------------
+        # --- Banner row: name + status + <action> + Open ▸ -----------------
         banner = QHBoxLayout()
         banner.setSpacing(10)
         self._name_label = QLabel(stage_name)
@@ -1618,10 +1622,11 @@ class StageStatusCard(QFrame):
         self._status_label.setObjectName("stage_card_status")
         banner.addWidget(self._status_label)
         banner.addStretch(1)
-        self._process_btn = QPushButton("Process")
+        self._process_btn = QPushButton(action_label or "Process")
         self._process_btn.setObjectName("stage_card_process")
         self._process_btn.setCursor(Qt.PointingHandCursor)
         self._process_btn.clicked.connect(self.process_clicked.emit)
+        self._process_btn.setVisible(bool(action_label))
         banner.addWidget(self._process_btn)
         self._open_btn = QPushButton("Open ▸")
         self._open_btn.setObjectName("stage_card_open")
@@ -1720,7 +1725,33 @@ class StageStatusCard(QFrame):
             f"border-top: 1px solid #313244;"
         )
 
+        # Default enable: stage can run when settings + outputs reach a
+        # non-trivial sync state. ``set_action_label`` callers (e.g. the
+        # mesh/material patch cards) override via ``set_action_enabled``
+        # after this default fires.
         self._process_btn.setEnabled(sstate not in ("unconfigured", "writing", "error"))
+
+    # -------------------------------------------------------------------------
+    # ACTION BUTTON CONTROL
+    # -------------------------------------------------------------------------
+    # The stage card's action button text + visibility + enable state are
+    # owned by the host (DashboardTab) since the meaning differs per stage:
+    # full-pipeline stages (Scenes / Prefabs / Terrain) say "Process" and
+    # gate on sync-state; iterative stages (Meshes / Materials) say
+    # "Patch Dirty" and gate on whether the state-index says anything is
+    # actually dirty. Cards with no actionable surface hide the button.
+
+    def set_action_label(self, label: str) -> None:
+        """Re-label the action button. Empty string hides the button."""
+        self._process_btn.setText(label or "")
+        self._process_btn.setVisible(bool(label))
+
+    def set_action_enabled(self, enabled: bool, *, tooltip: str = "") -> None:
+        """Force-set the action button's enabled state. Overrides the
+        default sync-state gate (called after ``update_state``)."""
+        self._process_btn.setEnabled(enabled)
+        if tooltip:
+            self._process_btn.setToolTip(tooltip)
 
 
 def compute_stage_readiness(stage_key: str, project) -> dict:
@@ -2142,23 +2173,73 @@ def compute_stage_sync_state(stage_key: str, project, *, writing: bool = False) 
             "details": f"Inputs changed since last export ({last_run})"}
 
 
-class _PreflightPanel(QWidget):
-    """Mission Command's Pre-flight surface.
+class _ClickableDot(QLabel):
+    """A single severity-coloured glyph that emits ``clicked(key)`` when
+    pressed. Sized tightly to the glyph (≈18 px square) with a 2-px
+    hover frame — much smaller than a flat QPushButton, which still
+    reserves button chrome and pushes adjacent widgets off-screen.
 
-    Renders the result of `preflight.run_preflight(project)` as a vertical
-    list of severity-tagged rows grouped by category. Per-yellow-row
-    `Acknowledge` buttons write the row's snapshot hash to
-    `project.preflight_acks`; the row's gate clears as a result.
+    Used by ``_PreflightPanel`` to render one indicator per category."""
+
+    clicked = Signal(str)
+
+    def __init__(self, key: str, glyph: str, color: str,
+                 tooltip: str = "", parent=None):
+        super().__init__(glyph, parent)
+        self._key = key
+        self.setCursor(Qt.PointingHandCursor)
+        self.setAlignment(Qt.AlignCenter)
+        self.setFixedSize(18, 18)
+        if tooltip:
+            self.setToolTip(tooltip)
+        self.setStyleSheet(
+            f"QLabel {{ color: {color}; font-size: 13pt; "
+            f"font-weight: bold; border: 1px solid transparent; "
+            f"border-radius: 3px; padding: 0px; }}"
+            f"QLabel:hover {{ border: 1px solid #6c7086; "
+            f"background-color: #313244; }}"
+        )
+
+    def mousePressEvent(self, event):  # noqa: N802 (Qt API)
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self._key)
+        super().mousePressEvent(event)
+
+    def click(self) -> None:
+        """Programmatic click — emits the same signal as a mouse press.
+        Used by tests so they can drive the widget without synthesising
+        a real Qt mouse event."""
+        self.clicked.emit(self._key)
+
+
+class _PreflightPanel(QWidget):
+    """Mission Command's Pre-flight surface — collapsed by default.
+
+    Compact header row shows one coloured dot per preflight category
+    plus a single-line summary (e.g. ``"Ready — 6 categories green"``
+    or the topmost issue title). Mass-action buttons (Refresh / Patch
+    All / Run All) sit to the right, gated by the report's severity
+    state. A chevron toggles the detailed rows below — per-category
+    breakdown with per-yellow ``Acknowledge`` buttons.
+
+    Per-dot clicks AND the ``Jump to issue`` button emit
+    ``category_clicked(stage_key)`` so the parent dashboard can scroll
+    the matching status card into view. The detailed rows below the
+    dots aren't redundant with the cards — they carry the ack
+    affordances — but they stay collapsed by default because the cards
+    are the user's primary surface.
 
     Signals:
-        run_all_clicked   — user wants to start a full Run All pass.
-        patch_all_clicked — user wants to patch-emit dirty assets.
-        refresh_clicked   — user requested an explicit re-run of the checks.
+        run_all_clicked     — user wants to start a full Run All pass.
+        patch_all_clicked   — user wants to patch-emit dirty assets.
+        refresh_clicked     — user requested an explicit re-run of the checks.
+        category_clicked    — user clicked a status dot or Jump button.
     """
 
     run_all_clicked   = Signal()
     patch_all_clicked = Signal()
     refresh_clicked   = Signal()
+    category_clicked  = Signal(str)
 
     SEVERITY_COLOR = {
         "green":  "#a6e3a1",
@@ -2170,10 +2251,28 @@ class _PreflightPanel(QWidget):
         "yellow": "⚠",
         "red":    "✗",
     }
+    # Severity ordering for "first issue" lookups.
+    _SEVERITY_RANK = {"red": 0, "yellow": 1, "green": 2}
+
+    # Canonical stage order — MUST match the DashboardTab's status-card
+    # construction loop. One dot per stage, same sequence, so clicking the
+    # n-th dot scrolls to the n-th card. ``environment`` is intentionally
+    # NOT in this list: it has no status card, so env problems are
+    # surfaced only in the summary line + the Jump-to-issue button +
+    # the expanded detail rows.
+    STAGE_ORDER = (
+        "scene_converter",
+        "asset_processor",
+        "mesh_processor",
+        "material_processor",
+        "terrain_processor",
+    )
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._report = None
+        self._dot_widgets: list = []     # filled by apply_report; per-category buttons
+        self._expanded = False
         self._build_ui()
 
     # -------------------------------------------------------------------------
@@ -2181,36 +2280,54 @@ class _PreflightPanel(QWidget):
     # -------------------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        from preflight import CATEGORY_LABELS  # noqa: F401  (forward ref OK)
-
         self._box, lay = _section_groupbox("Pre-flight")
-        lay.setSpacing(10)
+        lay.setSpacing(6)
 
-        # Top status banner + action buttons.
-        top = QHBoxLayout()
-        top.setSpacing(8)
+        # =====================================================================
+        # TOP ROW (always visible)
+        # =====================================================================
+        # [● ● ● ● ●]   Ready — 5 stages green.   [Jump] [Refresh] [Patch All] [Run All]
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        header.setContentsMargins(0, 0, 0, 0)
 
+        # Container for the dot-buttons. Rebuilt on each apply_report.
+        self._dots_box = QWidget()
+        self._dots_layout = QHBoxLayout(self._dots_box)
+        self._dots_layout.setSpacing(2)
+        self._dots_layout.setContentsMargins(0, 0, 0, 0)
+        self._dots_layout.setAlignment(Qt.AlignVCenter)
+        header.addWidget(self._dots_box, 0, Qt.AlignVCenter)
+
+        # Summary text — single line.
         self._summary_lbl = QLabel("(no project loaded)")
-        self._summary_lbl.setWordWrap(True)
         self._summary_lbl.setStyleSheet(
             "color: #cdd6f4; font-size: 10pt; font-weight: bold;"
         )
-        top.addWidget(self._summary_lbl, 1)
+        header.addWidget(self._summary_lbl, 1, Qt.AlignVCenter)
+
+        # Jump to issue — shown only when reds/unack yellows exist.
+        self._jump_btn = QPushButton("Jump to issue")
+        self._jump_btn.setObjectName("preflight_jump")
+        self._jump_btn.setCursor(Qt.PointingHandCursor)
+        self._jump_btn.setVisible(False)
+        self._jump_btn.clicked.connect(self._on_jump_to_issue)
+        header.addWidget(self._jump_btn, 0, Qt.AlignVCenter)
 
         self._refresh_btn = QPushButton("Refresh")
         self._refresh_btn.setCursor(Qt.PointingHandCursor)
         self._refresh_btn.clicked.connect(self.refresh_clicked.emit)
-        top.addWidget(self._refresh_btn)
+        header.addWidget(self._refresh_btn, 0, Qt.AlignVCenter)
 
         self._patch_all_btn = QPushButton("Patch All")
         self._patch_all_btn.setCursor(Qt.PointingHandCursor)
         self._patch_all_btn.clicked.connect(self.patch_all_clicked.emit)
         self._patch_all_btn.setToolTip(
             "Re-emit only the assets whose inputs (profile / override / "
-            "source file) have changed since the last run. Cheap iterative "
-            "loop."
+            "source file) have changed since the last run. Cheap "
+            "iterative loop. Disabled when red preflight items exist."
         )
-        top.addWidget(self._patch_all_btn)
+        header.addWidget(self._patch_all_btn, 0, Qt.AlignVCenter)
 
         self._run_all_btn = QPushButton("Run All")
         self._run_all_btn.setObjectName("primary")
@@ -2221,20 +2338,56 @@ class _PreflightPanel(QWidget):
             "Pre-flight gates apply; resolve every red and acknowledge "
             "every yellow first."
         )
-        top.addWidget(self._run_all_btn)
+        header.addWidget(self._run_all_btn, 0, Qt.AlignVCenter)
 
-        lay.addLayout(top)
+        lay.addLayout(header)
 
-        # Rows container — populated by `apply_report`.
+        # =====================================================================
+        # DETAIL ROWS (collapsed by default; toggled by the Show more row)
+        # =====================================================================
         self._rows_container = QWidget()
         self._rows_layout    = QVBoxLayout(self._rows_container)
         self._rows_layout.setSpacing(4)
-        self._rows_layout.setContentsMargins(0, 0, 0, 0)
+        self._rows_layout.setContentsMargins(0, 2, 0, 0)
+        self._rows_container.setVisible(False)
         lay.addWidget(self._rows_container)
+
+        # =====================================================================
+        # SHOW MORE / SHOW LESS  (second row, below dots / detail rows)
+        # =====================================================================
+        # Flat text-with-arrow control. "▾ Show more" when collapsed,
+        # "▴ Show less" when expanded. The arrow is downward-pointing,
+        # NOT a play-button glyph, so it reads as a dropdown affordance.
+        toggle_row = QHBoxLayout()
+        toggle_row.setSpacing(0)
+        toggle_row.setContentsMargins(0, 0, 0, 0)
+        self._toggle_btn = QPushButton("▾  Show more")
+        self._toggle_btn.setObjectName("preflight_toggle")
+        self._toggle_btn.setCursor(Qt.PointingHandCursor)
+        self._toggle_btn.setFlat(True)
+        self._toggle_btn.setStyleSheet(
+            "QPushButton#preflight_toggle { color: #89b4fa; font-size: 9pt; "
+            "padding: 2px 6px; border: 1px solid transparent; border-radius: 3px; "
+            "text-align: left; }"
+            "QPushButton#preflight_toggle:hover { background-color: #313244; }"
+        )
+        self._toggle_btn.clicked.connect(self._toggle_expanded)
+        toggle_row.addWidget(self._toggle_btn)
+        toggle_row.addStretch(1)
+        lay.addLayout(toggle_row)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(self._box)
+
+    # -------------------------------------------------------------------------
+    # EXPAND / COLLAPSE
+    # -------------------------------------------------------------------------
+
+    def _toggle_expanded(self) -> None:
+        self._expanded = not self._expanded
+        self._rows_container.setVisible(self._expanded)
+        self._toggle_btn.setText("▴  Show less" if self._expanded else "▾  Show more")
 
     # -------------------------------------------------------------------------
     # APPLY REPORT
@@ -2244,58 +2397,142 @@ class _PreflightPanel(QWidget):
         from preflight import CATEGORY_LABELS
 
         self._report = report
-        # Tear down existing rows.
+        # Tear down existing rows + dots.
         while self._rows_layout.count():
             item = self._rows_layout.takeAt(0)
             w = item.widget()
             if w is not None:
                 w.deleteLater()
+        while self._dots_layout.count():
+            item = self._dots_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._dot_widgets = []
 
         if report is None or project is None:
             self._summary_lbl.setText("(no project loaded)")
             self._run_all_btn.setEnabled(False)
             self._patch_all_btn.setEnabled(False)
+            self._jump_btn.setVisible(False)
             return
 
-        # Overall status banner.
+        # ---------------------------------------------------------------
+        # Dot row — one per stage in dashboard-card order (NOT report
+        # order — the report's category sequence depends on which check
+        # function runs first and doesn't match the user's mental layout
+        # of the cards below). Stages that aren't in the report (platform
+        # doesn't support them) are skipped so the row stays aligned with
+        # the visible cards. Environment isn't a stage — its issues live
+        # in the summary line + the Jump button + the chevron detail.
+        # ---------------------------------------------------------------
+        report_cats = set(report.categories())
+        for cat in self.STAGE_ORDER:
+            if cat not in report_cats:
+                continue
+            worst = report.worst_severity(cat)
+            label = CATEGORY_LABELS.get(cat, cat)
+            count = len(report.by_category(cat))
+            dot = _ClickableDot(
+                key=cat,
+                glyph=self.SEVERITY_DOT[worst],
+                color=self.SEVERITY_COLOR[worst],
+                tooltip=f"{label} — {count} check(s); click to jump",
+            )
+            dot.clicked.connect(self.category_clicked.emit)
+            self._dots_layout.addWidget(dot)
+            self._dot_widgets.append((cat, dot))
+
+        # ---------------------------------------------------------------
+        # Summary line — single-line cue. Green: "N categories ready".
+        # Otherwise: topmost issue title with severity-tinted dot.
+        # ---------------------------------------------------------------
+        # Summary text — no leading severity glyph. The dot row already
+        # conveys severity at-a-glance; a leading dot in the text would
+        # read as a 6th dot floating next to the row.
         n_red    = len(report.reds)
-        n_yellow = len(report.yellows)
         n_unack  = len(report.needs_ack)
-        n_green  = len(report.greens)
+        n_stages = len(self._dot_widgets)
         if report.can_run:
             color = self.SEVERITY_COLOR["green"]
-            mark  = self.SEVERITY_DOT["green"]
             self._summary_lbl.setText(
-                f"{mark}  Ready — {n_green} check(s) passed."
+                f"Ready — {n_stages} stage"
+                f"{'' if n_stages == 1 else 's'} green."
             )
-        elif n_red:
-            color = self.SEVERITY_COLOR["red"]
-            mark  = self.SEVERITY_DOT["red"]
-            self._summary_lbl.setText(
-                f"{mark}  Blocked — {n_red} red, {n_unack} unacknowledged yellow."
-            )
+            self._jump_btn.setVisible(False)
         else:
-            color = self.SEVERITY_COLOR["yellow"]
-            mark  = self.SEVERITY_DOT["yellow"]
-            self._summary_lbl.setText(
-                f"{mark}  Hold — {n_unack} yellow row(s) need Acknowledge before Run All."
-            )
+            first_issue = self._first_issue(report)
+            if n_red:
+                color = self.SEVERITY_COLOR["red"]
+                prefix = "Blocked"
+            else:
+                color = self.SEVERITY_COLOR["yellow"]
+                prefix = "Hold"
+            if first_issue is not None:
+                self._summary_lbl.setText(f"{prefix} — {first_issue.title}")
+            else:
+                self._summary_lbl.setText(
+                    f"{prefix} — {n_red} red, {n_unack} unacknowledged yellow."
+                )
+            self._jump_btn.setVisible(True)
         self._summary_lbl.setStyleSheet(
             f"color: {color}; font-size: 10pt; font-weight: bold;"
         )
 
-        # Render each category.
+        # ---------------------------------------------------------------
+        # Detail rows (rendered into the collapsible container — hidden
+        # by default; chevron toggles). All report categories appear
+        # here — including environment — because users opening the
+        # detail pane want to see the full picture.
+        # ---------------------------------------------------------------
         for cat in report.categories():
             self._rows_layout.addWidget(
                 self._build_category_widget(cat, CATEGORY_LABELS.get(cat, cat),
                                             report, project),
             )
 
-        # Run All gates on `report.can_run`. Patch All can always run since
-        # patching only touches assets already in the state index — its own
-        # internal dirty check decides what to do.
+        # ---------------------------------------------------------------
+        # Button gating.
+        #   Run All   — gated by `report.can_run` (reds OR unack yellows).
+        #   Patch All — gated by reds only. Patching is iterative and
+        #               benign for unack yellows, but reds (e.g. missing
+        #               output path) make patching nonsensical.
+        # ---------------------------------------------------------------
         self._run_all_btn.setEnabled(report.can_run)
-        self._patch_all_btn.setEnabled(True)
+        self._patch_all_btn.setEnabled(n_red == 0)
+        if n_red:
+            self._patch_all_btn.setToolTip(
+                f"Disabled — {n_red} red preflight item(s) must be "
+                f"resolved before patching can run safely."
+            )
+        else:
+            self._patch_all_btn.setToolTip(
+                "Re-emit only the assets whose inputs (profile / override / "
+                "source file) have changed since the last run."
+            )
+
+    # -------------------------------------------------------------------------
+    # JUMP-TO-ISSUE
+    # -------------------------------------------------------------------------
+
+    def _first_issue(self, report):
+        """Return the topmost (most severe + earliest in report order)
+        non-green ``PreflightItem``, or None when everything is green."""
+        for item in report.items:
+            if item.severity == "red":
+                return item
+        # No reds — look for an unack yellow.
+        for item in report.needs_ack:
+            return item
+        return None
+
+    def _on_jump_to_issue(self) -> None:
+        if self._report is None:
+            return
+        first = self._first_issue(self._report)
+        if first is None:
+            return
+        self.category_clicked.emit(first.category)
 
     def _build_category_widget(self, cat: str, label: str, report, project) -> QWidget:
         from preflight import CATEGORY_LABELS  # noqa: F401
@@ -2452,19 +2689,29 @@ class DashboardTab(QWidget):
         self._preflight.refresh_clicked.connect(self._refresh_preflight)
         self._preflight.run_all_clicked.connect(self._on_run_all)
         self._preflight.patch_all_clicked.connect(self._on_patch_all)
+        # Dot click / "Jump to issue" → scroll the matching status card.
+        # ``category_clicked`` carries the same stage_key the cards keyed
+        # off, except "environment" which has no card — we surface that
+        # by scrolling to the first card so the user lands somewhere
+        # sensible (the actual fix-hint is in the expanded preflight).
+        self._preflight.category_clicked.connect(self._on_preflight_jump)
         root.addWidget(self._preflight)
 
         # Pipeline Status — one StageStatusCard per stage, workflow order.
-        status_box, status_lay = _section_groupbox("Pipeline Status")
+        # Action button label is per-stage: full-pipeline stages say
+        # "Process" (full run); iterative stages say "Patch Dirty" (the
+        # state-index-driven re-emit loop). The enable gate for the
+        # iterative stages is refined in `_refresh_status_card`.
+        self._status_box, status_lay = _section_groupbox("Pipeline Status")
         status_lay.setSpacing(10)
-        for stage_key, label in (
-            ("scene_converter",    "Scenes"),
-            ("asset_processor",    "Prefabs"),
-            ("mesh_processor",     "Meshes"),
-            ("material_processor", "Materials"),
-            ("terrain_processor",  "Terrain"),
+        for stage_key, label, action_label in (
+            ("scene_converter",    "Scenes",    "Process"),
+            ("asset_processor",    "Prefabs",   "Process"),
+            ("mesh_processor",     "Meshes",    "Patch Dirty"),
+            ("material_processor", "Materials", "Patch Dirty"),
+            ("terrain_processor",  "Terrain",   "Process"),
         ):
-            card = StageStatusCard(label)
+            card = StageStatusCard(label, action_label=action_label)
             card.open_clicked.connect(
                 lambda k=stage_key: self.request_focus_stage.emit(k)
             )
@@ -2473,7 +2720,7 @@ class DashboardTab(QWidget):
             )
             status_lay.addWidget(card)
             self._status_cards[stage_key] = card
-        root.addWidget(status_box)
+        root.addWidget(self._status_box)
 
         # Activity log
         self._activity_log = _log_widget()
@@ -2512,6 +2759,20 @@ class DashboardTab(QWidget):
     def _on_patch_all(self) -> None:
         self.request_patch_all.emit()
 
+    def _on_preflight_jump(self, category: str) -> None:
+        """User clicked a preflight dot or the Jump-to-issue button.
+        Categories that map 1:1 onto a status card (``asset_processor``,
+        ``mesh_processor``, …) scroll to that card. ``environment``
+        has no card — it surfaces dependency banners and project-root
+        problems, which live in the expanded preflight detail rows — so
+        we force the panel open and leave the user there."""
+        if category == "environment":
+            if not self._preflight._expanded:
+                self._preflight._toggle_expanded()
+            return
+        if category in self._status_cards:
+            self.scroll_to_card(category)
+
     def showEvent(self, event) -> None:
         """Tab activation re-runs preflight so opening the dashboard
         sees the freshest project state (e.g. after the user edited
@@ -2526,6 +2787,105 @@ class DashboardTab(QWidget):
             stage_key, project, writing=(stage_key in self._stages_writing),
         )
         card.update_state(readiness, sync_state)
+
+        # Iterative stages (mesh / material) override the default sync-state
+        # gate: their action is "Patch Dirty", which only makes sense when
+        # at least one asset in the state index is dirty or externally
+        # modified. Synchronised stages disable the button with an
+        # explanatory tooltip so the user isn't left wondering why
+        # clicking does nothing.
+        if stage_key in ("mesh_processor", "material_processor") and project is not None:
+            bucket = "meshes" if stage_key == "mesh_processor" else "materials"
+            dirty, ext_mod = self._count_iterative_dirty(project, bucket)
+            actionable = (dirty + ext_mod) > 0
+            if actionable:
+                tip = (f"Re-emit {dirty} dirty + {ext_mod} externally-modified "
+                       f"{bucket}. Click runs the Patch worker.")
+            else:
+                tip = (f"All {bucket} in sync — nothing to patch. "
+                       f"Edit overrides / settings or run the Prefabs stage "
+                       f"to produce new assets.")
+            card.set_action_enabled(actionable, tooltip=tip)
+
+    @staticmethod
+    def _count_iterative_dirty(project, bucket: str):
+        """Return ``(dirty_count, externally_modified_count)`` for a
+        state-index bucket (``materials`` or ``meshes``). Used to gate
+        the iterative stages' Patch button without running the full
+        worker."""
+        from project_manager import detect_externally_modified
+        state_root = project.outputs.get("state_index") or {}
+        entries    = state_root.get(bucket) or {}
+        dirty = 0
+        for entry in entries.values():
+            outputs = entry.get("output_files") or []
+            if not outputs or any(not Path(p).exists() for p in outputs):
+                dirty += 1
+        ext_mod_bucket = detect_externally_modified(state_root).get(bucket) or set()
+        return dirty, len(ext_mod_bucket)
+
+    # -------------------------------------------------------------------------
+    # SCROLL HELPERS
+    # -------------------------------------------------------------------------
+
+    def scroll_to_card(self, stage_key: str) -> None:
+        """Scroll the dashboard so the named stage's status card is
+        visible. Called from the pre-flight panel when the user clicks
+        a status dot or the Jump-to-issue button. Falls back to no-op
+        when the stage key is unknown.
+
+        Briefly outlines the target card so the user can spot it. The
+        outline is tracked + cancellable to prevent the "card stays
+        highlighted" bug where rapid clicks left a card in a stuck
+        bordered state because two QTimers raced over the same
+        ``setStyleSheet`` slot."""
+        card = self._status_cards.get(stage_key)
+        if card is None:
+            return
+        from PySide6.QtWidgets import QScrollArea
+        from PySide6.QtCore import QTimer
+        scroll = next(iter(self.findChildren(QScrollArea)), None)
+        if scroll is not None:
+            scroll.ensureWidgetVisible(card, 0, 40)
+        self._flash_highlight(card)
+
+    def _flash_highlight(self, card) -> None:
+        """Apply a 1.2s flash outline to ``card``. Cancels any pending
+        clear from a previous flash on any card so the styling never
+        sticks. The card's pristine style is stored once on the
+        dashboard (``_card_base_qss``) so cumulative appends are
+        impossible."""
+        from PySide6.QtCore import QTimer
+        # Capture pristine card style once, the first time we flash.
+        if not hasattr(self, "_card_base_qss"):
+            self._card_base_qss = {
+                key: c.styleSheet() for key, c in self._status_cards.items()
+            }
+        # Cancel any pending clear; restore every card to pristine first
+        # so a stuck previous-highlight can't survive.
+        if getattr(self, "_highlight_timer", None) is not None:
+            self._highlight_timer.stop()
+            self._highlight_timer = None
+        for key, c in self._status_cards.items():
+            c.setStyleSheet(self._card_base_qss.get(key, ""))
+        # Apply the highlight to the requested card only.
+        target_key = next((k for k, v in self._status_cards.items() if v is card),
+                          None)
+        if target_key is None:
+            return
+        base = self._card_base_qss.get(target_key, "")
+        card.setStyleSheet(
+            base + " QFrame#stage_status_card { border: 2px solid #89b4fa; }"
+        )
+        # Single shared timer, captured on self so a follow-up flash can
+        # stop it before applying its own.
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(
+            lambda c=card, b=base: c.setStyleSheet(b)
+        )
+        timer.start(1200)
+        self._highlight_timer = timer
 
     def mark_stage_writing(self, stage_key: str, writing: bool) -> None:
         """Called by MainWindow when a stage's worker starts/finishes. Flips
@@ -5540,6 +5900,32 @@ class MaterialTab(QWidget):
                 tip_lines.append("Override applied")
             if not has_mapping:
                 tip_lines.append("Shader has no explicit profile — uses the default profile")
+            # F-9 provenance — show which profile (and recorded shader name)
+            # last emitted this material's .material on disk. Empty / missing
+            # means the file pre-dates the F-9 profile chain entirely
+            # (legacy hardcoded extraction) and should be re-emitted to
+            # gain provenance.
+            if state_entry is not None:
+                emitted_profile = state_entry.get("profile_name") or ""
+                emitted_shader  = state_entry.get("shader_name")  or ""
+                last_emitted    = state_entry.get("last_emitted") or ""
+                if emitted_profile:
+                    line = f"Last emitted by profile: {emitted_profile}"
+                    if emitted_shader and emitted_shader != shader:
+                        line += f"  (shader recorded as: {emitted_shader})"
+                    tip_lines.append(line)
+                else:
+                    tip_lines.append(
+                        "Last emitted via legacy hardcoded path "
+                        "(no F-9 profile recorded — re-emit to capture provenance)."
+                    )
+                if last_emitted:
+                    tip_lines.append(f"Last emitted: {last_emitted}")
+            else:
+                tip_lines.append(
+                    "Never emitted by this converter — output on disk (if any) "
+                    "is from a prior tool or hand-authored."
+                )
             if is_dirty:
                 tip_lines.append("Dirty — output is missing or stale; run Patch")
             if is_externally_modified:
@@ -6562,9 +6948,11 @@ class MainWindow(QMainWindow):
             self._tabs.setCurrentIndex(idx)
 
     def _process_stage(self, stage_key: str) -> None:
-        """Process button on a dashboard card → fire the relevant tab's
-        existing worker entry point. Same code path as clicking the tab's
-        bottom action button."""
+        """Action button on a dashboard card → fire the relevant tab's
+        existing worker entry point. Full-pipeline stages (Scenes /
+        Prefabs / Terrain) run their full processing path. Iterative
+        stages (Meshes / Materials) run the F-9 Patch worker — the
+        button label on those cards says "Patch Dirty" to match."""
         idx = self._STAGE_TAB_INDEX.get(stage_key)
         if idx is None:
             return
@@ -6575,6 +6963,8 @@ class MainWindow(QMainWindow):
             tab._start_processing()
         elif stage_key == "terrain_processor":
             tab._start_generation()
+        elif stage_key in ("mesh_processor", "material_processor"):
+            tab._start_patch()
 
     # -------------------------------------------------------------------------
     # F-8 — Mission Command actions
