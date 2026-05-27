@@ -352,6 +352,12 @@ class AssetDatabase:
             '_AOMap':            'occlusion.specular',
             '_AmbientOcclusion': 'occlusion.specular',
             '_AmbientOcclusionMap': 'occlusion.specular',
+            '_AO':               'occlusion.specular',  # MK4 / Alien Fantasy Forest foliage
+            # MK4 / Alien Fantasy Forest rock shader uses prefixed names for
+            # the primary surface (cover variants ignored — see IGNORE_UNMAPPED).
+            '_RockAlbedo':       'baseColor',
+            '_RockNormal':       'normal',
+            '_RockSpecular':     'specular',
             # emissive
             '_EmissionMap':      'emissive',
             '_EmissionTex':      'emissive',
@@ -373,6 +379,12 @@ class AssetDatabase:
             # _Composite is channel-packed and shader-specific (metallic/AO/rough
             # in different channels per shader); needs a per-shader rule.
             '_Composite', '_CompositeMap', '_MOHS', '_MaskMap',
+            # MK4 / Alien Fantasy Forest detail + cover layers — drop silently
+            # to avoid double-baking. The primary albedo / normal carries the
+            # surface look; the cover blend isn't reconstructible in O3DE
+            # StandardPBR without a second material layer.
+            '_Detail', '_AODetail',
+            '_CoverAlbedo', '_CoverNormal', '_CoverSpecular',
         }
         
         # NOTE: _Metallic, _Smoothness, _Glossiness, _GlossMapScale are handled
@@ -386,10 +398,19 @@ class AssetDatabase:
             '_EmissionColor': 'emissive.color',
         }
         
+        # Unity materials store m_Shader as a reference, not a name. Record
+        # the guid + fileID so _process_material can resolve the friendly
+        # "Shader \"Name\"" string via the .shader file (or a built-in
+        # lookup table).
+        shader_ref = material_data.get('m_Shader') or {}
+        if not isinstance(shader_ref, dict):
+            shader_ref = {}
         extracted = {
-            'name': material_data.get('m_Name', 'Material'),
-            'shader': material_data.get('m_Shader', {}).get('m_Name', ''),
-            'textures': {},
+            'name':         material_data.get('m_Name', 'Material'),
+            'shader':       '',  # filled by _process_material via _resolve_shader_name
+            'shader_guid':  shader_ref.get('guid', '') or '',
+            'shader_fileid': shader_ref.get('fileID', 0) or 0,
+            'textures':    {},
             'properties': {},
             # GUIDs that came from Unity's _MetallicGlossMap. _process_material
             # uses this set to decide whether the roughness slot should sample
@@ -879,6 +900,15 @@ class IntegratedAssetProcessor:
         # are also kept in `self._entity_map_cache` for cross-prefab
         # override reads within the same run.
         self._project_prefab_records: Dict[str, Dict] = {}
+        # F-6: per-material metadata (shader name, source path, bound
+        # texture slots). Surfaced on the Materials tab so the user can
+        # see which shaders need a mapping.
+        self._material_metadata: Dict[str, Dict] = {}
+        # F-6: cached `shader_guid → "Shader Name"` so we don't re-read
+        # the same .shader file once per material. Built-ins (Unity's
+        # Standard, etc.) don't resolve to a file in the project; we
+        # fall back to a small lookup table for those.
+        self._shader_name_cache: Dict[str, str] = {}
         
         # Track processed assets
         self.processed_materials: Dict[str, str] = {}  # guid -> output_path
@@ -1127,10 +1157,11 @@ class IntegratedAssetProcessor:
         `last_input_hash`, and `last_status` before calling
         `pm.update_outputs("asset_processor", ...)`."""
         return {
-            "prefabs":   dict(self._project_prefab_records),
-            "materials": dict(self.asset_index["materials"]),
-            "meshes":    dict(self.asset_index["meshes"]),
-            "coverage":  self.coverage.to_dict(),
+            "prefabs":           dict(self._project_prefab_records),
+            "materials":         dict(self.asset_index["materials"]),
+            "material_metadata": dict(self._material_metadata),
+            "meshes":             dict(self.asset_index["meshes"]),
+            "coverage":           self.coverage.to_dict(),
         }
     
     def _parse_unity_prefab(self, prefab_path: Path) -> Tuple[Dict[str, GameObject], Dict[str, str]]:
@@ -1407,6 +1438,52 @@ class IntegratedAssetProcessor:
                 self.log(f"  [Hierarchy] ⚠ No processor for component type '{comp_type}' — skipped")
     
     
+    # F-6 — Map a few Unity built-in shader fileIDs to their canonical
+    # names, since their GUIDs use the reserved `0000…f0…0000` pattern
+    # and don't resolve to a file on disk inside any user project.
+    _UNITY_BUILTIN_SHADERS: Dict[int, str] = {
+        4:  "Standard",
+        46: "Standard (Specular setup)",
+    }
+
+    def _resolve_shader_name(self, shader_guid: str, shader_fileid: int = 0) -> str:
+        """Resolve a Unity material's m_Shader reference to its friendly
+        name (e.g. ``"MK4/Foliage Fantasy"`` or ``"Standard"``).
+
+        Reads the first ``Shader "..."`` declaration from the .shader file
+        the GUID points at. Built-in shaders use a reserved GUID pattern
+        and don't have a file in the user's project — fall through to a
+        small built-in fileID lookup for those. Returns empty string when
+        neither path produces a name."""
+        cache_key = f"{shader_guid}:{shader_fileid}"
+        if cache_key in self._shader_name_cache:
+            return self._shader_name_cache[cache_key]
+
+        name = ""
+        if shader_guid:
+            shader_path = self.asset_db.resolve_guid(shader_guid)
+            if shader_path and shader_path.suffix in (".shader", ".shadergraph"):
+                try:
+                    with open(shader_path, "r", encoding="utf-8", errors="replace") as f:
+                        for _ in range(80):
+                            line = f.readline()
+                            if not line:
+                                break
+                            m = re.match(r'\s*Shader\s+"([^"]+)"', line)
+                            if m:
+                                name = m.group(1).strip()
+                                break
+                except Exception:
+                    pass
+
+        # Built-in fallback (Unity engine shaders). Only consult when the
+        # GUID didn't resolve.
+        if not name and shader_fileid:
+            name = self._UNITY_BUILTIN_SHADERS.get(int(shader_fileid), "")
+
+        self._shader_name_cache[cache_key] = name
+        return name
+
     def _process_material(self, material_guid: str) -> Optional[str]:
         """Process Unity material and create O3DE material"""
         # Check if already processed
@@ -1540,6 +1617,21 @@ class IntegratedAssetProcessor:
         asset_hint = f"{self.asset_hint_root}/materials/{output_path.stem}.azmaterial"
         self.processed_materials[material_guid] = asset_hint
         self.asset_index["materials"][material_guid] = asset_hint
+        # F-6 metadata. shader_name is resolved from the m_Shader GUID via
+        # the .shader file (user-content shaders) or a small built-in
+        # table (Unity Standard, etc.). Falls back to "" when neither
+        # path produces a name.
+        shader_guid = material_data.get("shader_guid", "") or ""
+        shader_fid  = material_data.get("shader_fileid", 0) or 0
+        shader_name = self._resolve_shader_name(shader_guid, shader_fid)
+        self._material_metadata[material_guid] = {
+            "asset_hint":     asset_hint,
+            "shader_name":    shader_name,
+            "shader_guid":    shader_guid,
+            "source_path":    str(material_path),
+            "source_stem":    material_path.stem,
+            "textures_bound": sorted(texture_paths.keys()),
+        }
 
         self.log(f"      ✓ Created material with {len(texture_paths)} textures")
 

@@ -19,14 +19,14 @@ import traceback
 from pathlib import Path
 
 from PySide6.QtCore    import Qt, QThread, Signal, QObject, QTimer
-from PySide6.QtGui     import QFont, QTextCursor, QAction
+from PySide6.QtGui     import QFont, QTextCursor, QAction, QDoubleValidator
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout,
     QHBoxLayout, QLabel, QLineEdit, QPushButton, QTextEdit,
     QFileDialog, QGroupBox, QListWidget, QListWidgetItem,
     QMessageBox, QSizePolicy, QCheckBox,
     QComboBox, QToolButton, QMenu, QStackedWidget, QFrame,
-    QFormLayout, QInputDialog, QScrollArea,
+    QFormLayout, QInputDialog, QScrollArea, QDialog, QDialogButtonBox,
 )
 
 from project_manager import (
@@ -1293,6 +1293,7 @@ _STAGE_STATUS_COLORS = {
     "ready":      "#89dceb",  # sapphire — all requirements met, awaiting run
     "ok":         "#a6e3a1",  # green — last run clean
     "warn":       "#fab387",  # orange — last run had warnings/errors
+    "error":      "#f38ba8",  # red — critical config problem (e.g. source has no assets)
 }
 
 # Green/red colors for individual requirement rows inside a card.
@@ -1382,10 +1383,25 @@ class StageStatusCard(QFrame):
                 w.deleteLater()
         for req in readiness.get("requirements", []):
             glyph = "✓" if req["met"] else "✗"
-            color = _REQ_MET_COLOR if req["met"] else _REQ_NOT_MET_COLOR
+            if req["met"]:
+                color = _REQ_MET_COLOR
+            elif req.get("severity") == "error":
+                color = "#f38ba8"   # red — critical config problem
+            else:
+                color = _REQ_NOT_MET_COLOR
             label = QLabel(f"{glyph}  {req['text']}")
             label.setObjectName("stage_card_req")
-            label.setStyleSheet(f"color: {color}; font-size: 9pt;")
+            weight = "font-weight: bold;" if req.get("severity") == "error" else ""
+            label.setStyleSheet(f"color: {color}; font-size: 9pt; {weight}")
+            label.setWordWrap(True)
+            self._reqs_lay.addWidget(label)
+
+        # Advisories (soft warnings) — render below requirements with a
+        # warning icon. Don't affect readiness status; visible only.
+        for advisory in readiness.get("advisories", []):
+            label = QLabel(f"⚠  {advisory['text']}")
+            label.setObjectName("stage_card_advisory")
+            label.setStyleSheet("color: #fab387; font-size: 9pt;")
             label.setWordWrap(True)
             self._reqs_lay.addWidget(label)
 
@@ -1419,30 +1435,32 @@ class StageStatusCard(QFrame):
             f"border-top: 1px solid #313244;"
         )
 
-        self._process_btn.setEnabled(sstate not in ("unconfigured", "writing"))
+        self._process_btn.setEnabled(sstate not in ("unconfigured", "writing", "error"))
 
 
 def compute_stage_readiness(stage_key: str, project) -> dict:
     """Return a structured readiness report for a converter stage:
 
         {
-          "status":       'unset' | 'incomplete' | 'ready' | 'ok' | 'warn',
+          "status":       'unset' | 'incomplete' | 'error' | 'ready' | 'ok' | 'warn',
           "status_label": display string for the status badge,
-          "requirements": [ {"met": bool, "text": str}, ... ],
+          "requirements": [ {"met": bool, "text": str,
+                             "severity": "error" | "incomplete"}, ... ],
+          "advisories":   [ {"text": str}, ... ],   # non-blocking warnings
           "last_run":     post-run summary string (None if never run),
         }
 
-    `requirements` lists each prerequisite for the stage as either met
-    (green ✓) or not met (red ✗). `status` summarises overall state:
-    `incomplete` when any requirement is unmet, `ready` when all are met
-    but nothing has run yet, `ok` after a clean run, `warn` after a run
-    with warnings/errors.
-    """
+    `requirements` lists each prerequisite as either met (green ✓) or
+    not met (red ✗). Unmet requirements with `severity="error"` push
+    overall status to `error` (red); otherwise unmet → `incomplete`
+    (yellow). `advisories` are soft warnings that don't change status
+    but render as warning rows on the card."""
     if project is None:
         return {
             "status":       "unset",
             "status_label": "No project",
             "requirements": [],
+            "advisories":   [],
             "last_run":     None,
         }
 
@@ -1453,6 +1471,7 @@ def compute_stage_readiness(stage_key: str, project) -> dict:
     last_run    = status_info.get("last_run")
 
     reqs: list = []
+    advisories: list = []
     last_run_summary = None
 
     if stage_key == "scene_converter":
@@ -1467,6 +1486,18 @@ def compute_stage_readiness(stage_key: str, project) -> dict:
         else:
             reqs.append({"met": False, "text": "No scenes selected"})
         reqs.append(_req_output(output))
+
+        # Soft advisory: warn when no converted prefabs are available to
+        # resolve scene references against. Run will technically succeed
+        # but every prefab instance will land as `missing_prefabs`.
+        ap_outputs = project.outputs.get("asset_processor", {}) or {}
+        if len(ap_outputs.get("prefabs", {}) or {}) == 0:
+            advisories.append({
+                "text": "No processed prefabs yet — scene references will not "
+                        "be mapped. Run the Prefab Processor first for a "
+                        "complete conversion."
+            })
+
         if last_run:
             last_run_summary = (
                 f"Last run {last_run}: "
@@ -1479,6 +1510,20 @@ def compute_stage_readiness(stage_key: str, project) -> dict:
 
     elif stage_key == "asset_processor":
         reqs.append(_req_source(source))
+        scrubbed  = scrub_scope_for(source, "*.prefab") if source else []
+        scr_count = len(scrubbed)
+        sel_count = len(cfg.get("selected_prefabs", []) or [])
+        if source and scr_count == 0:
+            # ERROR: source is configured but contains no prefabs. The user
+            # has pointed at a path with nothing to process — fix the path
+            # before anything else makes sense.
+            reqs.append({"met": False, "severity": "error",
+                         "text": "Source has no .prefab files — check the scope "
+                                 "root or this tab's source override"})
+        elif sel_count > 0:
+            reqs.append({"met": True,  "text": f"{sel_count} of {scr_count} prefabs selected"})
+        else:
+            reqs.append({"met": False, "text": "No prefabs selected"})
         reqs.append(_req_output(output))
         if last_run:
             last_run_summary = (
@@ -1506,16 +1551,85 @@ def compute_stage_readiness(stage_key: str, project) -> dict:
             )
         had_errors = bool(status_info.get("errors", 0))
 
+    elif stage_key in ("mesh_processor", "material_processor"):
+        # Mesh + Material stages derive from the Prefab Processor's outputs;
+        # they don't have their own source/output settings. Their readiness
+        # mirrors what the upstream run produced.
+        ap_outputs = project.outputs.get("asset_processor", {}) or {}
+        ap_last    = ap_outputs.get("last_run")
+        if not ap_last:
+            reqs.append({"met": False,
+                         "text": "Prefab Processor hasn't run yet"})
+            had_errors = False
+        elif stage_key == "mesh_processor":
+            meshes = ap_outputs.get("meshes", {}) or {}
+            if not meshes:
+                reqs.append({"met": False,
+                             "text": "No meshes extracted from prefab run"})
+                had_errors = False
+            else:
+                reqs.append({"met": True,
+                             "text": f"{len(meshes)} mesh(es) extracted"})
+                mp_cfg    = project.stage_settings("mesh_processor")
+                overrides = (mp_cfg.get("overrides") or {})
+                if overrides:
+                    reqs.append({"met": True,
+                                 "text": f"{len(overrides)} mesh(es) with override(s)"})
+                last_run_summary = (
+                    f"Inherited from Prefab Processor run {ap_last}: "
+                    f"{len(meshes)} mesh(es), {len(overrides)} override(s)"
+                )
+                last_run = ap_last  # so the status code path treats this as run-complete
+                had_errors = False
+        else:  # material_processor
+            meta = ap_outputs.get("material_metadata", {}) or {}
+            if not meta:
+                reqs.append({"met": False,
+                             "text": "No materials extracted from prefab run"})
+                had_errors = False
+            else:
+                reqs.append({"met": True,
+                             "text": f"{len(meta)} material(s) extracted"})
+                mp_cfg    = project.stage_settings("material_processor")
+                mappings  = (mp_cfg.get("shader_mappings") or {})
+                overrides = (mp_cfg.get("overrides") or {})
+                unmapped  = [
+                    g for g, rec in meta.items()
+                    if (rec or {}).get("shader_name", "")
+                    and (rec or {})["shader_name"] not in mappings
+                ]
+                if unmapped:
+                    reqs.append({"met": False,
+                                 "text": f"{len(unmapped)} material(s) have unmapped shaders"})
+                else:
+                    reqs.append({"met": True, "text": "All shaders mapped"})
+                if overrides:
+                    reqs.append({"met": True,
+                                 "text": f"{len(overrides)} material(s) with override(s)"})
+                last_run_summary = (
+                    f"Inherited from Prefab Processor run {ap_last}: "
+                    f"{len(meta)} material(s), {len(unmapped)} unmapped, "
+                    f"{len(overrides)} override(s)"
+                )
+                last_run = ap_last
+                had_errors = bool(unmapped)
+
     else:
         return {
             "status":       "unset",
             "status_label": "(unknown stage)",
             "requirements": [],
+            "advisories":   [],
             "last_run":     None,
         }
 
-    all_met = all(r["met"] for r in reqs)
-    if not all_met:
+    all_met       = all(r["met"] for r in reqs)
+    any_error_req = any(
+        (not r["met"]) and r.get("severity") == "error" for r in reqs
+    )
+    if any_error_req:
+        status, label = "error", "Error"
+    elif not all_met:
         status, label = "incomplete", "Incomplete"
     elif last_run and had_errors:
         status, label = "warn", "Completed with warnings"
@@ -1528,6 +1642,7 @@ def compute_stage_readiness(stage_key: str, project) -> dict:
         "status":       status,
         "status_label": label,
         "requirements": reqs,
+        "advisories":   advisories,
         "last_run":     last_run_summary,
     }
 
@@ -1603,7 +1718,14 @@ def input_hash_for(stage_key: str, project) -> str:
     }
 
     if stage_key == "asset_processor":
-        payload["files"] = _fingerprint_files_under(source, "*.prefab")
+        selected = sorted(cfg.get("selected_prefabs", []) or [])
+        payload["selected_prefabs"] = selected
+        if source:
+            payload["files"] = {
+                rel: _fingerprint_file(Path(source) / rel) for rel in selected
+            }
+        else:
+            payload["files"] = {}
 
     elif stage_key == "scene_converter":
         selected = sorted(cfg.get("selected_scenes", []) or [])
@@ -1669,7 +1791,42 @@ def compute_stage_sync_state(stage_key: str, project, *, writing: bool = False) 
                 "label": "No project",
                 "details": ""}
 
+    # Mesh + Material stages have no independent worker yet; their state
+    # mirrors what the Prefab Processor produced. Delegate.
+    if stage_key in ("mesh_processor", "material_processor"):
+        readiness = compute_stage_readiness(stage_key, project)
+        if readiness["status"] in ("incomplete", "error"):
+            # Use the first unmet requirement as the detail line so the
+            # sync row gives an honest reason ("1 material(s) have unmapped
+            # shaders") rather than a generic "configure requirements".
+            first_unmet = next(
+                (r["text"] for r in readiness["requirements"] if not r["met"]),
+                "Configuration incomplete",
+            )
+            sync_state = "error" if readiness["status"] == "error" else "unconfigured"
+            return {"state":   sync_state,
+                    "label":   _SYNC_STATE_LABELS[sync_state],
+                    "details": first_unmet}
+        delegated = compute_stage_sync_state("asset_processor", project)
+        # Re-label so the user understands this stage rides on the prefab run.
+        delegated = dict(delegated)
+        delegated["details"] = (
+            f"Inherited from Prefab Processor · {delegated.get('details', '')}"
+        ).rstrip(" ·")
+        return delegated
+
     readiness = compute_stage_readiness(stage_key, project)
+    if readiness["status"] == "error":
+        # Critical config problem — pull the first error requirement's text
+        # for the detail line so the user sees the specific issue.
+        first_err = next(
+            (r["text"] for r in readiness["requirements"]
+             if not r["met"] and r.get("severity") == "error"),
+            "Configuration error",
+        )
+        return {"state": "error",
+                "label": _SYNC_STATE_LABELS["error"],
+                "details": first_err}
     if readiness["status"] == "incomplete":
         return {"state": "unconfigured",
                 "label": _SYNC_STATE_LABELS["unconfigured"],
@@ -1746,9 +1903,11 @@ class DashboardTab(QWidget):
         status_box, status_lay = _section_groupbox("Pipeline Status")
         status_lay.setSpacing(10)
         for stage_key, label in (
-            ("scene_converter",   "Scene Converter"),
-            ("asset_processor",   "Prefab Processor"),
-            ("terrain_processor", "Terrain Materials"),
+            ("scene_converter",    "Scenes"),
+            ("asset_processor",    "Prefabs"),
+            ("mesh_processor",     "Meshes"),
+            ("material_processor", "Materials"),
+            ("terrain_processor",  "Terrain"),
         ):
             card = StageStatusCard(label)
             card.open_clicked.connect(
@@ -1828,9 +1987,12 @@ class PrefabProcessorTab(QWidget):
     def __init__(self):
         super().__init__()
         self._worker: WorkerThread = None
+        self._selected_prefabs: set = set()  # relative paths under effective_source
+        self._suppress_prefab_signals = False
         self._build_ui()
         pm = project_manager()
         pm.project_changed.connect(self.apply_project)
+        pm.status_changed.connect(self._on_status_changed)
         self.apply_project(pm.current())
 
     # -------------------------------------------------------------------------
@@ -1838,8 +2000,6 @@ class PrefabProcessorTab(QWidget):
     # -------------------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        # Outer layout holds a scroll area so the tab scrolls vertically
-        # when the window is shorter than the natural content height.
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
@@ -1855,13 +2015,35 @@ class PrefabProcessorTab(QWidget):
             "Override (blank → use project scope root)"
         )
         src_btn.clicked.connect(self._browse_source)
-        self._source_edit.editingFinished.connect(self._refresh_effective_source_label)
+        self._source_edit.editingFinished.connect(self._on_source_edited)
         src_lay.addLayout(_hbox(self._source_edit, src_btn))
         self._effective_source_label = QLabel("")
         self._effective_source_label.setStyleSheet("color: #6c7086; font-size: 9pt;")
         self._effective_source_label.setWordWrap(True)
         src_lay.addWidget(self._effective_source_label)
         root.addWidget(src_box)
+
+        # ── Prefabs to Convert (F-4 scrubbed checklist) ─────────────────
+        self._prefab_list = QListWidget()
+        self._prefab_list.itemChanged.connect(self._on_prefab_item_changed)
+        refresh_btn         = QPushButton("Refresh from Scope")
+        select_all_btn      = QPushButton("Select All")
+        clear_selection_btn = QPushButton("Clear Selection")
+        clear_missing_btn   = QPushButton("Clear Missing")
+        refresh_btn.clicked.connect(self._refresh_prefab_list)
+        select_all_btn.clicked.connect(self._select_all_prefabs)
+        clear_selection_btn.clicked.connect(self._clear_prefab_selection)
+        clear_missing_btn.clicked.connect(self._clear_missing_prefabs)
+        root.addWidget(_managed_list_section(
+            "Prefabs to Convert", self._prefab_list,
+            refresh_btn, select_all_btn, clear_selection_btn, clear_missing_btn,
+            min_h=140, max_h=220,
+        ))
+        # Cross-stage usage summary (referenced meshes / materials)
+        self._usage_label = QLabel("")
+        self._usage_label.setStyleSheet("color: #6c7086; font-size: 9pt;")
+        self._usage_label.setWordWrap(True)
+        root.addWidget(self._usage_label)
 
         # ── O3DE Output Folder ──────────────────────────────────────────
         out_box, out_lay = _section_groupbox("O3DE Output Folder")
@@ -1883,6 +2065,12 @@ class PrefabProcessorTab(QWidget):
         # ── Processing Log ──────────────────────────────────────────────
         self._log_edit = _log_widget()
         root.addWidget(_fill_section("Processing Log", self._log_edit), stretch=1)
+
+        # ── Last Run Details (per-prefab breakdown, populated on success) ──
+        self._last_run_box = _section_groupbox("Last Run Details")[0]
+        self._last_run_box_lay = self._last_run_box.layout()
+        self._last_run_box.setVisible(False)
+        root.addWidget(self._last_run_box)
 
         # ── Action buttons ──────────────────────────────────────────────
         save_log_btn = QPushButton("Save Log…")
@@ -1910,7 +2098,11 @@ class PrefabProcessorTab(QWidget):
         cfg = project.stage_settings(self.STAGE_KEY) if project else {}
         self._source_edit.setText(cfg.get("source_path", ""))
         self._output_edit.setText(cfg.get("output_path", ""))
+        self._selected_prefabs = set(cfg.get("selected_prefabs", []))
         self._refresh_effective_source_label()
+        self._refresh_prefab_list()
+        self._refresh_usage_summary(project)
+        self._refresh_last_run_details(project)
 
     def _refresh_effective_source_label(self) -> None:
         """Show the resolved walking root when the override is blank, hide
@@ -1930,8 +2122,9 @@ class PrefabProcessorTab(QWidget):
 
     def _collect_stage_settings(self) -> dict:
         return {
-            "source_path": self._source_edit.text(),
-            "output_path": self._output_edit.text(),
+            "source_path":      self._source_edit.text(),
+            "selected_prefabs": sorted(self._selected_prefabs),
+            "output_path":      self._output_edit.text(),
         }
 
     def _save_settings(self) -> None:
@@ -1951,7 +2144,171 @@ class PrefabProcessorTab(QWidget):
         if d:
             self._source_edit.setText(d)
             self._log(f"Source: {d}")
-            self._save_settings()
+            self._on_source_edited()
+
+    def _on_source_edited(self) -> None:
+        self._save_settings()
+        self._refresh_effective_source_label()
+        self._refresh_prefab_list()
+
+    def _effective_source_text(self) -> str:
+        proj = project_manager().current()
+        if proj is not None:
+            return proj.effective_source(self.STAGE_KEY)
+        return self._source_edit.text().strip()
+
+    # ── Prefabs checklist (F-4) ─────────────────────────────────────────
+
+    def _refresh_prefab_list(self) -> None:
+        """Re-walk effective_source for *.prefab and rebuild the checklist,
+        preserving the persisted selection. Previously-selected prefabs
+        that no longer resolve appear at the bottom with a ⚠ glyph."""
+        self._suppress_prefab_signals = True
+        try:
+            self._prefab_list.clear()
+            root_text = self._effective_source_text()
+            scrubbed = scrub_scope_for(root_text, "*.prefab")
+            scrubbed_strs = {str(p).replace("\\", "/") for p in scrubbed}
+
+            for rel in scrubbed:
+                rel_str = str(rel).replace("\\", "/")
+                item = QListWidgetItem(rel_str)
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                state = Qt.Checked if rel_str in self._selected_prefabs else Qt.Unchecked
+                item.setCheckState(state)
+                item.setData(Qt.UserRole, rel_str)
+                self._prefab_list.addItem(item)
+
+            missing = sorted(self._selected_prefabs - scrubbed_strs)
+            for rel_str in missing:
+                item = QListWidgetItem(f"⚠ {rel_str}  (missing from scope)")
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Checked)
+                item.setData(Qt.UserRole, rel_str)
+                item.setForeground(Qt.darkYellow)
+                item.setToolTip(
+                    "This prefab was selected previously but is not under the "
+                    "current effective source. Click 'Clear Missing' to drop it."
+                )
+                self._prefab_list.addItem(item)
+        finally:
+            self._suppress_prefab_signals = False
+
+    def _on_prefab_item_changed(self, item) -> None:
+        if self._suppress_prefab_signals:
+            return
+        rel = item.data(Qt.UserRole)
+        if not rel:
+            return
+        if item.checkState() == Qt.Checked:
+            self._selected_prefabs.add(rel)
+        else:
+            self._selected_prefabs.discard(rel)
+        self._save_settings()
+
+    def _select_all_prefabs(self) -> None:
+        self._suppress_prefab_signals = True
+        try:
+            for i in range(self._prefab_list.count()):
+                item = self._prefab_list.item(i)
+                item.setCheckState(Qt.Checked)
+                rel = item.data(Qt.UserRole)
+                if rel:
+                    self._selected_prefabs.add(rel)
+        finally:
+            self._suppress_prefab_signals = False
+        self._save_settings()
+
+    def _clear_prefab_selection(self) -> None:
+        self._suppress_prefab_signals = True
+        try:
+            for i in range(self._prefab_list.count()):
+                self._prefab_list.item(i).setCheckState(Qt.Unchecked)
+            self._selected_prefabs.clear()
+        finally:
+            self._suppress_prefab_signals = False
+        self._save_settings()
+
+    def _clear_missing_prefabs(self) -> None:
+        root_text = self._effective_source_text()
+        scrubbed = {str(p).replace("\\", "/") for p in scrub_scope_for(root_text, "*.prefab")}
+        self._selected_prefabs &= scrubbed
+        self._refresh_prefab_list()
+        self._save_settings()
+
+    # ── Cross-stage usage summary + last-run details ───────────────────
+
+    def _refresh_usage_summary(self, project) -> None:
+        """Show what selected prefabs imply for downstream stages — counts
+        of meshes and materials this Stage 1 run will produce, sourced from
+        project.outputs after a run. Pre-run shows just the selection count."""
+        if project is None:
+            self._usage_label.setText("")
+            return
+        sel_count = len(self._selected_prefabs)
+        outputs = project.outputs.get("asset_processor", {}) if project else {}
+        meshes_n = len(outputs.get("meshes", {}))
+        mats_n   = len(outputs.get("materials", {}))
+        last_run = outputs.get("last_run")
+        if last_run and (meshes_n or mats_n):
+            self._usage_label.setText(
+                f"{sel_count} selected · Last run produced {meshes_n} meshes, "
+                f"{mats_n} materials (used by Mesh + Material tabs)."
+            )
+        else:
+            self._usage_label.setText(
+                f"{sel_count} prefab(s) selected · Mesh / Material counts populate after a run."
+            )
+
+    def _refresh_last_run_details(self, project) -> None:
+        """Populate the per-prefab last-run breakdown section. Hidden until
+        a prefab run has populated project.outputs.asset_processor.prefabs."""
+        while self._last_run_box_lay.count():
+            item = self._last_run_box_lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        if project is None:
+            self._last_run_box.setVisible(False)
+            return
+        outputs = project.outputs.get("asset_processor", {})
+        prefab_records = outputs.get("prefabs", {})
+        last_run = outputs.get("last_run")
+        if not last_run or not prefab_records:
+            self._last_run_box.setVisible(False)
+            return
+
+        header = QLabel(
+            f"{len(prefab_records)} prefab(s) recorded · Last run {last_run}"
+        )
+        header.setStyleSheet("color: #a6e3a1; font-size: 9pt; font-weight: bold;")
+        self._last_run_box_lay.addWidget(header)
+        shown_limit = 20
+        for i, (key, rec) in enumerate(sorted(prefab_records.items())):
+            if i >= shown_limit:
+                break
+            out_path  = rec.get("output_path", "?")
+            entities  = len(rec.get("entity_aliases", {}))
+            mat_slots = sum(len(v) for v in rec.get("material_slots", {}).values())
+            label = QLabel(
+                f"  • {out_path}  ·  {entities} entities, {mat_slots} material slot(s)"
+            )
+            label.setStyleSheet("color: #cdd6f4; font-size: 9pt;")
+            label.setWordWrap(True)
+            self._last_run_box_lay.addWidget(label)
+        overflow = len(prefab_records) - shown_limit
+        if overflow > 0:
+            more = QLabel(f"  … and {overflow} more")
+            more.setStyleSheet("color: #6c7086; font-size: 9pt; font-style: italic;")
+            self._last_run_box_lay.addWidget(more)
+        self._last_run_box.setVisible(True)
+
+    def _on_status_changed(self, stage_key: str) -> None:
+        if stage_key != self.STAGE_KEY:
+            return
+        proj = project_manager().current()
+        self._refresh_usage_summary(proj)
+        self._refresh_last_run_details(proj)
 
     def _browse_output(self) -> None:
         start = _resolve_start_dir(self._output_edit.text().strip())
@@ -2001,18 +2358,47 @@ class PrefabProcessorTab(QWidget):
         if not os.path.exists(source):
             QMessageBox.critical(self, "Error", f"Source folder not found:\n{source}")
             return
+        if not self._selected_prefabs:
+            QMessageBox.critical(self, "Error",
+                "No prefabs selected. Check at least one prefab in the list.")
+            return
+
+        # Resolve selected relative paths to absolute files.
+        root = Path(source)
+        resolved: list = []
+        missing:  list = []
+        for rel in sorted(self._selected_prefabs):
+            abs_path = root / rel
+            if abs_path.is_file():
+                resolved.append(abs_path)
+            else:
+                missing.append(rel)
+        if missing:
+            txt = "\n".join(f"  • {m}" for m in missing)
+            reply = QMessageBox.question(
+                self, "Some prefabs missing",
+                f"{len(missing)} selected prefab(s) do not exist:\n{txt}\n\n"
+                f"Continue with the {len(resolved)} that do?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+            )
+            if reply == QMessageBox.No:
+                return
+        if not resolved:
+            QMessageBox.critical(self, "Error", "No selected prefabs exist on disk.")
+            return
 
         self._save_settings()
         self._process_btn.setEnabled(False)
         self._log_edit.clear()
         project_manager().set_processing(self.STAGE_KEY, True)
 
-        self._worker = WorkerThread(self._do_processing, source, output)
+        self._worker = WorkerThread(self._do_processing, source, output, resolved)
         self._worker.emitter.message.connect(self._log)
         self._worker.finished.connect(self._on_finished)
         self._worker.start()
 
-    def _do_processing(self, source_path: str, output_path: str, log) -> str:
+    def _do_processing(self, source_path: str, output_path: str,
+                       prefab_files: list, log) -> str:
         from integrated_asset_processor import IntegratedAssetProcessor
 
         log("\n" + "=" * 60)
@@ -2027,8 +2413,7 @@ class PrefabProcessorTab(QWidget):
             convert_smoothness_to_roughness=cfg["convert_smoothness_to_roughness"],
         )
 
-        prefab_files = list(Path(source_path).rglob('*.prefab'))
-        log(f"\nFound {len(prefab_files)} Unity prefab(s) to process")
+        log(f"\nProcessing {len(prefab_files)} selected Unity prefab(s)")
 
         success_count = 0
         for i, prefab_file in enumerate(prefab_files, 1):
@@ -2106,13 +2491,14 @@ class SceneConverterTab(QWidget):
     def __init__(self):
         super().__init__()
         self._worker: WorkerThread = None
-        self._prefab_dirs: list = []
+        self._prefab_dirs: list = []          # legacy; UI removed in F-4
         self._selected_scenes: set = set()    # relative paths under effective_source
         self._suppress_scene_signals = False  # block itemChanged during apply
         self._last_run_totals: dict = {}
         self._build_ui()
         pm = project_manager()
         pm.project_changed.connect(self.apply_project)
+        pm.status_changed.connect(self._on_status_changed)
         self.apply_project(pm.current())
 
     # -------------------------------------------------------------------------
@@ -2176,23 +2562,23 @@ class SceneConverterTab(QWidget):
         out_lay.addWidget(info_label)
         root.addWidget(out_box)
 
-        # ── Prefab Search Directories (legacy; F-4 will replace) ────────
-        self._prefab_list = QListWidget()
-        add_btn    = QPushButton("Add Directory")
-        remove_btn = QPushButton("Remove Selected")
-        clear_btn  = QPushButton("Clear All")
-        add_btn.clicked.connect(self._add_prefab_directory)
-        remove_btn.clicked.connect(self._remove_prefab_directory)
-        clear_btn.clicked.connect(self._clear_prefab_directories)
-        root.addWidget(_managed_list_section(
-            "Prefab Search Directories", self._prefab_list,
-            add_btn, remove_btn, clear_btn,
-            min_h=80, max_h=140,
-        ))
+        # ── Project Prefab Inventory (F-4: derived from Prefab Processor) ──
+        prefab_box, prefab_lay = _section_groupbox("Project Prefab Inventory")
+        self._project_prefabs_label = QLabel("")
+        self._project_prefabs_label.setWordWrap(True)
+        self._project_prefabs_label.setStyleSheet("color: #cdd6f4; font-size: 9pt;")
+        prefab_lay.addWidget(self._project_prefabs_label)
+        root.addWidget(prefab_box)
 
         # ── Conversion Log ──────────────────────────────────────────────
         self._log_edit = _log_widget()
         root.addWidget(_fill_section("Conversion Log", self._log_edit), stretch=1)
+
+        # ── Last Run Details (per-level breakdown, populated post-run) ──
+        self._last_run_box = _section_groupbox("Last Run Details")[0]
+        self._last_run_box_lay = self._last_run_box.layout()
+        self._last_run_box.setVisible(False)
+        root.addWidget(self._last_run_box)
 
         # ── Action buttons ──────────────────────────────────────────────
         save_log_btn = QPushButton("Save Log…")
@@ -2221,12 +2607,14 @@ class SceneConverterTab(QWidget):
         self._source_edit.setText(cfg.get("source_path", ""))
         self._output_edit.setText(cfg.get("output_path", ""))
         self._selected_scenes = set(cfg.get("selected_scenes", []))
-        self._prefab_dirs = []
-        self._prefab_list.clear()
-        for d in cfg.get("prefab_dirs", []):
-            self._add_dir_to_list(d)
+        # `prefab_dirs` still present in the schema for backwards compat,
+        # but no UI controls it any more. Stage 2 derives the prefab database
+        # from project.outputs.asset_processor (populated by F-4 prefab runs).
+        self._prefab_dirs = list(cfg.get("prefab_dirs", []))
         self._refresh_effective_source_label()
         self._refresh_scene_list()
+        self._refresh_project_prefabs_label(project)
+        self._refresh_last_run_details(project)
 
     def _collect_stage_settings(self) -> dict:
         return {
@@ -2371,35 +2759,108 @@ class SceneConverterTab(QWidget):
         self._refresh_scene_list()
         self._save_settings()
 
+    # ── Project prefab inventory (read from F-4 outputs) ───────────────
+
+    def _refresh_project_prefabs_label(self, project) -> None:
+        """Show how many converted prefabs are available to resolve scene
+        references, derived from `project.outputs.asset_processor.prefabs`.
+        Updated on every apply_project + on status_changed."""
+        if project is None:
+            self._project_prefabs_label.setText(
+                "(no project loaded — converted prefabs cannot be resolved)"
+            )
+            self._project_prefabs_label.setStyleSheet("color: #f9e2af; font-size: 9pt;")
+            return
+        outputs = project.outputs.get("asset_processor", {})
+        prefab_records = outputs.get("prefabs", {})
+        sel_count = len(project.stage_settings("asset_processor").get("selected_prefabs", []) or [])
+        if prefab_records:
+            self._project_prefabs_label.setText(
+                f"{len(prefab_records)} prefab(s) available from the last Prefab Processor "
+                f"run. Selected scenes will resolve references against these. "
+                f"({sel_count} prefab(s) currently marked for processing.)"
+            )
+            self._project_prefabs_label.setStyleSheet("color: #a6e3a1; font-size: 9pt;")
+        elif sel_count > 0:
+            self._project_prefabs_label.setText(
+                f"{sel_count} prefab(s) selected in the Prefab Processor tab, but the "
+                f"prefab run hasn't completed yet — scene references won't resolve "
+                f"until you Process Assets first."
+            )
+            self._project_prefabs_label.setStyleSheet("color: #f9e2af; font-size: 9pt;")
+        else:
+            self._project_prefabs_label.setText(
+                "No prefabs available yet. Open the Prefab Processor tab to mark "
+                "prefabs and run the conversion before processing scenes."
+            )
+            self._project_prefabs_label.setStyleSheet("color: #f9e2af; font-size: 9pt;")
+
+    # ── Last-run per-level breakdown (post-conversion details) ─────────
+
+    def _refresh_last_run_details(self, project) -> None:
+        """Populate the per-level breakdown of the last scene conversion.
+        Hidden until `project.outputs.scene_converter.scenes` has entries."""
+        while self._last_run_box_lay.count():
+            item = self._last_run_box_lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        if project is None:
+            self._last_run_box.setVisible(False)
+            return
+        outputs = project.outputs.get("scene_converter", {})
+        scenes = outputs.get("scenes", {})
+        last_run = outputs.get("last_run")
+        if not last_run or not scenes:
+            self._last_run_box.setVisible(False)
+            return
+
+        header = QLabel(
+            f"{len(scenes)} level(s) generated · Last run {last_run}"
+        )
+        header.setStyleSheet("color: #a6e3a1; font-size: 9pt; font-weight: bold;")
+        self._last_run_box_lay.addWidget(header)
+        for name, rec in sorted(scenes.items()):
+            stem = name.replace(".unity", "")
+            entities = rec.get("entities", 0)
+            refs     = rec.get("prefab_references", 0)
+            blanks   = rec.get("blanks", 0)
+            missing  = len(rec.get("missing_prefabs", []) or [])
+            written  = rec.get("written_at", "")
+            out_path = rec.get("output_path", "?")
+            line1 = QLabel(
+                f"  • {stem} → {out_path}  ·  {written}"
+            )
+            line1.setStyleSheet("color: #cdd6f4; font-size: 9pt;")
+            line1.setWordWrap(True)
+            self._last_run_box_lay.addWidget(line1)
+            line2 = QLabel(
+                f"        {entities} entities · {refs} prefab refs · "
+                f"{blanks} blanks · {missing} missing"
+            )
+            color = "#fab387" if missing else "#a6adc8"
+            line2.setStyleSheet(f"color: {color}; font-size: 9pt;")
+            self._last_run_box_lay.addWidget(line2)
+        self._last_run_box.setVisible(True)
+
+    def _on_status_changed(self, stage_key: str) -> None:
+        # Refresh both the cross-stage inventory (when prefab outputs change)
+        # and the per-level breakdown (when scene outputs change).
+        proj = project_manager().current()
+        if stage_key == "asset_processor":
+            self._refresh_project_prefabs_label(proj)
+        elif stage_key == self.STAGE_KEY:
+            self._refresh_last_run_details(proj)
+            self._refresh_project_prefabs_label(proj)
+
     # -------------------------------------------------------------------------
     # PREFAB DIRECTORY LIST
     # -------------------------------------------------------------------------
 
-    def _add_prefab_directory(self) -> None:
-        # Start the picker inside the last prefab dir if there is one,
-        # else the output folder. Either is a sensible neighborhood.
-        last_dir = self._prefab_dirs[-1] if self._prefab_dirs else ""
-        start    = _resolve_start_dir(last_dir) or _resolve_start_dir(self._output_edit.text().strip())
-        d = QFileDialog.getExistingDirectory(self, "Select O3DE Prefab Directory", start)
-        if d and d not in self._prefab_dirs:
-            self._add_dir_to_list(d)
-            self._save_settings()
-
-    def _add_dir_to_list(self, path: str) -> None:
-        self._prefab_dirs.append(path)
-        self._prefab_list.addItem(QListWidgetItem(path))
-
-    def _remove_prefab_directory(self) -> None:
-        for item in self._prefab_list.selectedItems():
-            row = self._prefab_list.row(item)
-            self._prefab_list.takeItem(row)
-            self._prefab_dirs.pop(row)
-        self._save_settings()
-
-    def _clear_prefab_directories(self) -> None:
-        self._prefab_list.clear()
-        self._prefab_dirs.clear()
-        self._save_settings()
+    # Legacy `prefab_dirs` UI removed in F-4. The Scene Converter derives
+    # its prefab database from `project.outputs.asset_processor.prefabs` —
+    # see `_collect_prefab_db_paths` below — so the user no longer manages
+    # the list explicitly. The schema field stays for backward compat.
 
     # -------------------------------------------------------------------------
     # LOGGING
@@ -2467,10 +2928,18 @@ class SceneConverterTab(QWidget):
             QMessageBox.critical(self, "Error", "No selected scenes exist on disk.")
             return
 
-        if not self._prefab_dirs:
-            QMessageBox.warning(self, "Warning",
-                "No prefab search directories added. Prefab references will not "
-                "be resolved.")
+        # Derive the prefab search dirs from the project's prefab outputs.
+        # F-4 dropped the manual `prefab_dirs` UI; the Stage 1 output_path
+        # is the canonical location for converted prefabs.
+        prefab_search_dirs = self._collect_prefab_db_paths()
+        if not prefab_search_dirs:
+            reply = QMessageBox.question(self, "No prefab inventory",
+                "The project has no Prefab Processor outputs yet, so scene "
+                "references won't resolve to any prefabs. Continue anyway "
+                "(all instances will be recorded as missing)?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply == QMessageBox.No:
+                return
 
         self._save_settings()
         self._convert_btn.setEnabled(False)
@@ -2479,11 +2948,31 @@ class SceneConverterTab(QWidget):
         project_manager().set_processing(self.STAGE_KEY, True)
 
         self._worker = WorkerThread(
-            self._do_multi_conversion, resolved, output, self._prefab_dirs[:]
+            self._do_multi_conversion, resolved, output, prefab_search_dirs,
         )
         self._worker.emitter.message.connect(self._log)
         self._worker.finished.connect(self._on_finished)
         self._worker.start()
+
+    def _collect_prefab_db_paths(self) -> list:
+        """Build the list of directories Stage 2's PrefabDatabase should scan
+        for converted .prefab files. F-4 derives this from
+        `project.stages.asset_processor.output_path`; any legacy
+        `prefab_dirs` entries are appended for backwards compat with
+        projects that point at shared prefab libraries outside the project
+        output."""
+        dirs: list = []
+        proj = project_manager().current()
+        if proj is not None:
+            ap_cfg = proj.stage_settings("asset_processor")
+            ap_out = (ap_cfg.get("output_path") or "").strip()
+            if ap_out:
+                # Stage 1 writes prefabs into <output>/Prefabs/.
+                dirs.append(str(Path(ap_out) / "Prefabs"))
+        for d in (self._prefab_dirs or []):
+            if d and d not in dirs:
+                dirs.append(d)
+        return dirs
 
     def _do_multi_conversion(self, scenes: list, output_dir: str,
                              prefab_dirs: list, log) -> str:
@@ -2634,7 +3123,1620 @@ class SceneConverterTab(QWidget):
 
 
 # =============================================================================
-# TAB 3 — TERRAIN
+# TAB 3 — MESH (stub for F-5)
+# =============================================================================
+
+class _InventoryStubTab(QWidget):
+    """Shared scaffolding for the Mesh and Material stub tabs.
+
+    Both render the same shape:
+      - intro section explaining the cross-stage relationship
+      - inventory list populated from `project.outputs.asset_processor.<key>`
+        (filled by Prefab Processor runs)
+      - last-run details footer
+      - disabled Process button (real processing arrives with F-5/F-6)
+
+    Subclasses set:
+      STAGE_KEY        — informational only (no project schema yet)
+      OUTPUTS_KEY      — sub-key under outputs.asset_processor (meshes/materials)
+      TITLE            — tab title for the inventory section
+      EMPTY_MSG        — placeholder when no inventory exists
+      FUTURE_F         — "F-5" / "F-6" — surfaced in the disabled Process button
+    """
+
+    STAGE_KEY:    str = ""
+    OUTPUTS_KEY:  str = ""
+    TITLE:        str = ""
+    EMPTY_MSG:    str = ""
+    FUTURE_F:     str = ""
+
+    def __init__(self):
+        super().__init__()
+        self._build_ui()
+        pm = project_manager()
+        pm.project_changed.connect(self.apply_project)
+        pm.status_changed.connect(self._on_status_changed)
+        self.apply_project(pm.current())
+
+    def _build_ui(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        content = QWidget()
+        root = QVBoxLayout(content)
+        root.setSpacing(12)
+        root.setContentsMargins(16, 16, 16, 16)
+
+        # Intro section.
+        intro_box, intro_lay = _section_groupbox(self.TITLE)
+        intro = QLabel(
+            f"{self.TITLE} populates from the Prefab Processor's last run. "
+            f"Run the Prefab Processor first; the inventory below will "
+            f"populate, and Stage 1 will hold the extracted {self.OUTPUTS_KEY} "
+            f"in the project file under outputs.asset_processor.{self.OUTPUTS_KEY}."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #cdd6f4; font-size: 9pt;")
+        intro_lay.addWidget(intro)
+        root.addWidget(intro_box)
+
+        # Inventory section (always visible; shows EMPTY_MSG when blank).
+        inv_box, inv_lay = _section_groupbox("Inventory")
+        self._inv_list = QListWidget()
+        _bound_list_height(self._inv_list, min_h=140, max_h=260)
+        inv_lay.addWidget(self._inv_list)
+        self._inv_summary = QLabel("")
+        self._inv_summary.setStyleSheet("color: #6c7086; font-size: 9pt;")
+        self._inv_summary.setWordWrap(True)
+        inv_lay.addWidget(self._inv_summary)
+        root.addWidget(inv_box)
+
+        # Last-run details (mirrors the pattern used in Prefab + Scene tabs).
+        self._last_run_box = _section_groupbox("Last Run Details")[0]
+        self._last_run_box_lay = self._last_run_box.layout()
+        self._last_run_box.setVisible(False)
+        root.addWidget(self._last_run_box)
+
+        # Action row — Process button is disabled; tooltip explains why.
+        process_btn = QPushButton(f"Process ({self.FUTURE_F})")
+        process_btn.setObjectName("primary")
+        process_btn.setEnabled(False)
+        process_btn.setToolTip(
+            f"Not yet implemented — arrives with {self.FUTURE_F}. The Mesh / "
+            f"Material processing stages will live here."
+        )
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
+        action_row.addStretch(1)
+        action_row.addWidget(process_btn)
+        root.addLayout(action_row)
+
+        outer.addWidget(_scroll_wrap(content))
+
+    def apply_project(self, project) -> None:
+        self._refresh_inventory(project)
+        self._refresh_last_run(project)
+
+    def _on_status_changed(self, stage_key: str) -> None:
+        # We listen for asset_processor updates because that's where our
+        # inventory comes from.
+        if stage_key != "asset_processor":
+            return
+        self.apply_project(project_manager().current())
+
+    def _refresh_inventory(self, project) -> None:
+        self._inv_list.clear()
+        if project is None:
+            self._inv_summary.setText("(no project loaded)")
+            return
+        outputs = project.outputs.get("asset_processor", {})
+        inventory = outputs.get(self.OUTPUTS_KEY, {}) or {}
+        if not inventory:
+            self._inv_summary.setText(self.EMPTY_MSG)
+            return
+
+        for key, value in sorted(inventory.items(), key=lambda kv: str(kv[1])):
+            # Materials store guid → asset_hint (string).
+            # Meshes store guid → output stem (string).
+            display = f"{value}      [guid {key[:8]}…]"
+            item = QListWidgetItem(display)
+            item.setToolTip(f"GUID: {key}\nValue: {value}")
+            self._inv_list.addItem(item)
+
+        prefab_count = len(outputs.get("prefabs", {}))
+        last_run     = outputs.get("last_run", "")
+        self._inv_summary.setText(
+            f"{len(inventory)} {self.OUTPUTS_KEY} from {prefab_count} prefab(s) "
+            f"· Last Prefab Processor run: {last_run or '(never)'}"
+        )
+
+    def _refresh_last_run(self, project) -> None:
+        while self._last_run_box_lay.count():
+            item = self._last_run_box_lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        if project is None:
+            self._last_run_box.setVisible(False)
+            return
+        outputs = project.outputs.get("asset_processor", {})
+        inventory = outputs.get(self.OUTPUTS_KEY, {}) or {}
+        last_run  = outputs.get("last_run")
+        if not last_run or not inventory:
+            self._last_run_box.setVisible(False)
+            return
+
+        header = QLabel(
+            f"{len(inventory)} {self.OUTPUTS_KEY} extracted · Last run {last_run}"
+        )
+        header.setStyleSheet("color: #a6e3a1; font-size: 9pt; font-weight: bold;")
+        self._last_run_box_lay.addWidget(header)
+        shown_limit = 20
+        for i, (key, value) in enumerate(sorted(inventory.items(), key=lambda kv: str(kv[1]))):
+            if i >= shown_limit:
+                break
+            label = QLabel(f"  • {value}  (guid {key[:8]}…)")
+            label.setStyleSheet("color: #cdd6f4; font-size: 9pt;")
+            label.setWordWrap(True)
+            self._last_run_box_lay.addWidget(label)
+        overflow = len(inventory) - shown_limit
+        if overflow > 0:
+            more = QLabel(f"  … and {overflow} more")
+            more.setStyleSheet("color: #6c7086; font-size: 9pt; font-style: italic;")
+            self._last_run_box_lay.addWidget(more)
+        self._last_run_box.setVisible(True)
+
+
+# =============================================================================
+# F-5: Multi-edit numeric field
+# =============================================================================
+
+class _FloatField(QLineEdit):
+    """Single-line float field for multi-select editing of mesh overrides.
+
+    States:
+      - `set_common(value)`: all selected meshes share this value → field
+        displays it.
+      - `set_common(None)`: selected meshes have differing values → field
+        clears its text and shows the `…` placeholder.
+      - `set_disabled_blank()`: no selection → field is empty + disabled.
+
+    Emits `committed(float)` only when the user finishes editing with a
+    parseable value AND the field isn't programmatically suppressed."""
+
+    committed = Signal(float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        validator = QDoubleValidator(self)
+        validator.setNotation(QDoubleValidator.StandardNotation)
+        self.setValidator(validator)
+        self.setFixedWidth(70)
+        self.setAlignment(Qt.AlignRight)
+        self._suppress = False
+        self.editingFinished.connect(self._on_editing_finished)
+
+    def set_common(self, value) -> None:
+        """If `value` is None → mixed-state (placeholder `…`).
+        Otherwise display the value."""
+        self._suppress = True
+        self.setEnabled(True)
+        if value is None:
+            self.setText("")
+            self.setPlaceholderText("…")
+        else:
+            self.setText(f"{value:g}")
+            self.setPlaceholderText("")
+        self._suppress = False
+
+    def set_disabled_blank(self) -> None:
+        self._suppress = True
+        self.setText("")
+        self.setPlaceholderText("")
+        self.setEnabled(False)
+        self._suppress = False
+
+    def _on_editing_finished(self) -> None:
+        if self._suppress or not self.isEnabled():
+            return
+        text = self.text().strip()
+        if not text:
+            return
+        try:
+            self.committed.emit(float(text))
+        except ValueError:
+            pass
+
+
+# =============================================================================
+# TAB 3 — MESH (F-5 — defaults + per-mesh overrides)
+# =============================================================================
+
+# Field schema for both defaults + overrides. Each entry: (key, display label,
+# kind). Kinds: 'bool', 'vec3'. Used to drive the form-rendering code below.
+_MESH_FIELDS = [
+    ("zero_position",    "Zero position on import",     "bool"),
+    ("default_position", "Default position (X / Y / Z)", "vec3"),
+    ("default_rotation", "Default rotation (X / Y / Z)", "vec3"),
+]
+
+
+class MeshTab(QWidget):
+    """Mesh preprocessing — F-5.
+
+    Layout (top to bottom):
+      1. Default Mesh Settings — global values used when a mesh has no
+         override entry.
+      2. Mesh Inventory — read-only list of meshes from
+         `outputs.asset_processor.meshes`. Multi-selectable. Meshes with
+         overrides get a ★ marker.
+      3. Selection Overrides — appears when ≥1 mesh is selected. Fields
+         reflect common values across the selection (or `…` for mixed).
+         Editing a field applies to every selected mesh.
+      4. Last Run Details — same pattern as Prefab + Scene tabs.
+
+    Mesh entries are NEVER de-selectable: they reflect the meshes the
+    Prefab Processor produced, and removing them would break prefab /
+    scene dependencies. The multi-selection here is purely for editing
+    overrides, not for inclusion/exclusion.
+    """
+
+    STAGE_KEY = "mesh_processor"
+
+    def __init__(self):
+        super().__init__()
+        self._suppress_field_signals = False
+        self._build_ui()
+        pm = project_manager()
+        pm.project_changed.connect(self.apply_project)
+        pm.status_changed.connect(self._on_status_changed)
+        self.apply_project(pm.current())
+
+    # -------------------------------------------------------------------------
+    # UI
+    # -------------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        content = QWidget()
+        root = QVBoxLayout(content)
+        root.setSpacing(12)
+        root.setContentsMargins(16, 16, 16, 16)
+
+        # ── Default Mesh Settings ───────────────────────────────────────
+        defaults_box, defaults_lay = _section_groupbox("Default Mesh Settings")
+        info = QLabel(
+            "Project-wide defaults applied to every mesh unless an override "
+            "exists for that mesh below. Changes here automatically affect "
+            "every mesh that doesn't have its own override."
+        )
+        info.setStyleSheet("color: #6c7086; font-size: 9pt;")
+        info.setWordWrap(True)
+        defaults_lay.addWidget(info)
+
+        self._default_fields = self._build_field_form(defaults_lay, scope="defaults")
+        root.addWidget(defaults_box)
+
+        # ── Mesh Inventory ──────────────────────────────────────────────
+        inv_box, inv_lay = _section_groupbox("Mesh Inventory")
+        inv_info = QLabel(
+            "Meshes the Prefab Processor produced. Selection is for editing "
+            "overrides only — meshes can't be de-selected without breaking "
+            "the prefabs that reference them. ★ marks meshes with overrides."
+        )
+        inv_info.setStyleSheet("color: #6c7086; font-size: 9pt;")
+        inv_info.setWordWrap(True)
+        inv_lay.addWidget(inv_info)
+
+        self._inv_list = QListWidget()
+        _bound_list_height(self._inv_list, min_h=140, max_h=240)
+        self._inv_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self._inv_list.itemSelectionChanged.connect(self._on_selection_changed)
+        inv_lay.addWidget(self._inv_list)
+
+        self._inv_summary = QLabel("")
+        self._inv_summary.setStyleSheet("color: #6c7086; font-size: 9pt;")
+        self._inv_summary.setWordWrap(True)
+        inv_lay.addWidget(self._inv_summary)
+        root.addWidget(inv_box)
+
+        # ── Selection Overrides ─────────────────────────────────────────
+        self._override_box, override_lay = _section_groupbox("Selection Overrides")
+        self._override_header = QLabel("Select one or more meshes above to edit.")
+        self._override_header.setStyleSheet("color: #6c7086; font-size: 9pt;")
+        self._override_header.setWordWrap(True)
+        override_lay.addWidget(self._override_header)
+
+        self._override_fields = self._build_field_form(override_lay, scope="override")
+
+        self._clear_override_btn = QPushButton("Clear Override for Selection")
+        self._clear_override_btn.clicked.connect(self._clear_override_for_selection)
+        self._clear_override_btn.setEnabled(False)
+        clear_row = QHBoxLayout()
+        clear_row.addStretch(1)
+        clear_row.addWidget(self._clear_override_btn)
+        override_lay.addLayout(clear_row)
+        root.addWidget(self._override_box)
+
+        # ── Last Run Details ────────────────────────────────────────────
+        self._last_run_box = _section_groupbox("Last Run Details")[0]
+        self._last_run_box_lay = self._last_run_box.layout()
+        self._last_run_box.setVisible(False)
+        root.addWidget(self._last_run_box)
+
+        # ── Disabled action button — full processing pipeline lands later ─
+        process_btn = QPushButton("Process (per-mesh worker — coming)")
+        process_btn.setObjectName("primary")
+        process_btn.setEnabled(False)
+        process_btn.setToolTip(
+            "Mesh overrides are currently stored in the project file; the "
+            "worker that applies them at .assetinfo generation time arrives "
+            "in a follow-up iteration of F-5."
+        )
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
+        action_row.addStretch(1)
+        action_row.addWidget(process_btn)
+        root.addLayout(action_row)
+
+        outer.addWidget(_scroll_wrap(content))
+
+    def _build_field_form(self, parent_lay: QVBoxLayout, *, scope: str) -> dict:
+        """Construct widgets for every field in `_MESH_FIELDS`. Returns
+        `{field_key: widgets}` where the value for `bool` is a single
+        QCheckBox and for `vec3` is a 3-tuple of `_FloatField`s."""
+        widgets: dict = {}
+        form = QFormLayout()
+        form.setSpacing(8)
+        form.setContentsMargins(0, 4, 0, 4)
+        for key, label, kind in _MESH_FIELDS:
+            if kind == "bool":
+                cb = QCheckBox(label)
+                cb.setTristate(scope == "override")  # only the override form supports mixed
+                cb.stateChanged.connect(
+                    lambda state, k=key, s=scope:
+                        self._on_field_changed(s, k, state == Qt.Checked)
+                )
+                widgets[key] = cb
+                form.addRow(cb)
+            elif kind == "vec3":
+                fx, fy, fz = _FloatField(), _FloatField(), _FloatField()
+                for axis, w in (("x", fx), ("y", fy), ("z", fz)):
+                    w.committed.connect(
+                        lambda value, k=key, a=axis, s=scope:
+                            self._on_field_changed(s, (k, a), value)
+                    )
+                widgets[key] = (fx, fy, fz)
+                row = _hbox(QLabel("X:"), fx, QLabel("Y:"), fy, QLabel("Z:"), fz,
+                            trailing_stretch=True)
+                form.addRow(label, _wrap_layout(row))
+        parent_lay.addLayout(form)
+        return widgets
+
+    # -------------------------------------------------------------------------
+    # APPLY / REFRESH
+    # -------------------------------------------------------------------------
+
+    def apply_project(self, project) -> None:
+        self._refresh_defaults_fields(project)
+        self._refresh_inventory(project)
+        self._refresh_override_fields()
+        self._refresh_last_run(project)
+
+    def _on_status_changed(self, stage_key: str) -> None:
+        # Inventory comes from asset_processor outputs; refresh on those.
+        # Our own stage updates also need re-render (defaults changes).
+        if stage_key not in ("asset_processor", self.STAGE_KEY):
+            return
+        self.apply_project(project_manager().current())
+
+    def _refresh_defaults_fields(self, project) -> None:
+        if project is None:
+            return
+        cfg = project.stage_settings(self.STAGE_KEY)
+        defaults = cfg.get("defaults", {}) or {}
+        self._suppress_field_signals = True
+        try:
+            for key, _, kind in _MESH_FIELDS:
+                if kind == "bool":
+                    cb = self._default_fields[key]
+                    cb.setChecked(bool(defaults.get(key, False)))
+                elif kind == "vec3":
+                    vec = defaults.get(key, [0.0, 0.0, 0.0])
+                    if not isinstance(vec, (list, tuple)) or len(vec) != 3:
+                        vec = [0.0, 0.0, 0.0]
+                    for axis_idx, w in enumerate(self._default_fields[key]):
+                        w.set_common(float(vec[axis_idx]))
+        finally:
+            self._suppress_field_signals = False
+
+    def _refresh_inventory(self, project) -> None:
+        self._inv_list.clear()
+        if project is None:
+            self._inv_summary.setText("(no project loaded)")
+            return
+        ap = project.outputs.get("asset_processor", {})
+        meshes = ap.get("meshes", {}) or {}
+        mp = project.stage_settings(self.STAGE_KEY)
+        overrides = mp.get("overrides", {}) or {}
+
+        if not meshes:
+            self._inv_summary.setText(
+                "No meshes extracted yet. Mark prefabs and run the Prefab Processor."
+            )
+            return
+
+        for guid, stem in sorted(meshes.items(), key=lambda kv: str(kv[1]).lower()):
+            has_override = guid in overrides
+            text = f"{'★ ' if has_override else '   '}{stem}"
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, guid)
+            item.setToolTip(f"GUID: {guid}\nOutput stem: {stem}"
+                            + ("\nOverride applied" if has_override else ""))
+            if has_override:
+                f = item.font()
+                f.setBold(True)
+                item.setFont(f)
+                item.setForeground(Qt.cyan)
+            self._inv_list.addItem(item)
+
+        override_count = sum(1 for g in meshes if g in overrides)
+        self._inv_summary.setText(
+            f"{len(meshes)} mesh(es) · {override_count} with overrides · "
+            f"select one or more to edit their settings"
+        )
+
+    def _selected_mesh_guids(self) -> list:
+        guids: list = []
+        for item in self._inv_list.selectedItems():
+            g = item.data(Qt.UserRole)
+            if g:
+                guids.append(g)
+        return guids
+
+    def _on_selection_changed(self) -> None:
+        self._refresh_override_fields()
+
+    def _refresh_override_fields(self) -> None:
+        """Populate the override editor based on current selection. Show
+        common values, `…` for mixed, disable when nothing selected."""
+        guids = self._selected_mesh_guids()
+        proj = project_manager().current()
+        if not guids or proj is None:
+            self._override_header.setText("Select one or more meshes above to edit.")
+            self._clear_override_btn.setEnabled(False)
+            for key, _, kind in _MESH_FIELDS:
+                if kind == "bool":
+                    cb = self._override_fields[key]
+                    self._suppress_field_signals = True
+                    cb.setCheckState(Qt.Unchecked)
+                    cb.setEnabled(False)
+                    self._suppress_field_signals = False
+                elif kind == "vec3":
+                    for w in self._override_fields[key]:
+                        w.set_disabled_blank()
+            return
+
+        cfg = proj.stage_settings(self.STAGE_KEY)
+        defaults  = cfg.get("defaults",  {}) or {}
+        overrides = cfg.get("overrides", {}) or {}
+
+        any_override = any(g in overrides for g in guids)
+        self._override_header.setText(
+            f"{len(guids)} mesh(es) selected · "
+            f"{sum(1 for g in guids if g in overrides)} with override(s) · "
+            f"editing applies to all selected"
+        )
+        self._clear_override_btn.setEnabled(any_override)
+
+        self._suppress_field_signals = True
+        try:
+            for key, _, kind in _MESH_FIELDS:
+                # Compute the effective value for each selected mesh, then
+                # check whether they all agree.
+                values = []
+                for g in guids:
+                    eff = overrides.get(g, {}).get(key, defaults.get(key))
+                    values.append(eff)
+                common = self._common_value(values)
+
+                if kind == "bool":
+                    cb = self._override_fields[key]
+                    cb.setEnabled(True)
+                    if common is None:
+                        cb.setCheckState(Qt.PartiallyChecked)
+                    else:
+                        cb.setCheckState(Qt.Checked if common else Qt.Unchecked)
+                elif kind == "vec3":
+                    # Each axis is independently mixed/common.
+                    if common is None:
+                        # Per-axis comparison
+                        axis_commons = []
+                        for axis_idx in range(3):
+                            axis_values = [
+                                (v[axis_idx] if isinstance(v, (list, tuple)) and len(v) == 3
+                                 else 0.0)
+                                for v in values
+                            ]
+                            axis_commons.append(self._common_value(axis_values))
+                    else:
+                        axis_commons = list(common)
+                    for axis_idx, w in enumerate(self._override_fields[key]):
+                        ac = axis_commons[axis_idx]
+                        if ac is None:
+                            w.set_common(None)
+                        else:
+                            w.set_common(float(ac))
+        finally:
+            self._suppress_field_signals = False
+
+    @staticmethod
+    def _common_value(values: list):
+        """Return the shared value if every entry matches, else None."""
+        if not values:
+            return None
+        first = values[0]
+        for v in values[1:]:
+            if v != first:
+                return None
+        return first
+
+    # -------------------------------------------------------------------------
+    # FIELD EDIT HANDLERS
+    # -------------------------------------------------------------------------
+
+    def _on_field_changed(self, scope: str, key, value) -> None:
+        """`scope` is 'defaults' or 'override'. `key` is either a field key
+        ('zero_position', 'default_position', ...) or a (vec_key, axis)
+        tuple for per-axis float commits."""
+        if self._suppress_field_signals:
+            return
+        pm = project_manager()
+        proj = pm.current()
+        if proj is None:
+            return
+
+        cfg = dict(proj.stage_settings(self.STAGE_KEY))
+        defaults  = dict(cfg.get("defaults",  {}) or {})
+        overrides = dict(cfg.get("overrides", {}) or {})
+
+        if scope == "defaults":
+            self._apply_field_value(defaults, key, value)
+        else:  # 'override' — applies to every selected mesh
+            for g in self._selected_mesh_guids():
+                entry = dict(overrides.get(g, {}))
+                self._apply_field_value(entry, key, value)
+                overrides[g] = entry
+
+        cfg["defaults"]  = defaults
+        cfg["overrides"] = overrides
+        pm.update_stage(self.STAGE_KEY, cfg)
+
+        # Re-render: defaults change cascades to inventory + override view,
+        # override change updates the inventory marker + override readout.
+        self._refresh_inventory(proj)
+        self._refresh_override_fields()
+
+    @staticmethod
+    def _apply_field_value(target: dict, key, value) -> None:
+        """Apply a single committed value into a defaults / override dict."""
+        if isinstance(key, tuple):
+            vec_key, axis = key
+            axis_idx = {"x": 0, "y": 1, "z": 2}[axis]
+            vec = list(target.get(vec_key, [0.0, 0.0, 0.0]))
+            while len(vec) < 3:
+                vec.append(0.0)
+            vec[axis_idx] = float(value)
+            target[vec_key] = vec
+        else:
+            target[key] = value
+
+    def _clear_override_for_selection(self) -> None:
+        pm = project_manager()
+        proj = pm.current()
+        if proj is None:
+            return
+        cfg = dict(proj.stage_settings(self.STAGE_KEY))
+        overrides = dict(cfg.get("overrides", {}) or {})
+        for g in self._selected_mesh_guids():
+            overrides.pop(g, None)
+        cfg["overrides"] = overrides
+        pm.update_stage(self.STAGE_KEY, cfg)
+        self._refresh_inventory(proj)
+        self._refresh_override_fields()
+
+    # -------------------------------------------------------------------------
+    # LAST-RUN DETAILS (same shape as the other tabs)
+    # -------------------------------------------------------------------------
+
+    def _refresh_last_run(self, project) -> None:
+        while self._last_run_box_lay.count():
+            item = self._last_run_box_lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        if project is None:
+            self._last_run_box.setVisible(False)
+            return
+        outputs = project.outputs.get("asset_processor", {})
+        meshes  = outputs.get("meshes", {}) or {}
+        last_run = outputs.get("last_run")
+        if not last_run or not meshes:
+            self._last_run_box.setVisible(False)
+            return
+
+        header = QLabel(
+            f"{len(meshes)} mesh(es) extracted · Last Prefab Processor run {last_run}"
+        )
+        header.setStyleSheet("color: #a6e3a1; font-size: 9pt; font-weight: bold;")
+        self._last_run_box_lay.addWidget(header)
+        shown_limit = 20
+        for i, (g, stem) in enumerate(sorted(meshes.items(), key=lambda kv: str(kv[1]).lower())):
+            if i >= shown_limit:
+                break
+            label = QLabel(f"  • {stem}  (guid {g[:8]}…)")
+            label.setStyleSheet("color: #cdd6f4; font-size: 9pt;")
+            label.setWordWrap(True)
+            self._last_run_box_lay.addWidget(label)
+        overflow = len(meshes) - shown_limit
+        if overflow > 0:
+            more = QLabel(f"  … and {overflow} more")
+            more.setStyleSheet("color: #6c7086; font-size: 9pt; font-style: italic;")
+            self._last_run_box_lay.addWidget(more)
+        self._last_run_box.setVisible(True)
+
+
+def _wrap_layout(layout) -> QWidget:
+    """Wrap a QLayout in a transparent QWidget so it can be used wherever a
+    widget is expected (e.g. QFormLayout.addRow's value slot)."""
+    w = QWidget()
+    w.setLayout(layout)
+    return w
+
+
+# =============================================================================
+# TAB 4 — MATERIALS (F-6 — shader mappings + per-material overrides)
+# =============================================================================
+
+# O3DE StandardPBR texture slots that the material tab exposes for rebinding.
+# Order is the visual order in the override section.
+_MATERIAL_TEXTURE_SLOTS = [
+    "baseColor",
+    "normal",
+    "metallic",
+    "roughness",
+    "occlusion",
+    "emissive",
+]
+
+
+class _PathField(QWidget):
+    """Editable file-path field with multi-select semantics. Row layout:
+    [QLineEdit] [Browse…] [Clear]. Same `set_common(value)` /
+    `set_common(None)` / `set_disabled_blank()` API as `_FloatField` so
+    the multi-edit machinery reads the same way.
+
+    `committed(str)` fires when the user finishes editing (Enter, focus
+    loss, or picks a file via Browse). `cleared()` fires when the user
+    hits Clear (distinguishes "set to empty" from "remove the override").
+    """
+
+    committed = Signal(str)
+    cleared   = Signal()
+
+    def __init__(self, parent=None, *, dialog_caption: str = "Select file",
+                 dialog_filter: str = "All files (*.*)"):
+        super().__init__(parent)
+        self._dialog_caption = dialog_caption
+        self._dialog_filter  = dialog_filter
+        self._suppress = False
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+
+        self._edit = QLineEdit()
+        self._edit.editingFinished.connect(self._on_editing_finished)
+        lay.addWidget(self._edit, 1)
+
+        self._browse_btn = QPushButton("Browse…")
+        self._browse_btn.setCursor(Qt.PointingHandCursor)
+        self._browse_btn.setMinimumWidth(0)
+        self._browse_btn.clicked.connect(self._on_browse)
+        lay.addWidget(self._browse_btn)
+
+        self._clear_btn = QPushButton("Clear")
+        self._clear_btn.setCursor(Qt.PointingHandCursor)
+        self._clear_btn.setMinimumWidth(0)
+        self._clear_btn.clicked.connect(self.cleared.emit)
+        lay.addWidget(self._clear_btn)
+
+    def set_common(self, value) -> None:
+        """`value=None` → mixed-state placeholder. Empty string → cleared
+        (no path set). Otherwise display the path."""
+        self._suppress = True
+        self.setEnabled(True)
+        self._edit.setEnabled(True)
+        self._browse_btn.setEnabled(True)
+        self._clear_btn.setEnabled(True)
+        if value is None:
+            self._edit.setText("")
+            self._edit.setPlaceholderText("…")
+        elif value == "":
+            self._edit.setText("")
+            self._edit.setPlaceholderText("(no path set)")
+        else:
+            self._edit.setText(str(value))
+            self._edit.setPlaceholderText("")
+        self._suppress = False
+
+    def set_disabled_blank(self) -> None:
+        self._suppress = True
+        self._edit.setText("")
+        self._edit.setPlaceholderText("")
+        self.setEnabled(False)
+        self._suppress = False
+
+    def _on_editing_finished(self) -> None:
+        if self._suppress or not self.isEnabled():
+            return
+        self.committed.emit(self._edit.text().strip())
+
+    def _on_browse(self) -> None:
+        start = _resolve_start_path(self._edit.text().strip())
+        f, _ = QFileDialog.getOpenFileName(
+            self, self._dialog_caption, start, self._dialog_filter,
+        )
+        if f:
+            self._edit.setText(f)
+            self.committed.emit(f)
+
+
+class ShaderMappingsDialog(QDialog):
+    """Popout editor for the project's Unity-shader → O3DE-materialtype table.
+
+    Rows are populated from DETECTED shaders only — i.e. the union of shader
+    names extracted across the project's material metadata. Mapped shaders
+    render with a path-field showing the current target; unmapped shaders
+    render the same way but with a ⚠ marker on the label so it's obvious
+    what needs attention.
+
+    Edits live-save through `project_manager.update_stage` and emit
+    `mappings_changed` so the owning `MaterialTab` can refresh its summary
+    and inventory immediately.
+    """
+
+    STAGE_KEY = "material_processor"
+
+    mappings_changed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Shader Mappings")
+        self.setModal(False)
+        self.resize(640, 480)
+        self._suppress_signals = False
+        self._build_ui()
+        pm = project_manager()
+        pm.project_changed.connect(lambda _p: self._populate(_p))
+        self._populate(pm.current())
+
+    # -------------------------------------------------------------------------
+    # UI
+    # -------------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(16, 16, 16, 16)
+        outer.setSpacing(10)
+
+        info = QLabel(
+            "Map each detected Unity shader to an O3DE .materialtype. "
+            "Unmapped shaders (⚠) fall back to the project's default "
+            "materialtype. Edits save immediately."
+        )
+        info.setStyleSheet("color: #6c7086; font-size: 9pt;")
+        info.setWordWrap(True)
+        outer.addWidget(info)
+
+        self._summary = QLabel("")
+        self._summary.setStyleSheet("color: #cdd6f4; font-size: 9pt;")
+        self._summary.setWordWrap(True)
+        outer.addWidget(self._summary)
+
+        # Scrollable list of per-shader rows.
+        self._rows_container = QWidget()
+        self._rows_layout = QVBoxLayout(self._rows_container)
+        self._rows_layout.setSpacing(6)
+        self._rows_layout.setContentsMargins(0, 4, 0, 4)
+        self._rows_layout.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidget(self._rows_container)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        outer.addWidget(scroll, 1)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Close)
+        button_box.rejected.connect(self.reject)
+        button_box.accepted.connect(self.accept)
+        outer.addWidget(button_box)
+
+    # -------------------------------------------------------------------------
+    # POPULATE
+    # -------------------------------------------------------------------------
+
+    def _populate(self, project) -> None:
+        # Tear down existing rows (keep the trailing stretch).
+        while self._rows_layout.count() > 1:
+            item = self._rows_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+        if project is None:
+            self._summary.setText("(no project loaded)")
+            return
+
+        cfg = project.stage_settings(self.STAGE_KEY)
+        mappings = dict(cfg.get("shader_mappings", {}) or {})
+
+        ap_meta = (project.outputs.get("asset_processor", {}) or {}).get(
+            "material_metadata", {}) or {}
+        detected = sorted({
+            (rec or {}).get("shader_name", "")
+            for rec in ap_meta.values()
+            if (rec or {}).get("shader_name")
+        })
+
+        if not detected:
+            empty = QLabel(
+                "(no shaders detected yet — run the Prefab Processor first)"
+            )
+            empty.setStyleSheet(
+                "color: #6c7086; font-size: 9pt; font-style: italic;"
+            )
+            self._rows_layout.insertWidget(self._rows_layout.count() - 1, empty)
+            self._summary.setText("0 detected · 0 mapped · 0 unmapped")
+            return
+
+        # Unmapped shaders first so they're visible without scrolling.
+        unmapped = [s for s in detected if s not in mappings]
+        mapped   = [s for s in detected if s in mappings]
+        ordered  = unmapped + mapped
+
+        for sname in ordered:
+            self._rows_layout.insertWidget(
+                self._rows_layout.count() - 1,
+                self._build_row(sname, mappings.get(sname, "")),
+            )
+
+        self._summary.setText(
+            f"{len(detected)} detected · {len(mapped)} mapped · "
+            f"{len(unmapped)} unmapped"
+        )
+
+    def _build_row(self, shader_name: str, current_mapping: str) -> QWidget:
+        has_mapping = bool(current_mapping)
+        row = QWidget()
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+
+        label = QLabel(f"{'  ' if has_mapping else '⚠ '}{shader_name}")
+        label.setMinimumWidth(280)
+        label.setToolTip(
+            "Mapping present" if has_mapping else
+            "Unmapped — falls back to default materialtype"
+        )
+        label.setStyleSheet(
+            "color: #cdd6f4; font-size: 9pt;" if has_mapping else
+            "color: #f9e2af; font-size: 9pt;"
+        )
+        lay.addWidget(label, 1)
+
+        field = _PathField(
+            dialog_caption=f"Select materialtype for '{shader_name}'",
+            dialog_filter="Material type (*.materialtype);;All files (*.*)",
+        )
+        field.set_common(current_mapping)
+        field.committed.connect(
+            lambda val, s=shader_name: self._on_mapping_changed(s, val)
+        )
+        field.cleared.connect(
+            lambda s=shader_name: self._on_mapping_changed(s, "")
+        )
+        lay.addWidget(field, 2)
+        return row
+
+    # -------------------------------------------------------------------------
+    # EDIT HANDLERS
+    # -------------------------------------------------------------------------
+
+    def _on_mapping_changed(self, shader_name: str, value: str) -> None:
+        if self._suppress_signals:
+            return
+        pm   = project_manager()
+        proj = pm.current()
+        if proj is None:
+            return
+        cfg = dict(proj.stage_settings(self.STAGE_KEY))
+        mappings = dict(cfg.get("shader_mappings", {}) or {})
+        if value:
+            mappings[shader_name] = value
+        else:
+            mappings.pop(shader_name, None)
+        cfg["shader_mappings"] = mappings
+        pm.update_stage(self.STAGE_KEY, cfg)
+        # Repopulate so the row reorders (unmapped → top) and the label
+        # marker flips.
+        self._populate(proj)
+        self.mappings_changed.emit()
+
+
+class MaterialTab(QWidget):
+    """Material preprocessing — F-6.
+
+    Layout (top to bottom):
+      1. Default Material Settings — global fallback target materialtype
+         applied to every material when no shader-specific mapping
+         exists.
+      2. Shader Mappings — one row per Unity shader name detected across
+         the project. Each row has an editable O3DE materialtype path.
+         Shaders detected in inventory but missing from the mapping
+         render with a ⚠ marker.
+      3. Material Inventory — read-only list (multi-select for editing)
+         showing material name + shader + override marker.
+      4. Selection Overrides — appears when ≥1 material is selected.
+         Editable: target materialtype + per-slot texture rebinds.
+         Multi-edit semantics: common shown, mixed shown as `…`.
+      5. Last Run Details — same pattern as Mesh / Scene / Prefab tabs.
+
+    Materials are NEVER de-selectable from the inventory — removing them
+    would break prefab + scene dependencies. Selection drives override
+    editing only.
+    """
+
+    STAGE_KEY = "material_processor"
+
+    def __init__(self):
+        super().__init__()
+        self._suppress_field_signals = False
+        self._build_ui()
+        pm = project_manager()
+        pm.project_changed.connect(self.apply_project)
+        pm.status_changed.connect(self._on_status_changed)
+        self.apply_project(pm.current())
+
+    # -------------------------------------------------------------------------
+    # UI
+    # -------------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        content = QWidget()
+        root = QVBoxLayout(content)
+        root.setSpacing(12)
+        root.setContentsMargins(16, 16, 16, 16)
+
+        # ── Default Material Settings ───────────────────────────────────
+        defaults_box, defaults_lay = _section_groupbox("Default Material Settings")
+        info = QLabel(
+            "Fallback O3DE materialtype applied when a material's Unity "
+            "shader has no entry in the mappings below. Per-material "
+            "overrides further down win over both."
+        )
+        info.setStyleSheet("color: #6c7086; font-size: 9pt;")
+        info.setWordWrap(True)
+        defaults_lay.addWidget(info)
+
+        self._default_materialtype = _PathField(
+            dialog_caption="Select default .materialtype",
+            dialog_filter="Material type (*.materialtype);;All files (*.*)",
+        )
+        self._default_materialtype.committed.connect(self._on_default_materialtype_changed)
+        self._default_materialtype.cleared.connect(
+            lambda: self._on_default_materialtype_changed("StandardPBR.materialtype")
+        )
+        defaults_form = QFormLayout()
+        defaults_form.setSpacing(8)
+        defaults_form.setContentsMargins(0, 4, 0, 4)
+        defaults_form.addRow("Default materialtype:", self._default_materialtype)
+        defaults_lay.addLayout(defaults_form)
+        root.addWidget(defaults_box)
+
+        # ── Shader Mappings (summary + popout editor) ───────────────────
+        self._shader_box, shader_lay = _section_groupbox("Shader Mappings")
+        shader_info = QLabel(
+            "Unity shader → O3DE materialtype. Detected shaders without a "
+            "mapping fall back to the default above and mark their materials "
+            "with ⚠. Open the editor to assign mappings."
+        )
+        shader_info.setStyleSheet("color: #6c7086; font-size: 9pt;")
+        shader_info.setWordWrap(True)
+        shader_lay.addWidget(shader_info)
+
+        self._shader_summary = QLabel("")
+        self._shader_summary.setStyleSheet("color: #cdd6f4; font-size: 9pt;")
+        self._shader_summary.setWordWrap(True)
+        shader_lay.addWidget(self._shader_summary)
+
+        self._shader_status = QLabel("")
+        self._shader_status.setWordWrap(True)
+        shader_lay.addWidget(self._shader_status)
+
+        edit_btn = QPushButton("Edit Mappings…")
+        edit_btn.clicked.connect(self._open_mappings_dialog)
+        edit_row = QHBoxLayout()
+        edit_row.addStretch(1)
+        edit_row.addWidget(edit_btn)
+        shader_lay.addLayout(edit_row)
+        root.addWidget(self._shader_box)
+
+        # Dialog instance is lazy-created when the user opens it. Kept as an
+        # attribute so the same window is reused across opens.
+        self._shader_dialog = None
+
+        # ── Material Inventory ──────────────────────────────────────────
+        inv_box, inv_lay = _section_groupbox("Material Inventory")
+        inv_info = QLabel(
+            "Materials produced by the Prefab Processor. Multi-select to "
+            "edit overrides — materials can't be de-selected here without "
+            "breaking the prefabs that reference them. ★ marks materials "
+            "with overrides; ⚠ marks materials whose shader has no mapping."
+        )
+        inv_info.setStyleSheet("color: #6c7086; font-size: 9pt;")
+        inv_info.setWordWrap(True)
+        inv_lay.addWidget(inv_info)
+
+        self._inv_list = QListWidget()
+        _bound_list_height(self._inv_list, min_h=140, max_h=240)
+        self._inv_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self._inv_list.itemSelectionChanged.connect(self._refresh_override_fields)
+        inv_lay.addWidget(self._inv_list)
+
+        self._inv_summary = QLabel("")
+        self._inv_summary.setStyleSheet("color: #6c7086; font-size: 9pt;")
+        self._inv_summary.setWordWrap(True)
+        inv_lay.addWidget(self._inv_summary)
+        root.addWidget(inv_box)
+
+        # ── Selection Overrides ─────────────────────────────────────────
+        self._override_box, override_lay = _section_groupbox("Selection Overrides")
+        self._override_header = QLabel("Select one or more materials above to edit.")
+        self._override_header.setStyleSheet("color: #6c7086; font-size: 9pt;")
+        self._override_header.setWordWrap(True)
+        override_lay.addWidget(self._override_header)
+
+        # Target materialtype override.
+        self._override_materialtype = _PathField(
+            dialog_caption="Select .materialtype",
+            dialog_filter="Material type (*.materialtype);;All files (*.*)",
+        )
+        self._override_materialtype.committed.connect(
+            lambda val: self._on_override_field_changed("materialtype", val)
+        )
+        self._override_materialtype.cleared.connect(
+            lambda: self._on_override_field_cleared("materialtype")
+        )
+
+        # Per-slot texture rebind fields.
+        self._override_textures: dict = {}
+        for slot in _MATERIAL_TEXTURE_SLOTS:
+            field = _PathField(
+                dialog_caption=f"Select texture for '{slot}'",
+                dialog_filter="Image files (*.png *.jpg *.jpeg *.tga *.tif *.tiff *.exr);;"
+                              "All files (*.*)",
+            )
+            field.committed.connect(
+                lambda val, s=slot: self._on_override_texture_changed(s, val)
+            )
+            field.cleared.connect(
+                lambda s=slot: self._on_override_texture_cleared(s)
+            )
+            self._override_textures[slot] = field
+
+        override_form = QFormLayout()
+        override_form.setSpacing(8)
+        override_form.setContentsMargins(0, 4, 0, 4)
+        override_form.addRow("Target materialtype:", self._override_materialtype)
+        for slot in _MATERIAL_TEXTURE_SLOTS:
+            override_form.addRow(f"Texture · {slot}:", self._override_textures[slot])
+        override_lay.addLayout(override_form)
+
+        self._clear_override_btn = QPushButton("Clear Override for Selection")
+        self._clear_override_btn.clicked.connect(self._clear_override_for_selection)
+        self._clear_override_btn.setEnabled(False)
+        clear_row = QHBoxLayout()
+        clear_row.addStretch(1)
+        clear_row.addWidget(self._clear_override_btn)
+        override_lay.addLayout(clear_row)
+        root.addWidget(self._override_box)
+
+        # ── Last Run Details ────────────────────────────────────────────
+        self._last_run_box = _section_groupbox("Last Run Details")[0]
+        self._last_run_box_lay = self._last_run_box.layout()
+        self._last_run_box.setVisible(False)
+        root.addWidget(self._last_run_box)
+
+        # ── Disabled Process button — worker integration lands later ────
+        process_btn = QPushButton("Process (re-emit materials — coming)")
+        process_btn.setObjectName("primary")
+        process_btn.setEnabled(False)
+        process_btn.setToolTip(
+            "Material overrides are stored in the project file; the worker "
+            "that re-emits .material files with override values arrives in "
+            "a follow-up iteration of F-6."
+        )
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
+        action_row.addStretch(1)
+        action_row.addWidget(process_btn)
+        root.addLayout(action_row)
+
+        outer.addWidget(_scroll_wrap(content))
+
+    # -------------------------------------------------------------------------
+    # APPLY / REFRESH
+    # -------------------------------------------------------------------------
+
+    def apply_project(self, project) -> None:
+        self._refresh_defaults(project)
+        self._refresh_shader_mappings(project)
+        self._refresh_inventory(project)
+        self._refresh_override_fields()
+        self._refresh_last_run(project)
+
+    def _on_status_changed(self, stage_key: str) -> None:
+        if stage_key not in ("asset_processor", self.STAGE_KEY):
+            return
+        self.apply_project(project_manager().current())
+
+    # ── Defaults ────────────────────────────────────────────────────────
+
+    def _refresh_defaults(self, project) -> None:
+        self._suppress_field_signals = True
+        try:
+            if project is None:
+                self._default_materialtype.set_disabled_blank()
+                return
+            cfg = project.stage_settings(self.STAGE_KEY)
+            mt = (cfg.get("defaults", {}) or {}).get("target_materialtype",
+                                                     "StandardPBR.materialtype")
+            self._default_materialtype.set_common(mt or "")
+        finally:
+            self._suppress_field_signals = False
+
+    def _on_default_materialtype_changed(self, value: str) -> None:
+        if self._suppress_field_signals:
+            return
+        pm = project_manager()
+        proj = pm.current()
+        if proj is None:
+            return
+        cfg = dict(proj.stage_settings(self.STAGE_KEY))
+        defaults = dict(cfg.get("defaults", {}) or {})
+        defaults["target_materialtype"] = value or "StandardPBR.materialtype"
+        cfg["defaults"] = defaults
+        pm.update_stage(self.STAGE_KEY, cfg)
+        # Refresh shader-mapping rows (unmapped fall back to default text).
+        self._refresh_shader_mappings(proj)
+
+    # ── Shader mappings ─────────────────────────────────────────────────
+
+    def _refresh_shader_mappings(self, project) -> None:
+        if project is None:
+            self._shader_summary.setText("(no project loaded)")
+            self._shader_status.setText("")
+            self._set_section_warn(False)
+            return
+
+        cfg = project.stage_settings(self.STAGE_KEY)
+        mappings = dict(cfg.get("shader_mappings", {}) or {})
+
+        ap_meta = (project.outputs.get("asset_processor", {}) or {}).get(
+            "material_metadata", {}) or {}
+        detected = sorted({
+            (rec or {}).get("shader_name", "")
+            for rec in ap_meta.values()
+            if (rec or {}).get("shader_name")
+        })
+        mapped   = [s for s in detected if s in mappings]
+        unmapped = [s for s in detected if s not in mappings]
+
+        if not detected:
+            self._shader_summary.setText(
+                "No shaders detected yet — run the Prefab Processor to "
+                "populate the mapping list."
+            )
+            self._shader_status.setText("")
+            self._set_section_warn(False)
+        else:
+            self._shader_summary.setText(
+                f"{len(detected)} detected · {len(mapped)} mapped · "
+                f"{len(unmapped)} unmapped"
+            )
+            if unmapped:
+                preview = ", ".join(unmapped[:3])
+                if len(unmapped) > 3:
+                    preview += f", +{len(unmapped) - 3} more"
+                self._shader_status.setText(
+                    f"⚠ Unmapped: {preview}"
+                )
+                self._shader_status.setStyleSheet(
+                    "color: #f9e2af; font-size: 9pt; font-weight: bold;"
+                )
+                self._set_section_warn(True)
+            else:
+                self._shader_status.setText("✓ all detected shaders mapped")
+                self._shader_status.setStyleSheet(
+                    "color: #a6e3a1; font-size: 9pt;"
+                )
+                self._set_section_warn(False)
+
+    def _set_section_warn(self, warn: bool) -> None:
+        """Toggle a yellow border on the Shader Mappings group box so the
+        unmapped-shaders condition is visible at a glance.
+
+        Implemented via a local stylesheet on the box itself rather than a
+        global selector so other QGroupBox sections stay untouched.
+        """
+        if warn:
+            self._shader_box.setStyleSheet(
+                "QGroupBox { border: 1px solid #f9e2af; border-radius: 4px; "
+                "margin-top: 12px; padding-top: 4px; } "
+                "QGroupBox::title { color: #f9e2af; }"
+            )
+        else:
+            self._shader_box.setStyleSheet("")
+
+    def _open_mappings_dialog(self) -> None:
+        """Lazy-construct + show the popout shader mappings editor. The
+        dialog drives edits through `project_manager.update_stage`; we
+        listen for `mappings_changed` so the section summary + material
+        inventory refresh as edits land."""
+        if self._shader_dialog is None:
+            self._shader_dialog = ShaderMappingsDialog(self)
+            self._shader_dialog.mappings_changed.connect(
+                self._on_dialog_mappings_changed
+            )
+        # Always repopulate from the current project before showing — covers
+        # the case where the user ran the prefab processor while the dialog
+        # was constructed but hidden.
+        self._shader_dialog._populate(project_manager().current())
+        self._shader_dialog.show()
+        self._shader_dialog.raise_()
+        self._shader_dialog.activateWindow()
+
+    def _on_dialog_mappings_changed(self) -> None:
+        proj = project_manager().current()
+        if proj is None:
+            return
+        self._refresh_shader_mappings(proj)
+        self._refresh_inventory(proj)
+
+    # ── Inventory ───────────────────────────────────────────────────────
+
+    def _refresh_inventory(self, project) -> None:
+        self._inv_list.clear()
+        if project is None:
+            self._inv_summary.setText("(no project loaded)")
+            return
+        ap = project.outputs.get("asset_processor", {}) or {}
+        meta = ap.get("material_metadata", {}) or {}
+        legacy_materials = ap.get("materials", {}) or {}
+
+        # Fall back to the legacy `materials` dict (older runs) when metadata
+        # is empty — renders rows without shader info but still listable.
+        if not meta and legacy_materials:
+            meta = {
+                g: {"asset_hint": hint, "shader_name": "", "source_stem": ""}
+                for g, hint in legacy_materials.items()
+            }
+
+        mp = project.stage_settings(self.STAGE_KEY)
+        overrides = mp.get("overrides", {}) or {}
+        mappings  = mp.get("shader_mappings", {}) or {}
+
+        if not meta:
+            self._inv_summary.setText(
+                "No materials extracted yet. Mark prefabs and run the Prefab Processor."
+            )
+            return
+
+        unmapped_count  = 0
+        override_count  = 0
+        for guid, rec in sorted(meta.items(),
+                                key=lambda kv: str(kv[1].get("source_stem")
+                                                   or kv[1].get("asset_hint")
+                                                   or kv[0]).lower()):
+            stem        = rec.get("source_stem") or rec.get("asset_hint") or guid
+            shader      = rec.get("shader_name", "") or "(unknown)"
+            has_override = guid in overrides
+            has_mapping  = shader in mappings if shader != "(unknown)" else False
+            if not has_mapping:
+                unmapped_count += 1
+            if has_override:
+                override_count += 1
+
+            prefix = ""
+            if has_override:
+                prefix += "★ "
+            if not has_mapping:
+                prefix += "⚠ "
+            if not prefix:
+                prefix = "   "
+
+            text = f"{prefix}{stem:<32}  {shader}"
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, guid)
+            tip_lines = [f"GUID: {guid}", f"Shader: {shader}"]
+            if rec.get("textures_bound"):
+                tip_lines.append(f"Bound slots: {', '.join(rec['textures_bound'])}")
+            if has_override:
+                tip_lines.append("Override applied")
+            if not has_mapping:
+                tip_lines.append("Shader unmapped — falls back to default")
+            item.setToolTip("\n".join(tip_lines))
+            if has_override:
+                f = item.font()
+                f.setBold(True)
+                item.setFont(f)
+                item.setForeground(Qt.cyan)
+            elif not has_mapping:
+                item.setForeground(Qt.darkYellow)
+            self._inv_list.addItem(item)
+
+        self._inv_summary.setText(
+            f"{len(meta)} material(s) · {override_count} with override(s) · "
+            f"{unmapped_count} with unmapped shader(s)"
+        )
+
+    def _selected_material_guids(self) -> list:
+        guids: list = []
+        for item in self._inv_list.selectedItems():
+            g = item.data(Qt.UserRole)
+            if g:
+                guids.append(g)
+        return guids
+
+    # ── Override editor ─────────────────────────────────────────────────
+
+    def _refresh_override_fields(self) -> None:
+        guids = self._selected_material_guids()
+        proj  = project_manager().current()
+        if not guids or proj is None:
+            self._override_header.setText("Select one or more materials above to edit.")
+            self._clear_override_btn.setEnabled(False)
+            self._override_materialtype.set_disabled_blank()
+            for slot, w in self._override_textures.items():
+                w.set_disabled_blank()
+            return
+
+        cfg = proj.stage_settings(self.STAGE_KEY)
+        defaults  = cfg.get("defaults",  {}) or {}
+        overrides = cfg.get("overrides", {}) or {}
+        mappings  = cfg.get("shader_mappings", {}) or {}
+        ap_meta   = (proj.outputs.get("asset_processor", {}) or {}).get(
+            "material_metadata", {}) or {}
+
+        def effective_materialtype(g):
+            entry = overrides.get(g, {}) or {}
+            if entry.get("materialtype"):
+                return entry["materialtype"]
+            shader = (ap_meta.get(g, {}) or {}).get("shader_name", "") or ""
+            if shader and shader in mappings:
+                return mappings[shader]
+            return defaults.get("target_materialtype", "StandardPBR.materialtype")
+
+        def effective_texture(g, slot):
+            entry = (overrides.get(g, {}) or {}).get("textures", {}) or {}
+            return entry.get(slot)  # None if no override for this slot
+
+        any_override = any(g in overrides for g in guids)
+        self._override_header.setText(
+            f"{len(guids)} material(s) selected · "
+            f"{sum(1 for g in guids if g in overrides)} with override(s)"
+        )
+        self._clear_override_btn.setEnabled(any_override)
+
+        self._suppress_field_signals = True
+        try:
+            mt_values = [effective_materialtype(g) for g in guids]
+            self._override_materialtype.set_common(self._common_value(mt_values))
+            for slot, w in self._override_textures.items():
+                slot_values = [effective_texture(g, slot) for g in guids]
+                w.set_common(self._common_value(slot_values))
+        finally:
+            self._suppress_field_signals = False
+
+    @staticmethod
+    def _common_value(values: list):
+        if not values:
+            return None
+        first = values[0]
+        for v in values[1:]:
+            if v != first:
+                return None
+        return first
+
+    def _on_override_field_changed(self, key: str, value) -> None:
+        if self._suppress_field_signals:
+            return
+        guids = self._selected_material_guids()
+        if not guids:
+            return
+        pm = project_manager()
+        proj = pm.current()
+        if proj is None:
+            return
+        cfg = dict(proj.stage_settings(self.STAGE_KEY))
+        overrides = dict(cfg.get("overrides", {}) or {})
+        for g in guids:
+            entry = dict(overrides.get(g, {}) or {})
+            entry[key] = value
+            overrides[g] = entry
+        cfg["overrides"] = overrides
+        pm.update_stage(self.STAGE_KEY, cfg)
+        self._refresh_inventory(proj)
+        self._refresh_override_fields()
+
+    def _on_override_field_cleared(self, key: str) -> None:
+        # Remove the field from each selected material's override entry. If
+        # the entry becomes empty, drop the whole entry.
+        guids = self._selected_material_guids()
+        if not guids:
+            return
+        pm = project_manager()
+        proj = pm.current()
+        if proj is None:
+            return
+        cfg = dict(proj.stage_settings(self.STAGE_KEY))
+        overrides = dict(cfg.get("overrides", {}) or {})
+        for g in guids:
+            entry = dict(overrides.get(g, {}) or {})
+            entry.pop(key, None)
+            if entry:
+                overrides[g] = entry
+            else:
+                overrides.pop(g, None)
+        cfg["overrides"] = overrides
+        pm.update_stage(self.STAGE_KEY, cfg)
+        self._refresh_inventory(proj)
+        self._refresh_override_fields()
+
+    def _on_override_texture_changed(self, slot: str, value: str) -> None:
+        if self._suppress_field_signals:
+            return
+        guids = self._selected_material_guids()
+        if not guids:
+            return
+        pm = project_manager()
+        proj = pm.current()
+        if proj is None:
+            return
+        cfg = dict(proj.stage_settings(self.STAGE_KEY))
+        overrides = dict(cfg.get("overrides", {}) or {})
+        for g in guids:
+            entry = dict(overrides.get(g, {}) or {})
+            textures = dict(entry.get("textures", {}) or {})
+            textures[slot] = value
+            entry["textures"] = textures
+            overrides[g] = entry
+        cfg["overrides"] = overrides
+        pm.update_stage(self.STAGE_KEY, cfg)
+        self._refresh_inventory(proj)
+        self._refresh_override_fields()
+
+    def _on_override_texture_cleared(self, slot: str) -> None:
+        guids = self._selected_material_guids()
+        if not guids:
+            return
+        pm = project_manager()
+        proj = pm.current()
+        if proj is None:
+            return
+        cfg = dict(proj.stage_settings(self.STAGE_KEY))
+        overrides = dict(cfg.get("overrides", {}) or {})
+        for g in guids:
+            entry = dict(overrides.get(g, {}) or {})
+            textures = dict(entry.get("textures", {}) or {})
+            textures.pop(slot, None)
+            if textures:
+                entry["textures"] = textures
+            else:
+                entry.pop("textures", None)
+            if entry:
+                overrides[g] = entry
+            else:
+                overrides.pop(g, None)
+        cfg["overrides"] = overrides
+        pm.update_stage(self.STAGE_KEY, cfg)
+        self._refresh_inventory(proj)
+        self._refresh_override_fields()
+
+    def _clear_override_for_selection(self) -> None:
+        guids = self._selected_material_guids()
+        if not guids:
+            return
+        pm = project_manager()
+        proj = pm.current()
+        if proj is None:
+            return
+        cfg = dict(proj.stage_settings(self.STAGE_KEY))
+        overrides = dict(cfg.get("overrides", {}) or {})
+        for g in guids:
+            overrides.pop(g, None)
+        cfg["overrides"] = overrides
+        pm.update_stage(self.STAGE_KEY, cfg)
+        self._refresh_inventory(proj)
+        self._refresh_override_fields()
+
+    # ── Last Run Details ────────────────────────────────────────────────
+
+    def _refresh_last_run(self, project) -> None:
+        while self._last_run_box_lay.count():
+            item = self._last_run_box_lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        if project is None:
+            self._last_run_box.setVisible(False)
+            return
+        outputs = project.outputs.get("asset_processor", {}) or {}
+        meta    = outputs.get("material_metadata", {}) or {}
+        legacy  = outputs.get("materials", {}) or {}
+        if not meta and legacy:
+            meta = {
+                g: {"source_stem": "", "asset_hint": hint, "shader_name": ""}
+                for g, hint in legacy.items()
+            }
+        last_run = outputs.get("last_run")
+        if not last_run or not meta:
+            self._last_run_box.setVisible(False)
+            return
+
+        header = QLabel(
+            f"{len(meta)} material(s) extracted · Last run {last_run}"
+        )
+        header.setStyleSheet("color: #a6e3a1; font-size: 9pt; font-weight: bold;")
+        self._last_run_box_lay.addWidget(header)
+        shown_limit = 20
+        for i, (g, rec) in enumerate(sorted(
+                meta.items(),
+                key=lambda kv: str(kv[1].get("source_stem")
+                                   or kv[1].get("asset_hint")
+                                   or kv[0]).lower())):
+            if i >= shown_limit:
+                break
+            stem   = rec.get("source_stem") or rec.get("asset_hint") or g
+            shader = rec.get("shader_name") or "(unknown)"
+            slots  = rec.get("textures_bound") or []
+            label = QLabel(
+                f"  • {stem}  ·  shader={shader}  ·  "
+                f"{len(slots)} texture slot(s)"
+            )
+            label.setStyleSheet("color: #cdd6f4; font-size: 9pt;")
+            label.setWordWrap(True)
+            self._last_run_box_lay.addWidget(label)
+        overflow = len(meta) - shown_limit
+        if overflow > 0:
+            more = QLabel(f"  … and {overflow} more")
+            more.setStyleSheet("color: #6c7086; font-size: 9pt; font-style: italic;")
+            self._last_run_box_lay.addWidget(more)
+        self._last_run_box.setVisible(True)
+
+
+# =============================================================================
+# TAB 5 — TERRAIN
 # =============================================================================
 
 class TerrainTab(QWidget):
@@ -3264,22 +5366,26 @@ class MainWindow(QMainWindow):
         # so enable-states sync on project_changed.
         self._title_bar.set_file_menu(self._project_header.project_menu())
 
-        # Tab order: Dashboard → Scene → Prefab → Terrain → Config(hidden).
-        # Workflow ordering, not execution ordering.
+        # Tab order: Dashboard → Scenes → Prefabs → Meshes → Materials →
+        # Terrain → Config(hidden). Workflow ordering by configuration stage.
         self._tabs = QTabWidget()
         dashboard_tab = DashboardTab(dep_banner=self._dep_banner)
-        self._tabs.addTab(dashboard_tab,                      "Dashboard")        # 0
-        scene_idx   = self._tabs.addTab(SceneConverterTab(),  "Scene Converter")  # 1
-        prefab_idx  = self._tabs.addTab(PrefabProcessorTab(), "Prefab Processor") # 2
-        terrain_idx = self._tabs.addTab(TerrainTab(),         "Terrain")          # 3
-        self._config_index = self._tabs.addTab(ConfigTab(),   "Config")           # 4
+        self._tabs.addTab(dashboard_tab,                      "Dashboard") # 0
+        scene_idx    = self._tabs.addTab(SceneConverterTab(),  "Scenes")    # 1
+        prefab_idx   = self._tabs.addTab(PrefabProcessorTab(), "Prefabs")   # 2
+        mesh_idx     = self._tabs.addTab(MeshTab(),            "Meshes")    # 3
+        material_idx = self._tabs.addTab(MaterialTab(),        "Materials") # 4
+        terrain_idx  = self._tabs.addTab(TerrainTab(),         "Terrain")   # 5
+        self._config_index = self._tabs.addTab(ConfigTab(),    "Config")    # 6
         self._tabs.tabBar().setTabVisible(self._config_index, False)
         self._tabs.setCurrentIndex(start_tab)
 
         self._STAGE_TAB_INDEX = {
-            "scene_converter":   scene_idx,
-            "asset_processor":   prefab_idx,
-            "terrain_processor": terrain_idx,
+            "scene_converter":    scene_idx,
+            "asset_processor":    prefab_idx,
+            "mesh_processor":     mesh_idx,
+            "material_processor": material_idx,
+            "terrain_processor":  terrain_idx,
         }
         dashboard_tab.request_focus_stage.connect(self._focus_stage)
         dashboard_tab.request_process_stage.connect(self._process_stage)
@@ -3506,7 +5612,15 @@ class MainWindow(QMainWindow):
 
         self.setGeometry(new_x, new_y, new_w, new_h)
 
+    # Class-level test hook: set to True in verification scripts to bypass
+    # the unsaved-project prompt so closing the window doesn't block on a
+    # modal dialog the test can't dismiss.
+    SUPPRESS_CLOSE_PROMPT = False
+
     def closeEvent(self, event):
+        if self.SUPPRESS_CLOSE_PROMPT or os.environ.get("U2O_SKIP_CLOSE_PROMPT"):
+            event.accept()
+            return
         pm = project_manager()
         proj = pm.current()
         if proj is None or not proj.is_dirty():
@@ -3565,7 +5679,9 @@ def main() -> None:
         "project":   0,
         "scene":     1,
         "prefab":    2,
-        "terrain":   3,
+        "mesh":      3,
+        "material":  4,
+        "terrain":   5,
     }
     start_tab = 0
     for arg in sys.argv[1:]:

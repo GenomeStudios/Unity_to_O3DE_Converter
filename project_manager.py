@@ -89,14 +89,59 @@ def _utc_now_iso() -> str:
 
 def _default_stages() -> dict:
     return {
-        "asset_processor":   {"source_path": "", "output_path": ""},
-        "scene_converter":   {
+        "asset_processor": {
+            "source_path":      "",   # F-2 override (walking root for prefab scrubbing)
+            "selected_prefabs": [],   # F-4 relative paths under effective_source
+            "output_path":      "",
+        },
+        "scene_converter": {
             "source_path":     "",   # F-2 override (walking root for scene scrubbing)
             "selected_scenes": [],   # F-3 relative paths under effective_source
             "output_path":     "",
-            "prefab_dirs":     [],
+            "prefab_dirs":     [],   # legacy; supplemental dirs outside project outputs
         },
-        "terrain_processor": {"source_path": "", "output_path": "", "selected_materials": []},
+        "mesh_processor": {
+            # F-5: project-wide defaults applied to every mesh unless an
+            # entry exists in `overrides` for that mesh's GUID.
+            "defaults": {
+                "zero_position":     True,
+                "default_position":  [0.0, 0.0, 0.0],
+                "default_rotation":  [0.0, 0.0, 0.0],
+            },
+            # F-5: per-mesh overrides keyed by mesh GUID (from
+            # outputs.asset_processor.meshes). Each value is a partial
+            # dict carrying any subset of the keys above.
+            "overrides": {},
+        },
+        "material_processor": {
+            # F-6: defaults for the materialtype binding when no shader-
+            # specific mapping exists.
+            "defaults": {
+                "target_materialtype": "StandardPBR.materialtype",
+            },
+            # Unity shader name → O3DE materialtype path. Populated by the
+            # user; unmapped shaders fall through to the default. Pre-seeded
+            # with common Unity built-ins + the Alien Fantasy Forest pack's
+            # MK4 shaders (mapped to StandardPBR; the foliage variants
+            # drop the wind animation, the rock variant drops the cover
+            # blend — these are visual-only losses).
+            "shader_mappings": {
+                "Standard":                             "StandardPBR.materialtype",
+                "Universal Render Pipeline/Lit":        "StandardPBR.materialtype",
+                "Universal Render Pipeline/Simple Lit": "StandardPBR.materialtype",
+                "MK4/Foliage Fantasy":                  "StandardPBR.materialtype",
+                "MK4/Foliage Fantasy no wind":          "StandardPBR.materialtype",
+                "MK4/Foliage Fantasy no trans":         "StandardPBR.materialtype",
+                "MK4/Rock_cover":                       "StandardPBR.materialtype",
+            },
+            # Per-material overrides keyed by material GUID. Each entry:
+            #   { "materialtype": "...",
+            #     "textures":     { "baseColor": "/abs/path", ... } }
+            "overrides": {},
+        },
+        "terrain_processor": {
+            "source_path": "", "output_path": "", "selected_materials": [],
+        },
     }
 
 
@@ -116,8 +161,9 @@ def _default_outputs() -> dict:
             "last_status":     None,
             "prefabs":   {},   # guid → {source_path, output_path, container_alias,
                                #         entity_aliases, material_slots, go_names, written_at}
-            "materials": {},   # guid → {output_path, written_at}
-            "meshes":    {},   # guid → {output_path, written_at}
+            "materials": {},   # guid → output_asset_hint (string)
+            "material_metadata": {},   # guid → {shader_name, source_path, asset_hint, textures_bound}
+            "meshes":    {},   # guid → output_stem (string)
             "coverage":  {},
         },
         "scene_converter": {
@@ -136,6 +182,22 @@ def _default_outputs() -> dict:
             "coverage":  {},
         },
     }
+
+
+def _deep_merge(base: dict, overlay: dict) -> dict:
+    """Recursively merge `overlay` onto `base`. Where both sides have a
+    dict for the same key, recurse; otherwise `overlay` wins. Used by
+    `Project.from_json` so newer schema defaults survive load even when a
+    saved project file uses the same top-level key (e.g. F-6's pre-seeded
+    `shader_mappings` need to fill in keys an older project's
+    `shader_mappings` dict doesn't know about)."""
+    out = dict(base)
+    for k, v in (overlay or {}).items():
+        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
 
 
 def _normalize_project_path(path: Path) -> Path:
@@ -184,8 +246,16 @@ class Project:
 
     @classmethod
     def from_json(cls, data: dict, path: Optional[Path]) -> "Project":
+        # Recursive deep merge each stage's settings so newer schema
+        # defaults survive load (e.g. F-6 pre-seeded shader_mappings need
+        # to fill in keys an older project's mappings dict doesn't carry).
+        # Saved data wins on conflict — user customisations stay intact.
         stages = _default_stages()
-        stages.update(data.get("stages", {}))
+        for key, saved in (data.get("stages", {}) or {}).items():
+            if key in stages and isinstance(saved, dict):
+                stages[key] = _deep_merge(stages[key], saved)
+            else:
+                stages[key] = saved
         status = _default_status()
         status.update(data.get("pipeline_status", {}))
         outputs = _default_outputs()
