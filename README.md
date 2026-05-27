@@ -54,10 +54,13 @@ Last-used paths are automatically saved and restored between sessions via `conve
 
 ```
 <output_root>/
-  Prefabs/       O3DE .prefab files, one per Unity prefab
-  Materials/     O3DE .material files (StandardPBR)
-  Textures/      Consolidated texture files
-  Meshes/        FBX / mesh files (optionally baked via Blender)
+  Prefabs/        O3DE .prefab files, one per Unity prefab
+  Materials/      O3DE .material files (StandardPBR)
+  Textures/       Consolidated texture files
+  Meshes/         FBX / mesh files (optionally baked via Blender)
+  .ImporterData/  Converter bookkeeping — entity maps, asset index, coverage
+                  report. NOT consumed by O3DE; dot-prefix hides it from the
+                  Asset Processor.
 ```
 
 ---
@@ -323,9 +326,10 @@ Save this as `components/light.py` with `WEIGHT = 200` and it will be live on th
 
 **2026-05-25 (latest)**
 - **Prefab override propagation**: nested-prefab instances now translate Unity `m_Modifications` into O3DE JSON-patch entries. Tier 1 (translate / rotate / scale) is always emitted; Tier 2 (`m_IsActive`) is logged to coverage; Tier 3 (`m_Materials.Array.data[N]` slot overrides) is resolved via per-prefab sidecars and emitted as `assetHint` patches. Anything else is recorded as an unhandled override path. Mirrored across both Stage 1 (`_create_nested_prefab_instance`) and Stage 2 (`UnitySceneConverter._create_prefab_instance`).
-- **Entity-map sidecars**: each converted prefab now writes a `<stem>.entitymap.json` next to its `.prefab` recording the Unity-fileID → O3DE-entity-alias map, the root entity, and per-entity material slot GUID lists. Required for cross-prefab override resolution.
-- **Asset index**: each run writes `<output_root>/asset_index.json` listing every processed material/mesh/prefab GUID and its O3DE asset hint. Loaded by Stage 2 (and override emission) to resolve GUIDs without re-walking the project.
-- **Coverage report**: each run writes `coverage.json` next to its primary output. Lists every Unity component type seen (handled or not), every prefab override propertyPath (with handled/unhandled counts and example values), every missing GUID, and converter warnings. Both Stage 1 and Stage 2 emit one.
+- **`.ImporterData/` folder**: all converter-internal bookkeeping (entity maps, asset index, coverage report) now lives in `<output_root>/.ImporterData/` instead of being scattered next to the O3DE-consumed `.prefab` files. The dot-prefix and dedicated subdirectory keep the O3DE Asset Processor from scanning files it doesn't recognize. None of these files are O3DE artifacts; they exist purely for the converter.
+- **Entity-map sidecars**: each converted prefab writes `<output_root>/.ImporterData/<stem>.entitymap.json` recording the Unity-fileID → O3DE-entity-alias map, the root entity, and per-entity material slot GUID lists. Required for cross-prefab override resolution.
+- **Asset index**: each run writes `<output_root>/.ImporterData/asset_index.json` listing every processed material/mesh/prefab GUID and its O3DE asset hint. Loaded by Stage 2 (and override emission) to resolve GUIDs without re-walking the project.
+- **Coverage report**: each run writes `.ImporterData/coverage.json` (next to its primary output for Stage 2). Lists every Unity component type seen (handled or not), every prefab override propertyPath (with handled/unhandled counts and example values), every missing GUID, and converter warnings. Both Stage 1 and Stage 2 emit one.
 - **Material metallic / roughness reconciliation** (texture-aware): `_extract_material_data` now collects `_Metallic`, `_Smoothness`, `_Glossiness`, `_GlossMapScale` separately and routes them based on whether a metallic/roughness texture is bound. With a texture: no `metallic.factor` (O3DE ignores it), `roughness.lowerBound = 1 − multiplier` + `roughness.upperBound = 1.0`. Without: `metallic.factor` / `roughness.factor` scalars only.
 - **Opacity `alphaSource = "Packed"`**: Cutout and Blended materials now write `opacity.alphaSource` so O3DE StandardPBR actually reads the alpha channel from the baseColor texture. Previously omitted; materials rendered fully opaque despite `opacity.mode` being set.
 

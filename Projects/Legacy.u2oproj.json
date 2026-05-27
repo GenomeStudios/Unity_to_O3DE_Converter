@@ -1,0 +1,37 @@
+{
+    "schema_version": 1,
+    "name": "Legacy (auto-migrated)",
+    "scope": "whole_game",
+    "notes": "Auto-migrated from converter_settings.json on first launch of the project system.",
+    "created": "2026-05-27T01:01:56Z",
+    "modified": "2026-05-27T01:01:56Z",
+    "stages": {
+        "asset_processor": {
+            "source_path": "D:/OffLocalDev/Contracting/artificer/Assets/Alien Fantasy Forest",
+            "output_path": "D:/OffLocalDev/CIPipelineTest/Assets/Alien Fantasy Forest"
+        },
+        "scene_converter": {
+            "scene_path": "D:/OffLocalDev/Contracting/artificer/Assets/Alien Fantasy Forest/Demo/Demo1.unity",
+            "output_path": "D:/OffLocalDev/CIPipelineTest/Levels",
+            "prefab_dirs": [
+                "D:/OffLocalDev/CIPipelineTest/Assets/Alien Fantasy Forest/Prefabs"
+            ]
+        },
+        "terrain_processor": {
+            "source_path": "",
+            "output_path": "",
+            "selected_materials": []
+        }
+    },
+    "pipeline_status": {
+        "asset_processor": {
+            "last_run": null
+        },
+        "scene_converter": {
+            "last_run": null
+        },
+        "terrain_processor": {
+            "last_run": null
+        }
+    }
+}

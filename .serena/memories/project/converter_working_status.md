@@ -78,6 +78,13 @@ Previous versions negated X; this was incorrect and has been removed from:
 - `unity_scene_converter_gui.py` (`convert_to_o3de_coordinates`)
 - `components/box_collider.py`, `sphere_collider.py`, `capsule_collider.py`
 
+### Prefab Root Transform — Discarded on Inner Root (added 2026-05-26)
+Unity prefabs are always rooted at a single GameObject whose stored transform is dead data: Unity records every PrefabInstance modification as the FINAL `m_LocalPosition` / `m_LocalRotation` / `m_LocalScale`, not a delta on top of the prefab root. Preserving the root GO's stored transform on the converted prefab's inner root entity caused a double-offset (consumer's ContainerEntity patch positioned the world placement, then the inner root entity added the Unity-stored bake on top — observed as 800-unit offsets in the field).
+
+Fix in `_create_entity_recursive`: when `parent_entity_id == "ContainerEntity"` (i.e. this is the prefab's root entity), force identity transform and clear `needs_nonuniform` before the Transform Data block is emitted. The ContainerEntity itself is already identity (no Transform Data block in `_create_container_entity`); world placement is supplied entirely by the consumer's patches on the ContainerEntity. Discarded values are logged for visibility.
+
+Caveat: if a Unity prefab root has an intentionally non-identity scale (rare for asset-pack content but possible for hand-authored prefabs), it's discarded too. The warning log surfaces this so the user can spot intentional bakes that need to be applied to children manually.
+
 ### Physics — Code Present, Needs Verification ⚠
 - **`_parse_collider_data`**: parses center, size (Box), radius (Sphere/Capsule), height+direction (Capsule), mesh GUID + convex flag (MeshCollider), is_trigger flag
 - **`_create_physx_components`**: Box/Sphere/Capsule/MeshCollider all emitting correct shape + ShapeCollider components
@@ -140,18 +147,27 @@ GameObject: file_id, name, transform, components, parent_id, children_ids,
 ## Prefab Override Propagation + Coverage Reporting (added 2026-05-25)
 
 ### Sidecars and indexes
-Stage 1 now persists two new artifacts per run:
+All converter bookkeeping lives in **`<output_root>/.ImporterData/`** —
+intentionally a dotfile-prefixed directory so the O3DE Asset Processor
+ignores it. Created by `IntegratedAssetProcessor.__init__` and mirrored on
+the Stage 2 side by `UnitySceneConverter.finalize`. Contents:
 
-- **`<output_root>/Prefabs/<stem>.entitymap.json`** — one per converted prefab.
+- **`<stem>.entitymap.json`** — one per converted prefab.
   Records `{source_guid, source_path, root_entity, container_alias,
   entity_aliases: {unity_file_id: o3de_entity_alias}, material_slots:
   {unity_file_id: [mat_guid_0, mat_guid_1, ...]}, go_names}`.
   Consumed by nested-instance override emission to translate Unity fileIDs
   inside `m_Modifications.target` into the right O3DE entity alias.
-- **`<output_root>/asset_index.json`** — one per run. Records
+- **`asset_index.json`** — one per run. Records
   `{materials: {guid: assetHint}, meshes: {guid: stem}, prefabs: {guid: source_path}}`.
   Consumed by Stage 2 (and any cross-prefab override resolution) to translate
   Unity GUIDs to O3DE asset hints without re-walking the project.
+- **`coverage.json`** — one per run. The end-of-run punch list of unhandled
+  component types, unhandled override paths, missing assets, warnings.
+
+These files are NOT O3DE artifacts. O3DE has no `.entitymap.json` type and
+does not consume any file in `.ImporterData/`. Located here purely to keep
+the Asset Processor from scanning them.
 
 The Stage 1 entrypoint requires `processor.finalize()` to be called after the
 last `process_prefab()` to write these artifacts. main_app.py is updated;

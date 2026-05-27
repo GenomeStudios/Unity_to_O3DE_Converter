@@ -30,6 +30,7 @@ class ProcessingContext:
 
     material_mapping:       Dict[str, str]          # unity guid  -> o3de asset hint
     mesh_mapping:           Dict[str, str]          # unity guid  -> o3de asset hint
+    fbx_material_labels:    Dict[str, List[str]]    # go.file_id  -> [fbx_material_name_0, ...]
     entities_dict:          Dict[str, Dict]         # entity_id   -> entity dict (mutated in place)
     entity_id_map:          Dict[str, str]          # go.file_id  -> entity_id
 

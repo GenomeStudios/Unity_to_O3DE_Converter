@@ -19,12 +19,19 @@ import traceback
 from pathlib import Path
 
 from PySide6.QtCore    import Qt, QThread, Signal, QObject, QTimer
-from PySide6.QtGui     import QFont, QTextCursor
+from PySide6.QtGui     import QFont, QTextCursor, QAction
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout,
     QHBoxLayout, QLabel, QLineEdit, QPushButton, QTextEdit,
     QFileDialog, QGroupBox, QListWidget, QListWidgetItem,
     QMessageBox, QSizePolicy, QCheckBox,
+    QComboBox, QToolButton, QMenu, QStackedWidget, QFrame,
+    QFormLayout, QInputDialog,
+)
+
+from project_manager import (
+    Project, ProjectScope, ProjectManager, project_manager,
+    PROJECT_FILE_EXT, STAGE_KEYS, _utc_now_iso,
 )
 
 
@@ -291,12 +298,481 @@ def _path_row(placeholder: str) -> tuple:
     return edit, btn
 
 
+# =============================================================================
+# BROWSE-DIALOG START-PATH HELPERS
+#
+# Every browse button in every tab should reopen the dialog at the saved path
+# it represents — not at whatever folder the OS last opened. The two helpers
+# below resolve a stored line-edit string to something safe to hand to
+# QFileDialog's `dir` argument: an existing directory (for getExistingDirectory)
+# or an existing file/directory (for getOpenFileName / getSaveFileName).
+#
+# If the stored path no longer exists they walk up to the nearest existing
+# parent directory rather than returning a broken path that Qt would discard.
+# =============================================================================
+
+def _resolve_start_dir(text: str, default: str = "") -> str:
+    """Pick a starting directory for a `getExistingDirectory` call.
+
+    text → return text if it's a directory, else its parent if it's a file,
+    else the nearest existing ancestor. Falls back to `default` (which itself
+    falls through to Qt's OS-default behavior when empty).
+    """
+    if text:
+        try:
+            p = Path(text).expanduser()
+            if p.is_dir():
+                return str(p)
+            if p.is_file():
+                return str(p.parent)
+            for parent in p.parents:
+                if parent.exists() and parent.is_dir():
+                    return str(parent)
+        except Exception:
+            pass
+    return default
+
+
+def _resolve_start_path(text: str, default: str = "") -> str:
+    """Pick a starting path for `getOpenFileName` / `getSaveFileName`.
+
+    When `text` points at an existing file, return the full path so Qt
+    pre-fills the filename. When it doesn't, fall back to the nearest
+    existing parent directory so the dialog at least opens in the right area.
+    """
+    if text:
+        try:
+            p = Path(text).expanduser()
+            if p.exists():
+                return str(p)
+            for parent in p.parents:
+                if parent.exists() and parent.is_dir():
+                    return str(parent)
+        except Exception:
+            pass
+    return default
+
+
 def _log_widget() -> QTextEdit:
     log = QTextEdit()
     log.setReadOnly(True)
-    log.setLineWrapMode(QTextEdit.NoWrap)
+    log.setLineWrapMode(QTextEdit.WidgetWidth)
     log.setMinimumHeight(220)
     return log
+
+
+# =============================================================================
+# TAB 0 — PROJECT (MISSION COMMAND)
+# =============================================================================
+
+class _NotesEdit(QTextEdit):
+    """QTextEdit that emits a `blurred` signal when focus is lost. Used by
+    ProjectTab so notes commit to the project on blur instead of per keystroke.
+    """
+    blurred = Signal()
+
+    def focusOutEvent(self, event):
+        super().focusOutEvent(event)
+        self.blurred.emit()
+
+
+class ProjectTab(QWidget):
+    """Mission Command — project header (name / scope / notes), pipeline
+    status dashboard across the three converter stages, and the project file
+    lifecycle controls (New / Open / Save / Save As / Recent / Close).
+
+    The tab is decoupled from MainWindow: it emits `request_focus_stage(key)`
+    when the user clicks an Open ▸ button on a pipeline row; MainWindow maps
+    the stage key to the right tab index.
+    """
+
+    request_focus_stage = Signal(str)   # one of STAGE_KEYS
+
+    # -------------------------------------------------------------------------
+    # CONSTRUCTION
+    # -------------------------------------------------------------------------
+
+    def __init__(self):
+        super().__init__()
+        self._suppress_emits = False   # block field-change handlers during apply_project
+        self._status_rows: dict = {}
+        self._build_ui()
+        pm = project_manager()
+        pm.project_changed.connect(self.apply_project)
+        pm.status_changed.connect(self._on_status_changed)
+        self.apply_project(pm.current())
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setSpacing(10)
+        root.setContentsMargins(14, 14, 14, 14)
+
+        # --- Toolbar ---------------------------------------------------------
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+        self._btn_new     = QPushButton("New…")
+        self._btn_open    = QPushButton("Open…")
+        self._btn_save    = QPushButton("Save")
+        self._btn_save_as = QPushButton("Save As…")
+        self._btn_close   = QPushButton("Close")
+        self._btn_new.clicked.connect(self._on_new)
+        self._btn_open.clicked.connect(self._on_open)
+        self._btn_save.clicked.connect(self._on_save)
+        self._btn_save_as.clicked.connect(self._on_save_as)
+        self._btn_close.clicked.connect(self._on_close)
+
+        self._btn_recent = QToolButton()
+        self._btn_recent.setText("Recent ▾")
+        self._btn_recent.setPopupMode(QToolButton.InstantPopup)
+        self._recent_menu = QMenu(self._btn_recent)
+        self._btn_recent.setMenu(self._recent_menu)
+        self._recent_menu.aboutToShow.connect(self._populate_recent_menu)
+
+        for btn in (self._btn_new, self._btn_open, self._btn_save,
+                    self._btn_save_as, self._btn_recent, self._btn_close):
+            bar.addWidget(btn)
+        bar.addStretch(1)
+        root.addLayout(bar)
+
+        # --- Stacked: populated panel vs empty-state card --------------------
+        self._stack = QStackedWidget()
+        self._stack.addWidget(self._build_populated_panel())   # index 0
+        self._stack.addWidget(self._build_empty_panel())       # index 1
+        root.addWidget(self._stack, 1)
+
+    def _build_populated_panel(self) -> QWidget:
+        panel = QWidget()
+        v = QVBoxLayout(panel)
+        v.setSpacing(10)
+        v.setContentsMargins(0, 0, 0, 0)
+
+        # --- Header ----------------------------------------------------------
+        hdr_box  = QGroupBox("Project")
+        hdr_form = QFormLayout(hdr_box)
+        hdr_form.setSpacing(6)
+
+        self._name_edit = QLineEdit()
+        self._name_edit.editingFinished.connect(self._on_name_changed)
+
+        self._scope_combo = QComboBox()
+        for scope in ProjectScope:
+            self._scope_combo.addItem(scope.display_name(), scope.value)
+        self._scope_combo.currentIndexChanged.connect(self._on_scope_changed)
+
+        self._created_label  = QLabel("—")
+        self._modified_label = QLabel("—")
+        self._path_label     = QLabel("(unsaved)")
+        self._path_label.setWordWrap(True)
+        self._path_label.setStyleSheet("color: #a6adc8;")
+
+        hdr_form.addRow("Name:",     self._name_edit)
+        hdr_form.addRow("Scope:",    self._scope_combo)
+        hdr_form.addRow("Created:",  self._created_label)
+        hdr_form.addRow("Modified:", self._modified_label)
+        hdr_form.addRow("File:",     self._path_label)
+        v.addWidget(hdr_box)
+
+        # --- Notes -----------------------------------------------------------
+        notes_box = QGroupBox("Notes")
+        notes_lay = QVBoxLayout(notes_box)
+        self._notes_edit = _NotesEdit()
+        self._notes_edit.setPlaceholderText("Free-form notes about this conversion project…")
+        self._notes_edit.setMaximumHeight(120)
+        self._notes_edit.blurred.connect(self._on_notes_changed)
+        notes_lay.addWidget(self._notes_edit)
+        v.addWidget(notes_box)
+
+        # --- Pipeline Status -------------------------------------------------
+        status_box = QGroupBox("Pipeline Status")
+        status_lay = QVBoxLayout(status_box)
+        status_lay.setSpacing(4)
+        for stage_key, label in (
+            ("asset_processor",   "Prefab Processor"),
+            ("scene_converter",   "Scene Converter"),
+            ("terrain_processor", "Terrain Materials"),
+        ):
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            dot = QLabel("○")
+            dot.setFixedWidth(14)
+            dot.setStyleSheet("color: #6c7086;")
+            stage_lbl = QLabel(label)
+            stage_lbl.setMinimumWidth(140)
+            summary = QLabel("never run")
+            summary.setObjectName("status_ok")
+            open_btn = QPushButton("Open ▸")
+            open_btn.setFixedWidth(80)
+            open_btn.clicked.connect(
+                lambda _checked=False, k=stage_key: self.request_focus_stage.emit(k)
+            )
+            row.addWidget(dot)
+            row.addWidget(stage_lbl)
+            row.addWidget(summary, 1)
+            row.addWidget(open_btn)
+            status_lay.addLayout(row)
+            self._status_rows[stage_key] = (dot, summary)
+        v.addWidget(status_box)
+
+        # --- Activity log ----------------------------------------------------
+        v.addWidget(_section_label("Activity Log"))
+        self._activity_log = _log_widget()
+        self._activity_log.setMinimumHeight(120)
+        v.addWidget(self._activity_log, 1)
+
+        return panel
+
+    def _build_empty_panel(self) -> QWidget:
+        panel = QWidget()
+        lay = QVBoxLayout(panel)
+        lay.setAlignment(Qt.AlignCenter)
+
+        card = QFrame()
+        card.setFrameShape(QFrame.StyledPanel)
+        card.setMaximumWidth(520)
+        cv = QVBoxLayout(card)
+        cv.setSpacing(8)
+        cv.setContentsMargins(20, 20, 20, 20)
+
+        title = QLabel("No project loaded")
+        title.setObjectName("section")
+        title.setAlignment(Qt.AlignCenter)
+        info = QLabel(
+            "Click <b>New…</b> to start a new Conversion Project, "
+            "<b>Open…</b> to load an existing <code>.u2oproj.json</code>, "
+            "or pick one from <b>Recent ▾</b>."
+        )
+        info.setWordWrap(True)
+        info.setAlignment(Qt.AlignCenter)
+        cv.addWidget(title)
+        cv.addWidget(info)
+
+        lay.addStretch(1)
+        lay.addWidget(card, 0, Qt.AlignCenter)
+        lay.addStretch(1)
+        return panel
+
+    # -------------------------------------------------------------------------
+    # APPLY PROJECT  (the project_changed → UI sync path)
+    # -------------------------------------------------------------------------
+
+    def apply_project(self, project) -> None:
+        self._suppress_emits = True
+        try:
+            if project is None:
+                self._stack.setCurrentIndex(1)
+                self._btn_save.setEnabled(False)
+                self._btn_save_as.setEnabled(False)
+                self._btn_close.setEnabled(False)
+                return
+
+            self._stack.setCurrentIndex(0)
+            self._btn_save.setEnabled(True)
+            self._btn_save_as.setEnabled(True)
+            self._btn_close.setEnabled(True)
+
+            self._name_edit.setText(project.name)
+            idx = self._scope_combo.findData(project.scope.value)
+            self._scope_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            self._created_label.setText(project.created or "—")
+            self._modified_label.setText(project.modified or "—")
+            self._path_label.setText(str(project.path) if project.path else "(unsaved)")
+            self._notes_edit.setPlainText(project.notes)
+            for key in self._status_rows:
+                self._refresh_status_row(key, project)
+        finally:
+            self._suppress_emits = False
+
+    def _refresh_status_row(self, stage_key: str, project) -> None:
+        dot, summary = self._status_rows[stage_key]
+        status = project.pipeline_status.get(stage_key, {}) if project else {}
+
+        if not status.get("last_run"):
+            dot.setText("○")
+            dot.setStyleSheet("color: #6c7086;")
+            summary.setText("never run")
+            return
+
+        last_run = status.get("last_run", "")
+        if stage_key == "asset_processor":
+            text = (
+                f"{last_run}   "
+                f"{status.get('prefabs_processed', 0)}/{status.get('prefabs_total', 0)} prefabs, "
+                f"{status.get('materials_written', 0)} mats, "
+                f"{status.get('errors', 0)} errors"
+            )
+            error_count = status.get("errors", 0)
+        elif stage_key == "scene_converter":
+            text = (
+                f"{last_run}   "
+                f"{status.get('entities', 0)} entities, "
+                f"{status.get('prefab_references', 0)} prefab refs, "
+                f"{status.get('missing_prefabs', 0)} missing"
+            )
+            error_count = status.get("missing_prefabs", 0)
+        else:  # terrain_processor
+            text = (
+                f"{last_run}   "
+                f"{status.get('materials_written', 0)}/{status.get('materials_total', 0)} materials, "
+                f"{status.get('textures_written', 0)} textures, "
+                f"{status.get('errors', 0)} errors"
+            )
+            error_count = status.get("errors", 0)
+
+        dot.setText("●")
+        dot.setStyleSheet("color: #f9e2af;" if error_count else "color: #a6e3a1;")
+        summary.setText(text)
+
+    def _on_status_changed(self, stage_key: str) -> None:
+        proj = project_manager().current()
+        if proj is None or stage_key not in self._status_rows:
+            return
+        self._refresh_status_row(stage_key, proj)
+        self._modified_label.setText(proj.modified)
+        self._log_activity(f"{stage_key}: status updated")
+
+    # -------------------------------------------------------------------------
+    # TOOLBAR HANDLERS
+    # -------------------------------------------------------------------------
+
+    def _on_new(self) -> None:
+        name, ok = QInputDialog.getText(
+            self, "New Project", "Project name:", text="Untitled Project",
+        )
+        if not ok:
+            return
+        name = name.strip() or "Untitled Project"
+        proj = project_manager().new_project(name)
+        self._log_activity(f"Created new project: {proj.name}")
+
+    def _on_open(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Project", "",
+            f"Conversion Project (*{PROJECT_FILE_EXT});;All files (*.*)",
+        )
+        if not path:
+            return
+        try:
+            project_manager().open(Path(path))
+            self._log_activity(f"Opened: {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Open failed", f"Could not open project:\n{e}")
+
+    def _on_save(self) -> None:
+        pm = project_manager()
+        proj = pm.current()
+        if proj is None:
+            return
+        if proj.path is None:
+            self._on_save_as()
+            return
+        try:
+            pm.save()
+            self._modified_label.setText(proj.modified)
+            self._log_activity(f"Saved: {proj.path.name}")
+        except Exception as e:
+            QMessageBox.critical(self, "Save failed", str(e))
+
+    def _on_save_as(self) -> None:
+        pm = project_manager()
+        proj = pm.current()
+        if proj is None:
+            return
+        suggestion = (proj.path.name if proj.path
+                      else f"{proj.name or 'Untitled'}{PROJECT_FILE_EXT}")
+        start = str(proj.path) if proj.path else suggestion
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Project As", start,
+            f"Conversion Project (*{PROJECT_FILE_EXT})",
+        )
+        if not path:
+            return
+        try:
+            pm.save_as(Path(path))
+            self._path_label.setText(str(proj.path))
+            self._modified_label.setText(proj.modified)
+            self._log_activity(f"Saved as: {proj.path.name}")
+        except Exception as e:
+            QMessageBox.critical(self, "Save failed", str(e))
+
+    def _on_close(self) -> None:
+        pm = project_manager()
+        proj = pm.current()
+        if proj is None:
+            return
+        name = proj.name
+        pm.close()
+        self._log_activity(f"Closed: {name}")
+
+    def _populate_recent_menu(self) -> None:
+        self._recent_menu.clear()
+        recent = project_manager().recent()
+        if not recent:
+            empty = QAction("(no recent projects)", self._recent_menu)
+            empty.setEnabled(False)
+            self._recent_menu.addAction(empty)
+            return
+        for path in recent:
+            label = path.name
+            action = QAction(label, self._recent_menu)
+            action.setToolTip(str(path))
+            action.triggered.connect(lambda _checked=False, p=path: self._open_recent(p))
+            self._recent_menu.addAction(action)
+
+    def _open_recent(self, path) -> None:
+        try:
+            project_manager().open(Path(path))
+            self._log_activity(f"Opened from recent: {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Open failed", str(e))
+
+    # -------------------------------------------------------------------------
+    # METADATA FIELD HANDLERS
+    # -------------------------------------------------------------------------
+
+    def _on_name_changed(self) -> None:
+        if self._suppress_emits:
+            return
+        pm = project_manager()
+        proj = pm.current()
+        if proj is None:
+            return
+        proj.set_name(self._name_edit.text().strip() or "Untitled")
+        pm.commit_metadata()
+        self._modified_label.setText(proj.modified)
+
+    def _on_scope_changed(self, idx: int) -> None:
+        if self._suppress_emits:
+            return
+        pm = project_manager()
+        proj = pm.current()
+        if proj is None:
+            return
+        scope_value = self._scope_combo.itemData(idx)
+        proj.set_scope(ProjectScope.from_string(scope_value))
+        pm.commit_metadata()
+        self._modified_label.setText(proj.modified)
+
+    def _on_notes_changed(self) -> None:
+        if self._suppress_emits:
+            return
+        pm = project_manager()
+        proj = pm.current()
+        if proj is None:
+            return
+        new_notes = self._notes_edit.toPlainText()
+        if new_notes == proj.notes:
+            return
+        proj.set_notes(new_notes)
+        pm.commit_metadata()
+        self._modified_label.setText(proj.modified)
+
+    # -------------------------------------------------------------------------
+    # ACTIVITY LOG
+    # -------------------------------------------------------------------------
+
+    def _log_activity(self, msg: str) -> None:
+        ts = _utc_now_iso()
+        self._activity_log.append(f"[{ts}] {msg}")
 
 
 # =============================================================================
@@ -305,16 +781,17 @@ def _log_widget() -> QTextEdit:
 
 class PrefabProcessorTab(QWidget):
     """
-    Drives IntegratedAssetProcessor.  Mirrors the fields from the old
-    IntegratedProcessorGUI (tkinter), loading/saving under the key
-    "asset_processor" in converter_settings.json.
+    Drives IntegratedAssetProcessor. Reads + writes the active project's
+    `stages.asset_processor` section via the ProjectManager.
     """
 
     def __init__(self):
         super().__init__()
         self._worker: WorkerThread = None
         self._build_ui()
-        self._load_settings()
+        pm = project_manager()
+        pm.project_changed.connect(self.apply_project)
+        self.apply_project(pm.current())
 
     # -------------------------------------------------------------------------
     # UI CONSTRUCTION
@@ -347,10 +824,12 @@ class PrefabProcessorTab(QWidget):
         info = QGroupBox("Output Structure")
         info_layout = QVBoxLayout(info)
         info_layout.addWidget(QLabel(
-            "  Prefabs/    — O3DE prefabs with material references\n"
-            "  Materials/  — O3DE PBR materials (.material)\n"
-            "  Textures/   — All textures consolidated\n"
-            "  Meshes/     — FBX models with .assetinfo sub-mesh definitions"
+            "  Prefabs/        — O3DE prefabs with material references\n"
+            "  Materials/      — O3DE PBR materials (.material)\n"
+            "  Textures/       — All textures consolidated\n"
+            "  Meshes/         — FBX models with .assetinfo sub-mesh definitions\n"
+            "  .ImporterData/  — Converter bookkeeping (entity maps, asset\n"
+            "                    index, coverage report). Not read by O3DE."
         ))
         root.addWidget(info)
 
@@ -375,30 +854,42 @@ class PrefabProcessorTab(QWidget):
     # SETTINGS
     # -------------------------------------------------------------------------
 
-    def _load_settings(self) -> None:
-        cfg = load_settings().get("asset_processor", {})
-        if cfg.get("source_path"):  self._source_edit.setText(cfg["source_path"])
-        if cfg.get("output_path"):  self._output_edit.setText(cfg["output_path"])
+    # ── Project contract ─────────────────────────────────────────────────────
+    STAGE_KEY = "asset_processor"
 
-    def _save_settings(self) -> None:
-        save_settings({"asset_processor": {
+    def apply_project(self, project) -> None:
+        cfg = project.stage_settings(self.STAGE_KEY) if project else {}
+        self._source_edit.setText(cfg.get("source_path", ""))
+        self._output_edit.setText(cfg.get("output_path", ""))
+
+    def _collect_stage_settings(self) -> dict:
+        return {
             "source_path": self._source_edit.text(),
             "output_path": self._output_edit.text(),
-        }})
+        }
+
+    def _save_settings(self) -> None:
+        """Field-edit hook: push current UI state into the active project."""
+        pm = project_manager()
+        if pm.current() is None:
+            return
+        pm.update_stage(self.STAGE_KEY, self._collect_stage_settings())
 
     # -------------------------------------------------------------------------
     # BROWSE HELPERS
     # -------------------------------------------------------------------------
 
     def _browse_source(self) -> None:
-        d = QFileDialog.getExistingDirectory(self, "Select Unity Assets Folder")
+        start = _resolve_start_dir(self._source_edit.text().strip())
+        d = QFileDialog.getExistingDirectory(self, "Select Unity Assets Folder", start)
         if d:
             self._source_edit.setText(d)
             self._log(f"Source: {d}")
             self._save_settings()
 
     def _browse_output(self) -> None:
-        d = QFileDialog.getExistingDirectory(self, "Select O3DE Output Folder")
+        start = _resolve_start_dir(self._output_edit.text().strip())
+        d = QFileDialog.getExistingDirectory(self, "Select O3DE Output Folder", start)
         if d:
             self._output_edit.setText(d)
             self._log(f"Output: {d}")
@@ -413,8 +904,12 @@ class PrefabProcessorTab(QWidget):
         self._log_edit.moveCursor(QTextCursor.End)
 
     def _save_log(self) -> None:
+        # Suggest <output>/prefab_processor_log.txt when an output dir is set,
+        # otherwise just the bare filename so Qt opens in its OS default.
+        out_dir = _resolve_start_dir(self._output_edit.text().strip())
+        suggestion = str(Path(out_dir) / "prefab_processor_log.txt") if out_dir else "prefab_processor_log.txt"
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Processing Log", "prefab_processor_log.txt",
+            self, "Save Processing Log", suggestion,
             "Text files (*.txt);;All files (*.*)"
         )
         if path:
@@ -489,6 +984,16 @@ class PrefabProcessorTab(QWidget):
         log(f"Output            : {output_path}")
         log("=" * 60)
 
+        project_manager().update_status(self.STAGE_KEY, {
+            "last_run":          _utc_now_iso(),
+            "prefabs_processed": success_count,
+            "prefabs_total":     len(prefab_files),
+            "materials_written": len(processor.processed_materials),
+            "textures_copied":   len(processor.processed_textures),
+            "meshes_copied":     len(processor.processed_meshes),
+            "errors":            max(0, len(prefab_files) - success_count),
+        })
+
         summary_parts = [f"Prefabs: {success_count}/{len(prefab_files)}"]
         summary_parts += [f"{label}: {count}" for label, count in asset_stats.items()]
         return "  |  ".join(summary_parts)
@@ -517,7 +1022,9 @@ class SceneConverterTab(QWidget):
         self._worker: WorkerThread = None
         self._prefab_dirs: list = []
         self._build_ui()
-        self._load_settings()
+        pm = project_manager()
+        pm.project_changed.connect(self.apply_project)
+        self.apply_project(pm.current())
 
     # -------------------------------------------------------------------------
     # UI CONSTRUCTION
@@ -587,27 +1094,39 @@ class SceneConverterTab(QWidget):
     # SETTINGS
     # -------------------------------------------------------------------------
 
-    def _load_settings(self) -> None:
-        cfg = load_settings().get("scene_converter", {})
-        if cfg.get("scene_path"):  self._scene_edit.setText(cfg["scene_path"])
-        if cfg.get("output_path"): self._output_edit.setText(cfg["output_path"])
+    # ── Project contract ─────────────────────────────────────────────────────
+    STAGE_KEY = "scene_converter"
+
+    def apply_project(self, project) -> None:
+        cfg = project.stage_settings(self.STAGE_KEY) if project else {}
+        self._scene_edit.setText(cfg.get("scene_path", ""))
+        self._output_edit.setText(cfg.get("output_path", ""))
+        self._prefab_dirs = []
+        self._prefab_list.clear()
         for d in cfg.get("prefab_dirs", []):
             self._add_dir_to_list(d)
 
-    def _save_settings(self) -> None:
-        save_settings({"scene_converter": {
+    def _collect_stage_settings(self) -> dict:
+        return {
             "scene_path":  self._scene_edit.text(),
             "output_path": self._output_edit.text(),
-            "prefab_dirs": self._prefab_dirs,
-        }})
+            "prefab_dirs": list(self._prefab_dirs),
+        }
+
+    def _save_settings(self) -> None:
+        pm = project_manager()
+        if pm.current() is None:
+            return
+        pm.update_stage(self.STAGE_KEY, self._collect_stage_settings())
 
     # -------------------------------------------------------------------------
     # BROWSE HELPERS
     # -------------------------------------------------------------------------
 
     def _browse_scene(self) -> None:
+        start = _resolve_start_path(self._scene_edit.text().strip())
         f, _ = QFileDialog.getOpenFileName(
-            self, "Select Unity Scene File", "",
+            self, "Select Unity Scene File", start,
             "Unity Scene (*.unity);;All files (*.*)"
         )
         if f:
@@ -615,7 +1134,8 @@ class SceneConverterTab(QWidget):
             self._save_settings()
 
     def _browse_output(self) -> None:
-        d = QFileDialog.getExistingDirectory(self, "Select Output Destination")
+        start = _resolve_start_dir(self._output_edit.text().strip())
+        d = QFileDialog.getExistingDirectory(self, "Select Output Destination", start)
         if d:
             self._output_edit.setText(d)
             self._save_settings()
@@ -625,7 +1145,11 @@ class SceneConverterTab(QWidget):
     # -------------------------------------------------------------------------
 
     def _add_prefab_directory(self) -> None:
-        d = QFileDialog.getExistingDirectory(self, "Select O3DE Prefab Directory")
+        # Start the picker inside the last prefab dir if there is one,
+        # else the output folder. Either is a sensible neighborhood.
+        last_dir = self._prefab_dirs[-1] if self._prefab_dirs else ""
+        start    = _resolve_start_dir(last_dir) or _resolve_start_dir(self._output_edit.text().strip())
+        d = QFileDialog.getExistingDirectory(self, "Select O3DE Prefab Directory", start)
         if d and d not in self._prefab_dirs:
             self._add_dir_to_list(d)
             self._save_settings()
@@ -655,8 +1179,10 @@ class SceneConverterTab(QWidget):
         self._log_edit.moveCursor(QTextCursor.End)
 
     def _save_log(self) -> None:
+        out_dir = _resolve_start_dir(self._output_edit.text().strip())
+        suggestion = str(Path(out_dir) / "scene_converter_log.txt") if out_dir else "scene_converter_log.txt"
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Conversion Log", "scene_converter_log.txt",
+            self, "Save Conversion Log", suggestion,
             "Text files (*.txt);;All files (*.*)"
         )
         if path:
@@ -744,6 +1270,14 @@ class SceneConverterTab(QWidget):
         log(f"Output             : {output_path}")
         log("=" * 60)
 
+        project_manager().update_status(self.STAGE_KEY, {
+            "last_run":          _utc_now_iso(),
+            "entities":          total,
+            "prefab_references": prefab_refs,
+            "blank_entities":    blanks,
+            "missing_prefabs":   len(converter.missing_prefabs),
+        })
+
         return f"Entities: {total}  |  Prefab refs: {prefab_refs}  |  Blanks: {blanks}"
 
     def _on_finished(self, success: bool, summary: str) -> None:
@@ -774,7 +1308,9 @@ class TerrainTab(QWidget):
         self._worker: WorkerThread = None
         self._selected_materials: list = []   # absolute paths to .mat files
         self._build_ui()
-        self._load_settings()
+        pm = project_manager()
+        pm.project_changed.connect(self.apply_project)
+        self.apply_project(pm.current())
 
     # -------------------------------------------------------------------------
     # UI CONSTRUCTION
@@ -858,33 +1394,46 @@ class TerrainTab(QWidget):
     # SETTINGS
     # -------------------------------------------------------------------------
 
-    def _load_settings(self) -> None:
-        cfg = load_settings().get("terrain_processor", {})
-        if cfg.get("source_path"): self._source_edit.setText(cfg["source_path"])
-        if cfg.get("output_path"): self._output_edit.setText(cfg["output_path"])
+    # ── Project contract ─────────────────────────────────────────────────────
+    STAGE_KEY = "terrain_processor"
+
+    def apply_project(self, project) -> None:
+        cfg = project.stage_settings(self.STAGE_KEY) if project else {}
+        self._source_edit.setText(cfg.get("source_path", ""))
+        self._output_edit.setText(cfg.get("output_path", ""))
+        self._selected_materials = []
+        self._material_list.clear()
         for path in cfg.get("selected_materials", []):
             self._add_material_to_list(path)
 
-    def _save_settings(self) -> None:
-        save_settings({"terrain_processor": {
+    def _collect_stage_settings(self) -> dict:
+        return {
             "source_path":        self._source_edit.text(),
             "output_path":        self._output_edit.text(),
             "selected_materials": list(self._selected_materials),
-        }})
+        }
+
+    def _save_settings(self) -> None:
+        pm = project_manager()
+        if pm.current() is None:
+            return
+        pm.update_stage(self.STAGE_KEY, self._collect_stage_settings())
 
     # -------------------------------------------------------------------------
     # BROWSE / LIST HELPERS
     # -------------------------------------------------------------------------
 
     def _browse_source(self) -> None:
-        d = QFileDialog.getExistingDirectory(self, "Select Unity Assets Folder")
+        start = _resolve_start_dir(self._source_edit.text().strip())
+        d = QFileDialog.getExistingDirectory(self, "Select Unity Assets Folder", start)
         if d:
             self._source_edit.setText(d)
             self._log(f"Source: {d}")
             self._save_settings()
 
     def _browse_output(self) -> None:
-        d = QFileDialog.getExistingDirectory(self, "Select O3DE Output Folder")
+        start = _resolve_start_dir(self._output_edit.text().strip())
+        d = QFileDialog.getExistingDirectory(self, "Select O3DE Output Folder", start)
         if d:
             self._output_edit.setText(d)
             self._log(f"Output: {d}")
@@ -893,7 +1442,7 @@ class TerrainTab(QWidget):
     def _add_materials(self) -> None:
         # Start the picker inside the source folder when one is set so the
         # user doesn't have to navigate from scratch each time.
-        start_dir = self._source_edit.text().strip() or ""
+        start_dir = _resolve_start_dir(self._source_edit.text().strip())
         paths, _ = QFileDialog.getOpenFileNames(
             self, "Select Unity Material Files", start_dir,
             "Unity Materials (*.mat);;All files (*.*)"
@@ -936,8 +1485,10 @@ class TerrainTab(QWidget):
         self._log_edit.moveCursor(QTextCursor.End)
 
     def _save_log(self) -> None:
+        out_dir = _resolve_start_dir(self._output_edit.text().strip())
+        suggestion = str(Path(out_dir) / "terrain_processor_log.txt") if out_dir else "terrain_processor_log.txt"
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Processing Log", "terrain_processor_log.txt",
+            self, "Save Processing Log", suggestion,
             "Text files (*.txt);;All files (*.*)"
         )
         if path:
@@ -1001,6 +1552,14 @@ class TerrainTab(QWidget):
             for err in result["errors"]:
                 log(f"  ⚠ {err}")
         log("=" * 60)
+
+        project_manager().update_status(self.STAGE_KEY, {
+            "last_run":          _utc_now_iso(),
+            "materials_written": result["materials_written"],
+            "materials_total":   len(material_paths),
+            "textures_written":  result["textures_written"],
+            "errors":            len(result["errors"]),
+        })
 
         return (
             f"Materials: {result['materials_written']}/{len(material_paths)}  |  "
@@ -1250,18 +1809,31 @@ class MainWindow(QMainWindow):
     out by QTabWidget itself, not the tab bar.
     """
 
+    # Stage-key → tab index, populated in __init__. Used by ProjectTab's
+    # Open ▸ buttons to switch focus to the correct converter tab.
+    _STAGE_TAB_INDEX: dict = {}
+
     def __init__(self, start_tab: int = 0):
         super().__init__()
         self.setWindowTitle("Unity → O3DE Converter")
         self.resize(820, 760)
 
         self._tabs = QTabWidget()
-        self._tabs.addTab(PrefabProcessorTab(), "Prefab Processor")
-        self._tabs.addTab(SceneConverterTab(),  "Scene Converter")
-        self._tabs.addTab(TerrainTab(),         "Terrain")
-        self._config_index = self._tabs.addTab(ConfigTab(), "Config")
+        project_tab = ProjectTab()
+        self._tabs.addTab(project_tab,           "Project")           # 0
+        prefab_idx  = self._tabs.addTab(PrefabProcessorTab(), "Prefab Processor")  # 1
+        scene_idx   = self._tabs.addTab(SceneConverterTab(),  "Scene Converter")   # 2
+        terrain_idx = self._tabs.addTab(TerrainTab(),         "Terrain")           # 3
+        self._config_index = self._tabs.addTab(ConfigTab(), "Config")              # 4
         self._tabs.tabBar().setTabVisible(self._config_index, False)
         self._tabs.setCurrentIndex(start_tab)
+
+        self._STAGE_TAB_INDEX = {
+            "asset_processor":   prefab_idx,
+            "scene_converter":   scene_idx,
+            "terrain_processor": terrain_idx,
+        }
+        project_tab.request_focus_stage.connect(self._focus_stage)
 
         # Corner button: Config, pinned to the top-right of the tab bar.
         self._config_btn = QPushButton("Config")
@@ -1277,9 +1849,80 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(self._tabs)
 
+        # Window title binds to the active project's name.
+        pm = project_manager()
+        pm.project_changed.connect(self._update_title)
+        self._update_title(pm.current())
+
     def _on_tab_changed(self, index: int) -> None:
         # Keep the corner button visually in sync with whether Config is active.
         self._config_btn.setChecked(index == self._config_index)
+
+    def _focus_stage(self, stage_key: str) -> None:
+        idx = self._STAGE_TAB_INDEX.get(stage_key)
+        if idx is not None:
+            self._tabs.setCurrentIndex(idx)
+
+    def _update_title(self, project) -> None:
+        if project is None:
+            self.setWindowTitle("Unity → O3DE Converter — (no project)")
+        else:
+            self.setWindowTitle(f"Unity → O3DE Converter — {project.name}")
+
+    # -------------------------------------------------------------------------
+    # SAVE-ON-CLOSE
+    #
+    # All converter-tab field edits autosave through the project manager, so
+    # the only dirty state that can survive to closeEvent is a brand-new
+    # project that the user created but never saved (path is still None).
+    # Prompt before discarding it.
+    # -------------------------------------------------------------------------
+
+    def closeEvent(self, event):
+        pm = project_manager()
+        proj = pm.current()
+        if proj is None or not proj.is_dirty():
+            event.accept()
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Unsaved project",
+            f"Project '{proj.name}' has unsaved changes.\n\n"
+            f"Save before closing?",
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+            QMessageBox.Yes,
+        )
+
+        if reply == QMessageBox.Cancel:
+            event.ignore()
+            return
+
+        if reply == QMessageBox.Yes:
+            if proj.path is None:
+                path, _ = QFileDialog.getSaveFileName(
+                    self, "Save Project As",
+                    f"{proj.name or 'Untitled'}{PROJECT_FILE_EXT}",
+                    f"Conversion Project (*{PROJECT_FILE_EXT})",
+                )
+                if not path:
+                    event.ignore()
+                    return
+                try:
+                    pm.save_as(Path(path))
+                except Exception as e:
+                    QMessageBox.critical(self, "Save failed", str(e))
+                    event.ignore()
+                    return
+            else:
+                try:
+                    pm.save()
+                except Exception as e:
+                    QMessageBox.critical(self, "Save failed", str(e))
+                    event.ignore()
+                    return
+
+        event.accept()
 
 
 # =============================================================================
@@ -1288,14 +1931,25 @@ class MainWindow(QMainWindow):
 
 def main() -> None:
     # Determine which tab to open from --tab= argument
+    tab_name_to_index = {
+        "project": 0,
+        "prefab":  1,
+        "scene":   2,
+        "terrain": 3,
+    }
     start_tab = 0
     for arg in sys.argv[1:]:
         if arg.startswith('--tab='):
             val = arg.split('=', 1)[1].lower()
-            start_tab = 1 if val == 'scene' else 0
+            start_tab = tab_name_to_index.get(val, 0)
 
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyleSheet(THEME_QSS)
+
+    # Bootstrap the project system BEFORE constructing tabs so that the
+    # initial apply_project(pm.current()) call in each tab's __init__ sees
+    # the auto-loaded project.
+    project_manager().bootstrap()
 
     window = MainWindow(start_tab=start_tab)
     window.show()

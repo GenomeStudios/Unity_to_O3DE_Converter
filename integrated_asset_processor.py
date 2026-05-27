@@ -246,7 +246,7 @@ class AssetDatabase:
         self.unity_assets_root = unity_assets_root
         self.guid_to_path: Dict[str, Path] = {}
         self.material_cache: Dict[str, Dict] = {}
-        self.texture_extensions = {'.png', '.jpg', '.jpeg', '.tga', '.tiff', '.bmp', '.psd', '.exr', '.hdr'}
+        self.texture_extensions = {'.png', '.jpg', '.jpeg', '.tga', '.tif', '.tiff', '.bmp', '.psd', '.exr', '.hdr'}
         self.mesh_extensions = {'.fbx', '.obj', '.dae', '.blend', '.3ds', '.max', '.ma', '.mb'}
         
         print("Building asset GUID index...")
@@ -323,18 +323,55 @@ class AssetDatabase:
     def _extract_material_data(self, material_data: Dict) -> Dict:
         """Extract material properties and texture references"""
         TEXTURE_MAP = {
-            '_MainTex': 'baseColor',
-            '_BaseMap': 'baseColor',
-            '_BaseColorMap': 'baseColor',
-            '_BumpMap': 'normal',
-            '_NormalMap': 'normal',
+            # baseColor — Unity Standard, URP, HDRP, and common custom-shader aliases
+            '_MainTex':          'baseColor',
+            '_BaseMap':          'baseColor',
+            '_BaseColorMap':     'baseColor',
+            '_Albedo':           'baseColor',
+            '_AlbedoMap':        'baseColor',
+            '_AlbedoTex':        'baseColor',
+            '_Diffuse':          'baseColor',
+            '_DiffuseMap':       'baseColor',
+            '_DiffuseTex':       'baseColor',
+            '_ColorMap':         'baseColor',
+            # normal
+            '_BumpMap':          'normal',
+            '_NormalMap':        'normal',
+            '_NormalTex':        'normal',
+            # metallic — Standard packs gloss in alpha, treated below
             '_MetallicGlossMap': 'metallic',
-            '_MetallicMap': 'metallic',
-            '_SpecGlossMap': 'specular',
-            '_OcclusionMap': 'occlusion.specular',  # O3DE uses occlusion.specularTextureMap
-            '_EmissionMap': 'emissive',
-            '_HeightMap': 'height',
-            '_ParallaxMap': 'height',
+            '_MetallicMap':      'metallic',
+            '_MetallicTex':      'metallic',
+            '_Metallic_Map':     'metallic',
+            # specular workflow
+            '_SpecGlossMap':     'specular',
+            '_SpecularMap':      'specular',
+            # occlusion / AO
+            '_OcclusionMap':     'occlusion.specular',  # O3DE uses occlusion.specularTextureMap
+            '_AOMap':            'occlusion.specular',
+            '_AmbientOcclusion': 'occlusion.specular',
+            '_AmbientOcclusionMap': 'occlusion.specular',
+            # emissive
+            '_EmissionMap':      'emissive',
+            '_EmissionTex':      'emissive',
+            '_EmissiveMap':      'emissive',
+            '_Emissive':         'emissive',
+            # height / parallax
+            '_HeightMap':        'height',
+            '_ParallaxMap':      'height',
+            '_DisplacementMap':  'height',
+        }
+
+        # Texture property names that are KNOWN to exist but intentionally not
+        # mapped — they don't have a clean 1:1 O3DE equivalent and silently
+        # mapping them would inject the wrong data. Listed here so the unmapped-
+        # property warning below doesn't yell about them on every material.
+        IGNORE_UNMAPPED = {
+            '_DetailAlbedoMap', '_DetailMask', '_DetailNormalMap',
+            '_LightTextureB0', '_VectorNoise', '_texcoord',
+            # _Composite is channel-packed and shader-specific (metallic/AO/rough
+            # in different channels per shader); needs a per-shader rule.
+            '_Composite', '_CompositeMap', '_MOHS', '_MaskMap',
         }
         
         # NOTE: _Metallic, _Smoothness, _Glossiness, _GlossMapScale are handled
@@ -363,20 +400,36 @@ class AssetDatabase:
 
         # Extract textures
         tex_envs = saved_properties.get('m_TexEnvs', [])
+        unmapped_with_texture: List[str] = []
         for tex_prop in tex_envs:
             for prop_name, tex_data in tex_prop.items():
                 texture_ref = tex_data.get('m_Texture', {})
                 guid = texture_ref.get('guid', '')
 
-                if guid and prop_name in TEXTURE_MAP:
+                if not guid:
+                    continue
+
+                if prop_name in TEXTURE_MAP:
                     o3de_prop = TEXTURE_MAP[prop_name]
-                    extracted['textures'][o3de_prop] = guid
+                    # Don't let a later alias clobber an already-resolved slot
+                    # (e.g. _BumpMap and _NormalMap both → 'normal'; keep first).
+                    if o3de_prop not in extracted['textures']:
+                        extracted['textures'][o3de_prop] = guid
 
                     # Unity's _MetallicGlossMap contains metallic in RGB and smoothness in Alpha
                     # O3DE needs the same texture for both metallic and roughness
                     if prop_name == '_MetallicGlossMap':
-                        extracted['textures']['roughness'] = guid
+                        if 'roughness' not in extracted['textures']:
+                            extracted['textures']['roughness'] = guid
                         extracted['metallic_gloss_source_guids'].add(guid)
+                elif prop_name not in IGNORE_UNMAPPED:
+                    unmapped_with_texture.append(prop_name)
+
+        if unmapped_with_texture:
+            # Record on the extracted dict so _process_material can surface a
+            # single concise warning per material (with the material name and
+            # shader path for context).
+            extracted['unmapped_texture_props'] = unmapped_with_texture
         
         # Extract float properties
         floats = saved_properties.get('m_Floats', [])
@@ -545,6 +598,49 @@ def read_fbx_mesh_node_names(fbx_path: Path) -> List[str]:
             start -= 1
         name = data[start:end].decode('ascii', errors='ignore').strip()
         if len(name) >= 2 and name not in names:
+            names.append(name)
+        pos = idx + len(marker)
+
+    return names
+
+
+def read_fbx_material_names(fbx_path: Path) -> List[str]:
+    """Extract material names from a binary FBX file, in file order.
+
+    Binary FBX stores each scene object as `<Name>\\x00\\x01<Class>`. The
+    Material class marker is `\\x00\\x01Material`. Scanning backwards from
+    that separator gives the material name as the FBX engine sees it —
+    which is what SceneAPI's ModelAssetBuilderComponent later exposes as
+    `MaterialAsset::m_name` / `ModelMaterialSlot::m_displayName`. That is
+    the exact string the O3DE MaterialComponent label resolver matches
+    against, so it is the only correct key for `materialsByLabel`.
+
+    Returns [] for non-binary or unreadable FBX files. Uses a larger read
+    window than `read_fbx_mesh_node_names` because the Materials block in
+    the Objects section is typically further into the file than Models.
+    """
+    try:
+        with open(fbx_path, 'rb') as f:
+            data = f.read(1048576)   # 1 MB covers the Material block on common assets
+    except Exception:
+        return []
+
+    if data[:20] != b'Kaydara FBX Binary  ':
+        return []
+
+    names: List[str] = []
+    marker = b'\x00\x01Material'
+    pos = 0
+    while True:
+        idx = data.find(marker, pos)
+        if idx < 0:
+            break
+        end = idx
+        start = end
+        while start > 0 and 0x20 <= data[start - 1] <= 0x7E:
+            start -= 1
+        name = data[start:end].decode('ascii', errors='ignore').strip()
+        if len(name) >= 1 and name not in names:
             names.append(name)
         pos = idx + len(marker)
 
@@ -768,12 +864,17 @@ class IntegratedAssetProcessor:
         self.materials_dir = output_root / "Materials"
         self.textures_dir = output_root / "Textures"
         self.meshes_dir = output_root / "Meshes"
-        
+        # Internal converter bookkeeping that O3DE does not consume:
+        # per-prefab .entitymap.json sidecars, asset_index.json, coverage.json.
+        # Kept out of Prefabs/ so the O3DE Asset Processor never scans them.
+        self.importer_data_dir = output_root / ".ImporterData"
+
         # Create directories
         self.prefabs_dir.mkdir(parents=True, exist_ok=True)
         self.materials_dir.mkdir(parents=True, exist_ok=True)
         self.textures_dir.mkdir(parents=True, exist_ok=True)
         self.meshes_dir.mkdir(parents=True, exist_ok=True)
+        self.importer_data_dir.mkdir(parents=True, exist_ok=True)
         
         # Track processed assets
         self.processed_materials: Dict[str, str] = {}  # guid -> output_path
@@ -809,8 +910,17 @@ class IntegratedAssetProcessor:
         # when a prefab is referenced from multiple consumers.
         self._entity_map_cache: Dict[str, Optional[Dict]] = {}
 
-        # Get project folder name for asset hints (lowercase)
+        # Get project folder name for asset hints (lowercase). This is the
+        # output root's basename — the folder that will sit inside the O3DE
+        # project's Assets/ directory.
         self.project_name = output_root.name.lower()
+
+        # Root prefix every assetHint must carry. O3DE's asset catalog stores
+        # paths rooted at the project's Assets/ scan folder, lowercased, with
+        # `assets/` as the leading segment (e.g.
+        # `assets/<project>/materials/foo.azmaterial`). Hints without the
+        # `assets/` prefix do not resolve at runtime.
+        self.asset_hint_root = f"assets/{self.project_name}"
 
         self.entity_id_counter = 1000000
 
@@ -891,6 +1001,14 @@ class IntegratedAssetProcessor:
             # gets its own named sub-mesh rather than the combined FBX model.
             mesh_mapping = {}   # {entity_file_id: assetHint}
 
+            # FBX-internal material names per entity, in submesh order.
+            # SceneAPI extracts these from the FBX as MaterialAsset::m_name,
+            # and ModelMaterialSlot::m_displayName is set from that. The
+            # O3DE MaterialComponent label resolver matches against exactly
+            # these strings — they are the only valid keys for the
+            # `materialsByLabel` map. Pair ordinally with go.material_guids.
+            fbx_material_labels = {}   # {entity_file_id: [fbx_name_0, ...]}
+
             from collections import defaultdict
             entities_by_guid = defaultdict(list)
             for go in game_objects.values():
@@ -904,6 +1022,17 @@ class IntegratedAssetProcessor:
                 # Read actual mesh node names from the FBX binary
                 fbx_node_names = read_fbx_mesh_node_names(fbx_path)
                 self.log(f"    [Mesh] FBX nodes found: {fbx_node_names}")
+
+                # Read FBX-internal material names (Material class objects in
+                # the binary FBX), in file order. This is what SceneAPI will
+                # expose as ModelMaterialSlot::m_displayName at runtime.
+                fbx_mat_names = read_fbx_material_names(fbx_path)
+                if fbx_mat_names:
+                    self.log(f"    [Mesh] FBX materials found: {fbx_mat_names}")
+                else:
+                    self.log(f"    [Mesh] ⚠ No FBX-internal material names "
+                             f"read from {fbx_path.name} — materialsByLabel "
+                             f"will be empty for entities using this mesh.")
 
                 node_paths = build_fbx_node_paths(entity_list, game_objects, fbx_stem, fbx_node_names)
                 entity_node_map = {
@@ -926,19 +1055,31 @@ class IntegratedAssetProcessor:
                     if go.file_id in node_paths:
                         group_name = f"{fbx_stem}-{go.name}"
                         mesh_mapping[go.file_id] = (
-                            f"{self.project_name}/meshes/{group_name}.fbx.azmodel"
+                            f"{self.asset_hint_root}/meshes/{group_name}.fbx.azmodel"
                         )
+                    # Per-entity material label list. Pair ordinally with the
+                    # Unity MeshRenderer slot order; truncate to whichever is
+                    # shorter so we never index past either array. Multi-mesh
+                    # FBX caveat: this uses the FBX-wide material list, not a
+                    # per-submesh Connections-resolved list. For single-mesh
+                    # FBX (the common Unity case) this matches; for multi-mesh
+                    # FBX with different materials per mesh node, a Connections
+                    # parse would be needed.
+                    if go.material_guids and fbx_mat_names:
+                        slot_count = min(len(go.material_guids), len(fbx_mat_names))
+                        fbx_material_labels[go.file_id] = list(fbx_mat_names[:slot_count])
             
             # Create O3DE prefab
             output_name = prefab_path.stem
             output_path = self.prefabs_dir / f"{output_name}.prefab"
             
             self._create_o3de_prefab(
-                root_go, 
-                game_objects, 
+                root_go,
+                game_objects,
                 transform_map,
                 material_mapping,
                 mesh_mapping,
+                fbx_material_labels,
                 output_path
             )
             
@@ -973,7 +1114,7 @@ class IntegratedAssetProcessor:
         self._write_coverage_report()
 
     def _write_asset_index(self) -> None:
-        path = self.output_root / "asset_index.json"
+        path = self.importer_data_dir / "asset_index.json"
         payload = {
             "project_name": self.project_name,
             "materials":    self.asset_index["materials"],
@@ -988,7 +1129,7 @@ class IntegratedAssetProcessor:
         try:
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(payload, f, indent=2)
-            self.log(f"\n  ✓ Wrote asset index: {path.name} "
+            self.log(f"\n  ✓ Wrote asset index: .ImporterData/{path.name} "
                      f"({payload['counts']['materials']} mats, "
                      f"{payload['counts']['meshes']} meshes, "
                      f"{payload['counts']['prefabs']} prefabs)")
@@ -996,14 +1137,14 @@ class IntegratedAssetProcessor:
             self.log(f"  ⚠ Failed to write asset_index.json: {exc}")
 
     def _write_coverage_report(self) -> None:
-        path = self.output_root / "coverage.json"
+        path = self.importer_data_dir / "coverage.json"
         payload = self.coverage.to_dict()
         try:
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(payload, f, indent=2)
             unh_comp = len(payload['unhandled_component_types'])
             unh_over = len(payload['unhandled_override_paths'])
-            self.log(f"  ✓ Wrote coverage report: {path.name} "
+            self.log(f"  ✓ Wrote coverage report: .ImporterData/{path.name} "
                      f"({unh_comp} unhandled component type(s), "
                      f"{unh_over} unhandled override path(s), "
                      f"{len(payload['warnings'])} warning(s))")
@@ -1305,6 +1446,22 @@ class IntegratedAssetProcessor:
             self.log(f"      ⚠ Failed to parse material")
             return None
         
+        # Warn about texture-bound property names the extractor doesn't know
+        # how to route. Almost always indicates a custom / asset-store shader
+        # that uses non-standard slot names (e.g. _Albedo, _Composite). Add
+        # the aliases to TEXTURE_MAP (or IGNORE_UNMAPPED) in
+        # _extract_material_data when one of these recurs across a pack.
+        unmapped = material_data.get('unmapped_texture_props', [])
+        if unmapped:
+            shader_path = material_data.get('shader') or '<unknown shader>'
+            self.log(
+                f"      ⚠ '{material_path.stem}' has bound textures on "
+                f"unrecognized property names {unmapped} "
+                f"(shader: {shader_path}). Those textures will be skipped — "
+                f"add the names to TEXTURE_MAP in _extract_material_data to "
+                f"route them, or to IGNORE_UNMAPPED to silence this warning."
+            )
+
         # Process textures
         texture_paths = {}
         mg_source_guids = material_data.get('metallic_gloss_source_guids', set())
@@ -1367,12 +1524,38 @@ class IntegratedAssetProcessor:
                 # Scalar property
                 o3de_material["propertyValues"][o3de_prop] = float(value)
         
+        # ---------------------------------------------------------------
+        # Opacity sanity pass.
+        # `opacity.alphaSource = "Packed"` tells O3DE to read alpha from the
+        # bound baseColor texture. With no baseColor texture in the final
+        # material, that sample returns 0 → a Cutout material renders fully
+        # invisible and a Blended material renders fully transparent.
+        # Strip the opacity flags in that case so the material falls back to
+        # the (correct) Opaque default and at least shows the constant
+        # baseColor.color. The most common cause is a Unity material whose
+        # _MainTex/_BaseMap GUID does not resolve in the project being
+        # converted (missing texture, package-only texture, etc.).
+        # ---------------------------------------------------------------
+        prop_values = o3de_material["propertyValues"]
+        opacity_mode = prop_values.get('opacity.mode')
+        if opacity_mode in ('Cutout', 'Blended') and 'baseColor.textureMap' not in prop_values:
+            prop_values.pop('opacity.mode', None)
+            prop_values.pop('opacity.alphaSource', None)
+            prop_values.pop('opacity.factor', None)
+            self.log(
+                f"      ⚠ '{output_name}' source declared opacity.mode="
+                f"{opacity_mode} but no baseColor texture survived "
+                f"resolution — opacity flags dropped to avoid an invisible "
+                f"material. Check that the Unity material's _MainTex / "
+                f"_BaseMap GUID is resolvable in this project."
+            )
+
         # Write material file
         with open(output_path, 'w') as f:
             json.dump(o3de_material, f, indent=4)
-        
-        # Generate gem-style asset hint: projectname/materials/filename.azmaterial
-        asset_hint = f"{self.project_name}/materials/{output_path.stem}.azmaterial"
+
+        # Generate gem-style asset hint: assets/projectname/materials/filename.azmaterial
+        asset_hint = f"{self.asset_hint_root}/materials/{output_path.stem}.azmaterial"
         self.processed_materials[material_guid] = asset_hint
         self.asset_index["materials"][material_guid] = asset_hint
 
@@ -1557,6 +1740,7 @@ class IntegratedAssetProcessor:
     
     def _create_o3de_prefab(self, root_go: GameObject, all_game_objects: Dict,
                            transform_map: Dict, material_mapping: Dict, mesh_mapping: Dict,
+                           fbx_material_labels: Dict[str, List[str]],
                            output_path: Path) -> None:
         """Create O3DE prefab in JSON format, plus a `.entitymap.json` sidecar
         that records the fileID→entity_alias mapping so nested-instance override
@@ -1587,6 +1771,7 @@ class IntegratedAssetProcessor:
         root_entity_id = self._create_entity_recursive(
             root_entity, all_game_objects, prefab_data["Entities"],
             prefab_data["Instances"], entity_id_map, material_mapping, mesh_mapping,
+            fbx_material_labels,
             parent_entity_id="ContainerEntity"
         )
 
@@ -1604,6 +1789,7 @@ class IntegratedAssetProcessor:
         # ---------------------------------------------------------------
         self._write_entity_map_sidecar(
             output_path, root_entity, all_game_objects, entity_id_map,
+            fbx_material_labels,
         )
 
     # =========================================================================
@@ -1613,20 +1799,30 @@ class IntegratedAssetProcessor:
     def _write_entity_map_sidecar(self, prefab_output_path: Path,
                                   root_go: GameObject,
                                   all_game_objects: Dict,
-                                  entity_id_map: Dict[str, str]) -> None:
+                                  entity_id_map: Dict[str, str],
+                                  fbx_material_labels: Dict[str, List[str]]) -> None:
         """
         Persist the fileID→entity_alias map and per-entity material slot list
-        next to the converted prefab. Format:
+        into <output>/.ImporterData/<prefab_stem>.entitymap.json so the O3DE
+        Asset Processor never scans these (they are converter bookkeeping, not
+        O3DE-consumed). Sidecar format:
 
             {
               "source_guid":     "<unity_prefab_guid>",
               "source_path":     "Assets/Foo.prefab",   (best-effort)
               "root_entity":     "Entity_[1000001]",
               "container_alias": "ContainerEntity",
-              "entity_aliases":  {"<unity_file_id>": "Entity_[N]", ...},
-              "material_slots":  {"<unity_file_id>": ["<mat_guid_0>", ...]},
-              "go_names":        {"<unity_file_id>": "Cube_001", ...}
+              "entity_aliases":     {"<unity_file_id>": "Entity_[N]", ...},
+              "material_slots":     {"<unity_file_id>": ["<mat_guid_0>", ...]},
+              "material_slot_labels": {"<unity_file_id>": ["<fbx_name_0>", ...]},
+              "go_names":           {"<unity_file_id>": "Cube_001", ...}
             }
+
+        `material_slot_labels` holds the FBX-internal material names (one per
+        Unity MeshRenderer slot, ordinally paired). It is the only valid key
+        source for the runtime `materialsByLabel` map, so any Tier 3 override
+        emission needs to look up the slot's label here rather than guessing
+        from the assetHint stem.
         """
         # The root in entity_id_map keys was indexed by Unity file_id, which is
         # exactly what nested-instance overrides target. ContainerEntity is the
@@ -1652,41 +1848,46 @@ class IntegratedAssetProcessor:
             for go in all_game_objects.values()
             if go.material_guids
         }
+        material_slot_labels = {
+            file_id: list(labels)
+            for file_id, labels in fbx_material_labels.items()
+            if labels
+        }
         go_names = {
             go.file_id: go.name for go in all_game_objects.values() if go.name
         }
 
         sidecar = {
-            "source_guid":     source_guid or "",
-            "source_path":     str(source_path) if source_path else "",
-            "root_entity":     entity_id_map.get(root_go.file_id, ""),
-            "container_alias": "ContainerEntity",
-            "entity_aliases":  dict(entity_id_map),
-            "material_slots":  material_slots,
-            "go_names":        go_names,
+            "source_guid":         source_guid or "",
+            "source_path":         str(source_path) if source_path else "",
+            "root_entity":         entity_id_map.get(root_go.file_id, ""),
+            "container_alias":     "ContainerEntity",
+            "entity_aliases":      dict(entity_id_map),
+            "material_slots":      material_slots,
+            "material_slot_labels": material_slot_labels,
+            "go_names":            go_names,
         }
 
-        sidecar_path = prefab_output_path.with_suffix('.entitymap.json')
+        sidecar_path = self.importer_data_dir / f"{prefab_output_path.stem}.entitymap.json"
         try:
             with open(sidecar_path, 'w', encoding='utf-8') as f:
                 json.dump(sidecar, f, indent=2)
-            self.log(f"  ✓ Wrote entity map sidecar: {sidecar_path.name}")
+            self.log(f"  ✓ Wrote entity map sidecar: .ImporterData/{sidecar_path.name}")
         except Exception as exc:
             self.log(f"  ⚠ Failed to write entity map sidecar: {exc}")
 
     def _load_entity_map_sidecar(self, source_prefab_path: Path) -> Optional[Dict]:
         """Load the converted-side sidecar for a Unity source prefab path.
 
-        Looks up the matching output path by stem in the Prefabs/ directory.
-        Cached after first load. Returns None when the source prefab hasn't
-        been converted yet (or the sidecar is missing for some other reason).
+        Sidecars now live in <output>/.ImporterData/<stem>.entitymap.json.
+        Returns None when the source prefab hasn't been converted yet (or the
+        sidecar is missing for some other reason). Cached after first load.
         """
         key = str(source_prefab_path)
         if key in self._entity_map_cache:
             return self._entity_map_cache[key]
 
-        # The converter writes outputs as <source.stem>.prefab in Prefabs/.
-        candidate = self.prefabs_dir / f"{source_prefab_path.stem}.entitymap.json"
+        candidate = self.importer_data_dir / f"{source_prefab_path.stem}.entitymap.json"
         if not candidate.exists():
             self._entity_map_cache[key] = None
             return None
@@ -1766,16 +1967,17 @@ class IntegratedAssetProcessor:
           Tier 2  m_IsActive on the prefab root → container visibility patch
           Tier 3  m_Materials.Array.data[N] → patch the assetHint inside the
                   target entity's EditorMaterialComponent materialsByLabel
-                  entry whose key is the stem of the ORIGINAL material at
-                  slot N in the source prefab (which equals the FBX submesh
-                  slot's m_displayName under the converter naming convention).
+                  entry. Label key = FBX-internal material name at slot N
+                  (read from the source prefab's sidecar
+                  `material_slot_labels`, which mirrors what SceneAPI exposes
+                  as ModelMaterialSlot::m_displayName at runtime).
 
         Patch path conventions (all are valid JSON Pointer fragments rooted at
         the nested instance):
           /ContainerEntity/...                — affects the instance shell
           /Entities/<entity_alias>/...        — affects a child of the source
         """
-        source_path = f"{self.project_name}/prefabs/{prefab_path.name}"
+        source_path = f"{self.asset_hint_root}/prefabs/{prefab_path.name}"
         o3de_transform, _ = self._convert_to_o3de_coordinates(go.transform)
         euler             = self._quaternion_to_euler(o3de_transform.rotation)
 
@@ -1834,7 +2036,7 @@ class IntegratedAssetProcessor:
         # ---------------------------------------------------------------
         sidecar = self._load_entity_map_sidecar(prefab_path)
         entity_aliases = (sidecar or {}).get("entity_aliases", {})
-        material_slots = (sidecar or {}).get("material_slots", {})
+        material_slot_labels = (sidecar or {}).get("material_slot_labels", {})
 
         if go.prefab_modifications and not sidecar:
             self.coverage.warn(
@@ -1923,9 +2125,10 @@ class IntegratedAssetProcessor:
                     )
                 continue
 
-            # Original material guids per slot index for this target — used
-            # to derive the label key in the base prefab's materialsByLabel.
-            original_slots = material_slots.get(target_id, []) or []
+            # FBX-internal material names per slot index for this target.
+            # Recorded by the source prefab's converter run as the truth
+            # source for label keys in the base prefab's materialsByLabel.
+            slot_labels = material_slot_labels.get(target_id, []) or []
 
             for slot_idx, mat_guid in slot_map.items():
                 asset_hint = self.asset_index["materials"].get(mat_guid)
@@ -1940,23 +2143,20 @@ class IntegratedAssetProcessor:
                     )
                     continue
 
-                # Resolve the slot's label = stem of the ORIGINAL material
-                # the source prefab assigned at this index. That stem is the
-                # key in the base O3DE prefab's materialsByLabel map (matches
-                # the FBX submesh slot's m_displayName, which equals the
-                # original Unity material name by convention).
-                original_guid = (original_slots[slot_idx]
-                                 if slot_idx < len(original_slots) else '')
-                original_hint = (self.asset_index["materials"].get(original_guid, '')
-                                 if original_guid else '')
-                label = Path(original_hint).stem if original_hint else ''
+                # Resolve the slot's label = FBX-internal material name at
+                # this ordinal position (as SceneAPI saw it when the base
+                # prefab was emitted). This is the only key that will match
+                # the base prefab's materialsByLabel entry at runtime.
+                label = (slot_labels[slot_idx]
+                         if slot_idx < len(slot_labels) else '')
 
                 if not label:
                     self.coverage.warn(
                         f"Material override on nested instance '{go.name}' "
-                        f"slot {slot_idx} — cannot resolve original slot's "
-                        f"label (source prefab had no recorded material at "
-                        f"this index). Patch skipped."
+                        f"slot {slot_idx} — no FBX-internal label recorded "
+                        f"in sidecar (source prefab predates the label "
+                        f"refactor, or FBX parse failed at emit time). "
+                        f"Patch skipped — re-convert the source prefab to fix."
                     )
                     self.coverage.record_modification(
                         f'm_Materials.Array.data[{slot_idx}]',
@@ -2047,6 +2247,7 @@ class IntegratedAssetProcessor:
                                  entities_dict: Dict, instances_dict: Dict,
                                  entity_id_map: Dict,
                                  material_mapping: Dict, mesh_mapping: Dict,
+                                 fbx_material_labels: Dict[str, List[str]],
                                  parent_entity_id: str = None) -> str:
         """Recursively create entities or instances in JSON format"""
         # Check if this is a prefab instance
@@ -2068,13 +2269,44 @@ class IntegratedAssetProcessor:
         entity_id_map[go.file_id] = entity_id
         
         o3de_transform, needs_nonuniform = self._convert_to_o3de_coordinates(go.transform)
-        
+
         # Use provided parent_entity_id or look up from entity_id_map
         if parent_entity_id is None:
             if go.parent_id and go.parent_id in entity_id_map:
                 parent_entity_id = entity_id_map[go.parent_id]
             else:
                 parent_entity_id = ""
+
+        # Unity prefabs are always rooted at a single GameObject whose stored
+        # transform is just whatever the prefab happened to sit at when last
+        # saved. Unity treats that root transform as DEAD DATA at instance
+        # time: every PrefabInstance modification records the FINAL
+        # m_LocalPosition / m_LocalRotation / m_LocalScale, not a delta on
+        # top of the prefab root. So preserving the Unity root GO's
+        # transform on the converted prefab's inner root entity causes a
+        # double-offset — the consumer's instance patch positions the
+        # ContainerEntity at the world placement, and then the inner root
+        # entity adds its own bake on top.
+        #
+        # Fix: when this entity is the prefab's root (parent_entity_id is
+        # the ContainerEntity), force identity. World placement is supplied
+        # entirely by the consumer's patches on the ContainerEntity.
+        is_prefab_root = (parent_entity_id == "ContainerEntity")
+        if is_prefab_root and (
+            any(abs(v) > 0.0001 for v in o3de_transform.position)
+            or any(abs(v) > 0.0001 for v in self._quaternion_to_euler(o3de_transform.rotation))
+            or needs_nonuniform
+            or abs(o3de_transform.scale[0] - 1.0) > 0.0001
+        ):
+            self.log(
+                f"  [Transform] Discarding non-identity root transform on "
+                f"'{go.name}' (pos={o3de_transform.position}, "
+                f"scale={o3de_transform.scale}) — Unity prefab root "
+                f"transforms are dead data, placement comes from the "
+                f"consumer's ContainerEntity patch."
+            )
+            o3de_transform   = Transform((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), (1.0, 1.0, 1.0))
+            needs_nonuniform = False
         
         entity = {
             "Id": entity_id,
@@ -2152,6 +2384,7 @@ class IntegratedAssetProcessor:
         ctx = ProcessingContext(
             material_mapping      = material_mapping,
             mesh_mapping          = mesh_mapping,
+            fbx_material_labels   = fbx_material_labels,
             entities_dict         = entities_dict,
             entity_id_map         = entity_id_map,
             generate_component_id = self._generate_component_id,
@@ -2175,7 +2408,8 @@ class IntegratedAssetProcessor:
                 child_entity_id = self._create_entity_recursive(
                     all_game_objects[child_id], all_game_objects,
                     entities_dict, instances_dict, entity_id_map,
-                    material_mapping, mesh_mapping, entity_id
+                    material_mapping, mesh_mapping, fbx_material_labels,
+                    entity_id
                 )
                 if child_entity_id:
                     child_order.append(child_entity_id)

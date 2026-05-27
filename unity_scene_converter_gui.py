@@ -683,8 +683,9 @@ class UnitySceneConverter:
           Tier 2  m_IsActive — logged to coverage (schema TBD)
           Tier 3  m_Materials.Array.data[N] — patch the assetHint in the
                   target entity's EditorMaterialComponent materialsByLabel
-                  entry whose key is the stem of the ORIGINAL material at
-                  slot N in the source prefab.
+                  entry. Label key = FBX-internal material name at slot N
+                  (read from the source prefab's sidecar
+                  `material_slot_labels`).
         Unhandled propertyPaths are recorded into self.coverage.
         """
         source_path = self._convert_to_assets_path(prefab_path)
@@ -731,8 +732,8 @@ class UnitySceneConverter:
 
         # ---- Tier 2 + 3: walk modifications by propertyPath ----
         sidecar = self._load_entity_map_sidecar(prefab_path)
-        entity_aliases = (sidecar or {}).get("entity_aliases", {})
-        material_slots = (sidecar or {}).get("material_slots", {})
+        entity_aliases       = (sidecar or {}).get("entity_aliases", {})
+        material_slot_labels = (sidecar or {}).get("material_slot_labels", {})
 
         if go.prefab_modifications and not sidecar:
             self.coverage.warn(
@@ -796,9 +797,10 @@ class UnitySceneConverter:
                     )
                 continue
 
-            # Original material guids per slot index for this target — used
-            # to derive the label key in the base prefab's materialsByLabel.
-            original_slots = material_slots.get(target_id, []) or []
+            # FBX-internal material names per slot index for this target,
+            # recorded by the source prefab's converter run. Only valid keys
+            # for the base prefab's materialsByLabel.
+            slot_labels = material_slot_labels.get(target_id, []) or []
 
             for slot_idx, mat_guid in slot_map.items():
                 asset_hint = (asset_index or {}).get('materials', {}).get(mat_guid)
@@ -810,23 +812,19 @@ class UnitySceneConverter:
                     )
                     continue
 
-                # Resolve the slot's label = stem of the ORIGINAL material the
-                # source prefab assigned at this index. That stem is the key
-                # in the base O3DE prefab's materialsByLabel map (matches the
-                # FBX submesh slot's m_displayName, which equals the original
-                # Unity material name by convention).
-                original_guid = (original_slots[slot_idx]
-                                 if slot_idx < len(original_slots) else '')
-                original_hint = ((asset_index or {}).get('materials', {}).get(original_guid, '')
-                                 if original_guid else '')
-                label = Path(original_hint).stem if original_hint else ''
+                # Label = FBX-internal material name at this ordinal position
+                # (the only key that matches the base prefab's
+                # materialsByLabel entry at runtime).
+                label = (slot_labels[slot_idx]
+                         if slot_idx < len(slot_labels) else '')
 
                 if not label:
                     self.coverage.warn(
                         f"Material override on scene instance '{go.name}' "
-                        f"slot {slot_idx} — cannot resolve original slot's "
-                        f"label (source prefab had no recorded material at "
-                        f"this index). Patch skipped."
+                        f"slot {slot_idx} — no FBX-internal label recorded "
+                        f"in sidecar (source prefab predates the label "
+                        f"refactor, or FBX parse failed at emit time). "
+                        f"Patch skipped — re-convert the source prefab to fix."
                     )
                     self.coverage.record_modification(
                         f'm_Materials.Array.data[{slot_idx}]',
@@ -867,17 +865,24 @@ class UnitySceneConverter:
     # =========================================================================
 
     def _load_entity_map_sidecar(self, prefab_path: Path) -> Optional[Dict]:
-        """Load `<stem>.entitymap.json` next to a converted O3DE prefab.
+        """Load `<stem>.entitymap.json` from <output>/.ImporterData/.
 
-        These are written by Stage 1 (IntegratedAssetProcessor). When Stage 2
-        is run after Stage 1 against the same output, the sidecar is present;
-        otherwise this returns None and non-transform overrides are recorded
-        as unhandled.
+        Sidecars are written by Stage 1 (IntegratedAssetProcessor) into the
+        same output root's `.ImporterData/` subdirectory. When Stage 2 runs
+        after Stage 1, the sidecar is found there; otherwise this returns
+        None and non-transform overrides are recorded as unhandled.
+
+        `prefab_path` is the converted O3DE prefab path, e.g.
+        `<output>/Prefabs/Foo.prefab`. The sidecar is therefore at
+        `<output>/.ImporterData/Foo.entitymap.json`.
         """
         key = str(prefab_path)
         if key in self._entity_map_cache:
             return self._entity_map_cache[key]
-        candidate = prefab_path.with_suffix('.entitymap.json')
+
+        candidate = (prefab_path.parent.parent
+                     / ".ImporterData"
+                     / f"{prefab_path.stem}.entitymap.json")
         if not candidate.exists():
             self._entity_map_cache[key] = None
             return None
@@ -892,24 +897,23 @@ class UnitySceneConverter:
             return None
 
     def _get_asset_index(self, hint_path: Path) -> Optional[Dict]:
-        """Lazy-load asset_index.json by walking up from a converted prefab path.
+        """Lazy-load asset_index.json from <output>/.ImporterData/.
 
-        Searches `<prefab_path>.parent.parent / asset_index.json` first
-        (matching the Stage 1 output layout), then the immediate parent.
-        Cached after first successful load.
+        `hint_path` is a converted prefab path like
+        `<output>/Prefabs/Foo.prefab`. The index now lives in
+        `<output>/.ImporterData/asset_index.json`. Cached after first load.
         """
         if self._asset_index is not None:
             return self._asset_index
-        for candidate in (hint_path.parent.parent / 'asset_index.json',
-                          hint_path.parent / 'asset_index.json'):
-            if candidate.exists():
-                try:
-                    with open(candidate, 'r', encoding='utf-8') as f:
-                        self._asset_index = json.load(f)
-                    self.log(f"  ✓ Loaded asset index: {candidate}")
-                    return self._asset_index
-                except Exception as exc:
-                    self.log(f"  ⚠ Failed to load asset index {candidate}: {exc}")
+        candidate = hint_path.parent.parent / ".ImporterData" / "asset_index.json"
+        if candidate.exists():
+            try:
+                with open(candidate, 'r', encoding='utf-8') as f:
+                    self._asset_index = json.load(f)
+                self.log(f"  ✓ Loaded asset index: {candidate}")
+                return self._asset_index
+            except Exception as exc:
+                self.log(f"  ⚠ Failed to load asset index {candidate}: {exc}")
         self._asset_index = {}
         return self._asset_index
 
@@ -918,15 +922,17 @@ class UnitySceneConverter:
     # =========================================================================
 
     def finalize(self, output_dir: Path) -> None:
-        """Write coverage.json into the scene output directory."""
-        path = Path(output_dir) / "coverage.json"
+        """Write coverage.json into <output_dir>/.ImporterData/."""
+        importer_data = Path(output_dir) / ".ImporterData"
+        importer_data.mkdir(parents=True, exist_ok=True)
+        path = importer_data / "coverage.json"
         payload = self.coverage.to_dict()
         try:
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(payload, f, indent=2)
             unh_comp = len(payload['unhandled_component_types'])
             unh_over = len(payload['unhandled_override_paths'])
-            self.log(f"  ✓ Wrote coverage report: {path.name} "
+            self.log(f"  ✓ Wrote coverage report: .ImporterData/{path.name} "
                      f"({unh_comp} unhandled component type(s), "
                      f"{unh_over} unhandled override path(s), "
                      f"{len(payload['warnings'])} warning(s))")
@@ -1090,6 +1096,7 @@ class UnitySceneConverter:
         ctx = ProcessingContext(
             material_mapping      = {},
             mesh_mapping          = {},
+            fbx_material_labels   = {},   # scene converter has no FBX access; material emit gracefully degrades
             entities_dict         = entities_dict,
             entity_id_map         = entity_id_map,
             generate_component_id = self._generate_component_id,

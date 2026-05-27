@@ -4,42 +4,98 @@ Paired with `mem:material_conversion/material_component_label_resolution_plan`.
 
 ## Update Log (newest at top)
 
-### 2026-05-25 — I.3 (converter emission) landed
+### 2026-05-26 — Label source corrected: FBX-internal material names, not .mat stems
 
-**Primary emission (`components/material.py`)**
-`MaterialComponentProcessor.emit()` rewritten:
-- `materials` now contains only the default `{}` slot (= first Unity material).
-  Retained because `GetDefaultMaterialMapFromModelAsset` always inserts
-  `DefaultMaterialAssignmentId` and therefore the default slot still routes
-  through the legacy `m_materials` path.
-- All materials are also written into `materialsByLabel`, keyed by
-  `Path(assetHint).stem` (e.g. `Door_MetalDark`). At runtime,
-  `ResolveMaterialsByLabel()` matches each label against
-  `MaterialConsumerRequestBus::GetMaterialLabels()` (the FBX submesh slot's
-  `m_displayName`) and projects resolved entries into `m_materials`.
-  Unresolved labels stay in the by-label map.
-- Synthetic `{N}` keys (`{0}`, `{1}`, …) are no longer emitted — they
-  never resolved at runtime under the old scheme either.
-- Duplicate labels emit a warning and keep first occurrence (Unity allows
-  the same material on multiple slots; O3DE label resolution does not).
+**Why this matters:** Confirmed via O3DE source — `ModelMaterialSlot::m_displayName`
+is set from `MaterialAsset::m_name`, which SceneAPI extracts from the FBX
+itself in `ModelAssetBuilderComponent.cpp:2361`. The runtime label resolver
+therefore sees the FBX-internal material strings, which are completely
+independent of Unity's `.mat` (and our `.azmaterial`) file names. My earlier
+emission used `Path(assetHint).stem` as the label key — that string only
+happens to match the FBX label if the Unity material name was authored to
+mirror the FBX name, which is not a guaranteed convention.
 
-**Tier 3 nested-prefab + scene-instance overrides**
-Both override sites rewritten to patch `materialsByLabel/<label>` instead
-of the dead `materials/{N}` path:
-- `integrated_asset_processor.py` `_create_nested_prefab_instance` —
-  label = stem of the ORIGINAL material at slot N in the source prefab,
-  looked up via the sidecar's `material_slots[target_id][slot_idx]` →
-  `asset_index["materials"]` → `Path(hint).stem`.
-- `unity_scene_converter_gui.py` `_create_prefab_instance` — same lookup,
-  via `_get_asset_index(prefab_path)`. Sidecar `material_slots` is now
-  loaded in this method (previously only Stage 1 loaded it).
-- Slots with no recorded original material (sidecar missing the entry)
-  log a coverage warning and skip the patch.
+**Structural change:** The converter now pairs *FBX-material-slot-name* ↔
+*Unity-material-name* (ordinally, per Unity's MeshRenderer.materials order),
+where previously it paired *Unity-mesh-slot-index* ↔ *Unity-material-name*.
 
-**Invariant the whole pipeline now depends on**: the Unity material name
-(= .azmaterial file stem we emit) must equal the FBX submesh material
-slot's `m_displayName`. Mismatches surface as a "label not resolved"
-entry that never reaches the inspector.
+**Files touched:**
+
+- `integrated_asset_processor.py`
+  - New `read_fbx_material_names(fbx_path) -> List[str]`. Scans the binary
+    FBX for `\x00\x01Material` markers (mirrors the existing
+    `read_fbx_mesh_node_names`). Uses a 1 MB read window because the
+    Materials block in the Objects section is typically deeper than Models.
+  - `_process_prefab` now calls `read_fbx_material_names` once per FBX,
+    builds `fbx_material_labels: {entity_file_id: [fbx_name_0, ...]}`,
+    truncates to `min(len(go.material_guids), len(fbx_mat_names))`, and
+    threads it through `_create_o3de_prefab` → `_create_entity_recursive`
+    → `ProcessingContext` → `MaterialComponentProcessor`.
+  - **Multi-mesh FBX caveat**: uses the FBX-wide material list, not a
+    per-mesh-node Connections-resolved list. Single-mesh FBX (the common
+    Unity case) is correct; multi-mesh FBX with different materials per
+    mesh node would need Connections parsing.
+
+- `components/base.py` — `ProcessingContext` gained
+  `fbx_material_labels: Dict[str, List[str]]`.
+
+- `components/material.py` — `MaterialComponentProcessor.emit()` now keys
+  `materialsByLabel` by `ctx.fbx_material_labels[go.file_id][idx]` instead
+  of `Path(mat_path).stem`. When labels are unavailable (no FBX access,
+  empty parse, or unknown entity), the by-label entry is omitted but the
+  default `{}` slot is still emitted so the entity renders.
+
+- `unity_scene_converter_gui.py` — passes `fbx_material_labels={}` into
+  the scene-side `ProcessingContext` (scene converter has no FBX access).
+
+- Sidecar (`.entitymap.json`) gained `material_slot_labels:
+  {file_id: [fbx_name_0, ...]}`. Tier 3 override patches in both stages
+  now look up the slot's label here rather than re-deriving from the
+  assetHint stem. Sidecars from earlier converter runs lack this field,
+  so overrides against legacy prefabs log a warning and skip the patch
+  with a "re-convert the source prefab to fix" hint.
+
+### 2026-05-26 — assetHint `assets/` prefix fix
+
+All converter-emitted assetHints (and nested-prefab `Source` paths) were
+missing the leading `assets/` segment that the O3DE asset catalog stores
+them under. Symptom: catalog entry like
+`assets/alien fantasy forest/meshes/dead _trunk_01-...azmodel` does not
+match emitted hint `alien fantasy forest/meshes/Dead _trunk_01-...`,
+so the hint never resolves at runtime.
+
+Fix in `integrated_asset_processor.py`:
+- New field `self.asset_hint_root = f"assets/{self.project_name}"` (next
+  to the existing `self.project_name` derivation).
+- Three construction sites switched from `{self.project_name}/...` to
+  `{self.asset_hint_root}/...`:
+    * mesh hint (`_process_prefab`, ~L934)
+    * material hint (`_process_material`, ~L1380)
+    * nested-prefab Source path (`_create_nested_prefab_instance`, ~L1784)
+- `project_name` itself unchanged (still the bare folder basename) since
+  it is also written to `asset_index.json` metadata.
+
+Stage 2 (`unity_scene_converter_gui.py`) reads hints out of the asset
+index Stage 1 writes, so it picks up the fix transitively.
+
+**Possible parallel issue (NOT fixed, flagged for user):**
+- `unity_scene_converter_gui._convert_to_assets_path` builds prefab
+  `Source` paths as `{search_dir.name}/{rel_to_search}` with no
+  `assets/` prefix. If `search_dir` is something other than the project
+  Assets folder, the resulting Source won't match the catalog either.
+- **Case mismatch** — `project_name` is lowercased but Stage 1's
+  `group_name = f"{fbx_stem}-{go.name}"` preserves Unity's casing in the
+  mesh subpath, and material file names also preserve case per the
+  pipeline convention. The catalog normalizes paths to lowercase, so if
+  O3DE's hint resolution is case-sensitive, the bind will still miss on
+  any source whose file/group name has uppercase letters.
+
+### 2026-05-25 — I.3 (converter emission) — first attempt, since superseded
+
+Initial emission scheme keyed `materialsByLabel` by `Path(assetHint).stem`
+(the Unity material name). Superseded by the FBX-name correction above —
+see top entry. The default-`{}`-slot + drop-synthetic-`{N}`-keys parts
+are unchanged from that attempt.
 
 ### 2026-05-25 — Implementation (I.1 + I.2) landed in o3de_sourcedev
 
@@ -64,22 +120,35 @@ entry that never reaches the inspector.
 ### Pending
 
 - **Testing** — not yet run. End-to-end build + load required:
-    * Convert `W_2x_glass_A.prefab` through the new converter.
-    * Open in editor with the patched AtomLyIntegration gem.
-    * Verify Door_MetalDark + Glass slots bind on first mesh load.
-    * Verify a scene-level material override on the same prefab also
-      lands via the new `materialsByLabel/<label>` patch path.
+    * Convert a multi-material prefab through the new converter; verify
+      the converter log prints "FBX materials found: [...]" with the
+      expected list, and the resulting `.prefab` has a `materialsByLabel`
+      keyed by those exact strings.
+    * Open in editor with the patched AtomLyIntegration gem; verify the
+      inspector shows the right materials on each slot after first mesh
+      load.
+    * Author a scene-level material override on the regenerated prefab;
+      run Stage 2; verify the patch path uses the FBX label and resolves.
   See plan T-matrix.
 
 ## Decisions in flight
 None.
 
 ## Known unknowns
-- Does the Unity material name always equal the FBX submesh material slot's `m_displayName` for converted assets? The pipeline now hard-depends on this. Verify on the W_2x_glass_A test asset first. If false: need a name-mapping pass in the converter to rewrite either the .azmaterial file names or the by-label keys to match the FBX slot names.
+- **Multi-mesh FBX**: the per-FBX material list works for single-mesh
+  FBX. Multi-mesh FBX where different mesh nodes use different subsets
+  of materials needs Connections-section parsing to know which materials
+  go with which mesh. Currently the converter assumes the FBX-wide list
+  applies to every entity sharing the FBX.
+- Whether O3DE's assetHint resolution is case-sensitive. If yes, the
+  converter's mixed-case mesh group names and preserved-case material
+  file names won't match the lowercased catalog entries.
 - JSON serialization of `AZStd::unordered_map<AZStd::string, MaterialAssignment>` is expected to use the string as the JSON object key directly (vs. the struct-string serialization used for `MaterialAssignmentId` keys). No custom serializer added — relying on auto reflection. If the field round-trips as something else (e.g. an `{Key, Value}` array form), the converter's emission shape will need to follow.
-- Whether the AzCore JSON Patch `replace` op tolerates a missing intermediate path (`materialsByLabel/<label>`). The Tier 3 override emission assumes the base prefab always contains the label (which is true under the new emission scheme, since every original material is also written to materialsByLabel). Legacy prefabs converted before this change won't have it — those need re-conversion to benefit.
+- Whether the AzCore JSON Patch `replace` op tolerates a missing intermediate path (`materialsByLabel/<label>`). The Tier 3 override emission assumes the base prefab always contains the label.
 
 ## Next actions
-1. User: regenerate a multi-material prefab (W_2x_glass_A), load in editor, confirm inspector shows both Door_MetalDark and Glass after first mesh load.
+1. User: regenerate a multi-material prefab, confirm "FBX materials found" log shows the expected list, load in editor, confirm inspector shows correct materials on each slot.
 2. User: author a scene-level material override on the regenerated prefab, run Stage 2, confirm the patch resolves.
-3. README + `project/converter_working_status.md` row "Multi-material slots" needs the format note updated from `{0}, {1}, ...` to `{} default + materialsByLabel`.
+3. README + `project/converter_working_status.md` row "Multi-material slots" needs the format note updated from `{0}, {1}, ...` to `{} default + materialsByLabel (keyed by FBX-internal material names)`.
+4. Decide on Stage 2 `_convert_to_assets_path` prefix fix + case-sensitivity question.
+5. Multi-mesh FBX Connections parsing if/when a test asset surfaces the limitation.
