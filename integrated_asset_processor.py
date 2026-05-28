@@ -409,6 +409,57 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _derive_asset_hint_root(output_root: Path) -> str:
+    """Compute the assetHint prefix every emitted reference must carry.
+
+    O3DE resolves an ``assetHint`` by matching it against a product
+    asset's cache-relative path: the path from the project's scan-folder
+    root (the dir containing ``project.json``) down to the asset,
+    lowercased with forward slashes. So the hint root must be the output
+    directory's path relative to that project root.
+
+    Resolution order:
+      1. Walk up from ``output_root`` looking for ``project.json``. When
+         found, return ``output_root`` relative to it (lowercased). This
+         is the authoritative answer — it mirrors exactly how the O3DE
+         Asset Processor keys the product cache.
+      2. No ``project.json`` above us → fall back to the first
+         case-insensitive ``assets`` path segment and take everything
+         from there. Handles output trees that aren't inside a built
+         project yet but still follow the ``Assets/...`` convention.
+      3. Last resort → ``assets/<leaf>`` (the legacy leaf-only behaviour).
+         Only fires when the output path has no ``assets`` segment at all.
+
+    The leaf-only fallback was the ONLY behaviour before 2026-05-28 and
+    silently dropped intermediate folders (e.g. ``Art/``), leaving every
+    mesh / material reference unresolved when output landed deeper than
+    ``<proj>/Assets/<leaf>``.
+    """
+    output_root = Path(output_root)
+
+    # 1. Authoritative: relative to the O3DE project root.
+    probe = output_root
+    for _ in range(24):  # bounded climb — guards against pathological roots
+        if (probe / "project.json").is_file():
+            try:
+                rel = output_root.relative_to(probe)
+            except ValueError:
+                break
+            return "/".join(part.lower() for part in rel.parts)
+        if probe.parent == probe:
+            break
+        probe = probe.parent
+
+    # 2. First `assets` segment in the path.
+    parts = output_root.parts
+    for i, part in enumerate(parts):
+        if part.lower() == "assets":
+            return "/".join(seg.lower() for seg in parts[i:])
+
+    # 3. Legacy leaf-only fallback.
+    return f"assets/{output_root.name.lower()}"
+
+
 
 class IntegratedAssetProcessor:
     """Processes Unity prefabs with materials to O3DE format"""
@@ -539,16 +590,22 @@ class IntegratedAssetProcessor:
         self._entity_map_cache: Dict[str, Optional[Dict]] = {}
 
         # Get project folder name for asset hints (lowercase). This is the
-        # output root's basename — the folder that will sit inside the O3DE
-        # project's Assets/ directory.
+        # output root's basename — kept for log/display use.
         self.project_name = output_root.name.lower()
 
-        # Root prefix every assetHint must carry. O3DE's asset catalog stores
-        # paths rooted at the project's Assets/ scan folder, lowercased, with
-        # `assets/` as the leading segment (e.g.
-        # `assets/<project>/materials/foo.azmaterial`). Hints without the
-        # `assets/` prefix do not resolve at runtime.
-        self.asset_hint_root = f"assets/{self.project_name}"
+        # Root prefix every assetHint must carry. O3DE resolves an assetHint
+        # by matching it against the product asset's cache-relative path —
+        # the path from the project's scan-folder root (the directory that
+        # contains `project.json`) down to the asset, lowercased, forward
+        # slashes. So the hint root MUST be the output directory's path
+        # relative to the O3DE project root, not merely its leaf name.
+        #
+        # Example: output at `<proj>/Assets/Art/Alien Fantasy Forest` must
+        # produce `assets/art/alien fantasy forest`, NOT
+        # `assets/alien fantasy forest` (the old leaf-only behaviour, which
+        # dropped intermediate folders like `Art/` and left every mesh /
+        # material reference unresolved in-engine).
+        self.asset_hint_root = _derive_asset_hint_root(output_root)
 
         self.entity_id_counter = 1000000
 
