@@ -362,11 +362,25 @@ def _default_stages() -> dict:
                 "zero_position":     True,
                 "default_position":  [0.0, 0.0, 0.0],
                 "default_rotation":  [0.0, 0.0, 0.0],
+                # When True, force-generate a whole-mesh PhysX collision
+                # mesh (.pxmesh) for this FBX even if no Unity MeshCollider
+                # references it. "Everything" granularity — one group over
+                # all the FBX's geometry.
+                "physx_mesh":        False,
+                # Auto-compensation toggles (transform-truth). Default on;
+                # turn off per-mesh (override) or globally (here) when the
+                # auto-derived value is wrong for a specific asset.
+                "auto_center":       True,   # single-mesh FBX geometry auto-center
+                "auto_rotation":     True,   # Y-up→Z-up +90°X correction
             },
             # F-5: per-mesh overrides keyed by mesh GUID (from
             # outputs.asset_processor.meshes). Each value is a partial
             # dict carrying any subset of the keys above.
             "overrides": {},
+            # Project-wide: emit the prefab's ContainerEntity wrapper as
+            # an editor-only entity (stripped/dissolved at runtime). On by
+            # default — toggled from the Meshes tab.
+            "prefab_wrapper_editor_only": True,
         },
         "material_processor": {
             # F-9: defaults reference a profile name instead of a raw
@@ -408,7 +422,9 @@ def _default_stages() -> dict:
             "overrides": {},
         },
         "terrain_processor": {
-            "source_path": "", "output_path": "", "selected_materials": [],
+            "source_path": "", "output_path": "",
+            "selected_terrains": [],
+            "outputs": ["materials", "heightmap", "splatmaps", "entity"],
         },
     }
 

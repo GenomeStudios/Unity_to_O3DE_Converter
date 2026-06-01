@@ -123,10 +123,15 @@ def create_o3de_prefab(worker, root_go: GameObject, all_game_objects: Dict,
                        transform_map: Dict, material_mapping: Dict,
                        mesh_mapping: Dict,
                        fbx_material_labels: Dict[str, List[str]],
-                       output_path: Path) -> None:
+                       output_path: Path,
+                       collider_pxmesh_mapping: Dict = None) -> None:
     """Write an O3DE ``.prefab`` JSON file + its
     ``.entitymap.json`` sidecar from a parsed source scene-graph
     rooted at ``root_go``."""
+    # Stashed on the worker so the per-entity ProcessingContext (built deep in
+    # create_entity_recursive from worker.*) can read it without threading the
+    # map through every recursive signature. {(guid, fileID): .pxmesh hint}.
+    worker._collider_pxmesh_mapping = collider_pxmesh_mapping or {}
     # ContainerEntity uses the root GameObject's name.
     prefab_data = {
         "ContainerEntity": create_container_entity(worker, root_go),
@@ -264,7 +269,13 @@ def load_entity_map_sidecar(worker, source_prefab_path: Path) -> Optional[Dict]:
 
 def create_container_entity(worker, root_go: GameObject) -> Dict:
     """Build the prefab's top-level ContainerEntity dict from
-    ``root_go``."""
+    ``root_go``.
+
+    The wrapper is emitted editor-only by default (stripped/dissolved at
+    runtime); the Meshes tab's ``mesh_processor.prefab_wrapper_editor_only``
+    toggle can turn that off so the container survives into the game."""
+    mesh_settings = getattr(worker, "_mesh_settings", None) or {}
+    editor_only = bool(mesh_settings.get("prefab_wrapper_editor_only", True))
     return {
         "Id":   "ContainerEntity",
         "Name": root_go.name,
@@ -293,7 +304,7 @@ def create_container_entity(worker, root_go: GameObject) -> Dict:
             "EditorOnlyEntityComponent": {
                 "$type": "EditorOnlyEntityComponent",
                 "Id": generate_component_id(worker),
-                "IsEditorOnly": True,
+                "IsEditorOnly": editor_only,
             },
             "EditorPendingCompositionComponent": {
                 "$type": "EditorPendingCompositionComponent",
@@ -325,8 +336,17 @@ def create_nested_prefab_instance(worker, go: GameObject, prefab_path: Path,
     Tier 3 = m_Materials.Array.data[N] (patch the assetHint inside
               the target entity's EditorMaterialComponent
               materialsByLabel entry — label key = FBX-internal
-              material name at slot N)."""
-    source_path = f"{worker.asset_hint_root}/prefabs/{prefab_path.name}"
+              material name at slot N).
+
+    Source path is computed by walking up from ``prefab_path`` looking
+    for the O3DE project root (``project.json``) and returning the
+    file's project-relative path with original case. The pre-2026-05-31
+    formula (``{asset_hint_root}/prefabs/<name>``) coupled the Source
+    path to the lowercased asset-hint root, which worked on Windows by
+    accident (case-insensitive FS) and broke on Linux/macOS."""
+    from integrated_asset_processor import _project_relative_path
+    rel = _project_relative_path(prefab_path)
+    source_path = rel if rel else f"{worker.asset_hint_root}/prefabs/{prefab_path.name}"
     o3de_transform, _ = convert_to_o3de_coordinates(go.transform)
     euler             = quaternion_to_euler(o3de_transform.rotation)
 
@@ -680,6 +700,7 @@ def create_entity_recursive(worker, go: GameObject, all_game_objects: Dict,
         material_mapping      = material_mapping,
         mesh_mapping          = mesh_mapping,
         fbx_material_labels   = fbx_material_labels,
+        collider_pxmesh_mapping = getattr(worker, "_collider_pxmesh_mapping", {}),
         entities_dict         = entities_dict,
         entity_id_map         = entity_id_map,
         generate_component_id = (lambda: generate_component_id(worker)),

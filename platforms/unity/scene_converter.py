@@ -628,19 +628,34 @@ class UnitySceneConverter:
         }
     
     def _convert_to_assets_path(self, prefab_path: Path) -> str:
-        """Convert absolute prefab path to project-relative format"""
-        # Find which search directory contains this prefab
+        """Return the O3DE prefab Source path for ``prefab_path``.
+
+        O3DE's PrefabLoader resolves the ``Source`` field as a path
+        relative to the project root (the directory containing
+        ``project.json``), preserving original case. The pre-2026-05-31
+        behaviour used the prefab search-dir's leaf folder name (or just
+        the filename) which produced paths like ``Prefabs/Foo.prefab``
+        that the loader resolved to ``<proj>/Prefabs/Foo.prefab`` —
+        always failing when the real file lives under ``Assets/.../``.
+
+        Walks up from the prefab looking for ``project.json``. Falls
+        back to the legacy search-dir / filename path only when the
+        prefab isn't inside an O3DE project (rare; useful for tests)."""
+        from integrated_asset_processor import _project_relative_path
+        rel = _project_relative_path(prefab_path)
+        if rel:
+            return rel
+
+        # Legacy fallback path — used only when no project.json sits
+        # above the prefab (typically a synthetic test fixture). The
+        # leaf-folder construction here is broken for real projects;
+        # the `_project_relative_path` branch above is the correct one.
         for search_dir in self.prefab_db.search_dirs:
             try:
-                # Make path relative to search directory
                 rel_to_search = prefab_path.relative_to(search_dir)
-                # Construct path: {search_dir_name}/{relative_path}
-                assets_path = f"{search_dir.name}/{rel_to_search}"
-                return assets_path.replace('\\', '/')
+                return f"{search_dir.name}/{rel_to_search}".replace("\\", "/")
             except ValueError:
                 continue
-        
-        # Fallback: if not in any search directory, just use filename
         return f"Prefabs/{prefab_path.name}"
     
     def _create_prefab_instance(self, go: GameObject, prefab_path: Path,
@@ -1033,6 +1048,7 @@ class UnitySceneConverter:
             material_mapping      = {},
             mesh_mapping          = {},
             fbx_material_labels   = {},   # scene converter has no FBX access; material emit gracefully degrades
+            collider_pxmesh_mapping = {},
             entities_dict         = entities_dict,
             entity_id_map         = entity_id_map,
             generate_component_id = self._generate_component_id,

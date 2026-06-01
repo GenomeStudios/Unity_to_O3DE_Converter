@@ -91,6 +91,9 @@ def _resolve_mesh_settings(mesh_settings: Optional[Dict],
         "zero_position":    True,
         "default_position": [0.0, 0.0, 0.0],
         "default_rotation": [0.0, 0.0, 0.0],
+        "physx_mesh":       False,
+        "auto_center":      True,   # single-mesh FBX auto-center (toggle off to disable)
+        "auto_rotation":    True,   # Y-up→Z-up +90°X auto-correction (toggle off to disable)
     }
     if not mesh_settings:
         return defaults
@@ -109,7 +112,7 @@ def _resolve_mesh_settings(mesh_settings: Optional[Dict],
 
 def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
                          entity_node_map: dict, log=print,
-                         collider_entity_node_map: dict = None,
+                         physx_specs: Optional[list] = None,
                          mesh_settings: Optional[Dict] = None,
                          mesh_guid: Optional[str] = None,
                          *,
@@ -141,10 +144,16 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
     behaviour). When ``zero_position=False`` no translation field is
     emitted, so the source FBX node transform passes through.
 
-    When collider_entity_node_map is provided, one PhysX convex
-    MeshGroup is also written per collider entity, targeting the parent
-    node of the visual mesh node. This produces the .pxmesh file that
-    EditorMeshColliderComponent references.
+    When ``physx_specs`` is provided, one PhysX MeshGroup is written per
+    spec into the same ``values[]`` array (the engine supports many PhysX
+    groups in one assetinfo, exactly like the visual groups). Each spec is
+    ``{"name": str, "node_paths": [str, ...], "convex": bool}`` and produces
+    one ``.pxmesh`` product named after ``name``. This is the per-sub-mesh
+    model (`mem:physx_mesh_collider/physx_mesh_collider_plan`): one FBX can
+    yield several pxmesh products (T3 multi-LOD, T4 multi-submesh ``_COL``),
+    and the assetinfo may carry only PhysX groups (a dedicated collider FBX
+    with no visual entities). Convex specs emit ``"export method": 1``; the
+    default is a triangle mesh.
     """
     import json as _json
     import uuid as _uuid
@@ -152,14 +161,17 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
     # FBX up-axis detection lives in `integrated_asset_processor` for now
     # (FBX binary parsing, format-specific not platform-specific). Imported
     # at call time to avoid a circular import during module load.
-    from integrated_asset_processor import read_fbx_up_axis
+    from integrated_asset_processor import (
+        read_fbx_up_axis, compute_node_autocenters,
+    )
 
-    # Up-axis is logged for visibility but no longer drives an auto
-    # correction. The user authors rotation explicitly via mesh_settings.
+    # Per-FBX up-axis drives the Y-up→Z-up rotation correction. FBX
+    # GlobalSettings UpAxis: 1 = Y-up, 2 = Z-up. O3DE is Z-up, so a Y-up FBX
+    # needs a +90° X correction (confirmed in-engine on the Office Cabinet:
+    # Z-up desk imports upright, Y-up cabinet lands on its face without it).
+    # This is the PER-FBX successor to the old GLOBAL auto-correction that
+    # was removed for overcompensating — Z-up FBX (up_axis=2) gets nothing.
     up_axis = read_fbx_up_axis(fbx_dest_path)
-    if up_axis == 1:
-        log("    [Mesh] Y-up FBX detected (informational — no auto-correction "
-            "is applied; set default_rotation in mesh settings if needed).")
 
     # F-9 — resolve the per-mesh settings chain (defaults + override).
     eff = _resolve_mesh_settings(mesh_settings, mesh_guid)
@@ -169,14 +181,48 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
     has_user_rotation = any(abs(float(v)) > 1e-6 for v in user_rot)
     has_user_translation = any(abs(float(v)) > 1e-6 for v in user_pos)
 
-    coordinate_rule = {"$type": "CoordinateSystemRule", "useAdvancedData": True}
-    # Direct mapping: the user's Euler degrees become the rule quaternion.
-    if has_user_rotation:
-        coordinate_rule["rotation"] = _euler_deg_to_quat(user_rot)
-    # Translation only when zero_position=True. zero_position=False explicitly
-    # opts out of having the assetinfo touch position at all.
-    if zero_pos and has_user_translation:
-        coordinate_rule["translation"] = [float(v) for v in user_pos]
+    auto_rotation = bool(eff.get("auto_rotation", True))
+    auto_center   = bool(eff.get("auto_center", True))
+
+    # --- Shared rotation (per-FBX) ---
+    # User's Euler degrees → quaternion, composed UNDER the Y-up correction.
+    rot_quat = _euler_deg_to_quat(user_rot) if has_user_rotation else None
+    if up_axis == 1 and auto_rotation:
+        yup_corr = _euler_deg_to_quat([90.0, 0.0, 0.0])
+        rot_quat = _quat_mul(rot_quat, yup_corr) if rot_quat else yup_corr
+        log("    [Mesh] Y-up FBX → +90° X auto-correction applied.")
+
+    # --- Translation (per-node auto-center) ---
+    # Each mesh node is centred independently so its entity/instance transform
+    # places it — reproducing Unity's node-local import. A single-mesh FBX gets
+    # one center; a multi-mesh FBX (cabinet doors, drawer_C) gets one PER
+    # sub-mesh. A user-authored default_position overrides ALL nodes (shared).
+    # Gated by zero_position + auto_center toggle. Self-limiting: an
+    # already-centred node yields ~0. See `mem:transform_truth/*`.
+    shared_translation = ([float(v) for v in user_pos]
+                          if (zero_pos and has_user_translation) else None)
+    # Per-node auto-center, calibrated for BOTH up-axes (compute_node_autocenters
+    # applies the Z-up / Y-up formula). A user-authored default_position
+    # overrides all nodes (shared). Gated by zero_position + the auto_center
+    # toggle. See `mem:transform_truth/*`.
+    node_autocenters = ({} if (shared_translation is not None
+                               or not (zero_pos and auto_center))
+                        else compute_node_autocenters(fbx_dest_path))
+    if node_autocenters:
+        log(f"    [Mesh] per-node auto-center → {node_autocenters}")
+
+    def rule_for(node_path: str) -> dict:
+        """Build this node's CoordinateSystemRule: shared rotation + the node's
+        own auto-center translation (or the shared user override)."""
+        rule = {"$type": "CoordinateSystemRule", "useAdvancedData": True}
+        if rot_quat is not None:
+            rule["rotation"] = rot_quat
+        leaf = node_path.split(".")[-1]
+        tr = (shared_translation if shared_translation is not None
+              else node_autocenters.get(leaf))
+        if tr and any(abs(float(v)) > 1e-6 for v in tr):
+            rule["translation"] = [float(v) for v in tr]
+        return rule
 
     all_node_paths = list(entity_node_map.values())
     groups = []
@@ -199,7 +245,7 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
                 "rules": [
                     {"$type": "StaticMeshAdvancedRule", "vertexColorStreamName": "Col0"},
                     {"$type": "MaterialRule"},
-                    coordinate_rule,
+                    rule_for(node_path),
                     {"$type": "{6E796AC8-1484-4909-860A-6D3F22A7346F} LodRule"}
                 ]
             },
@@ -208,41 +254,61 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
 
     # -------------------------------------------------------------------------
     # PHYSX MESH GROUPS  ({5B03C8E6...} MeshGroup)
-    # One convex group per collider entity — produces the .pxmesh physics asset.
-    # Targets the parent node of the visual mesh node so all geometry is captured.
+    # One group per spec — produces a .pxmesh physics asset whose product name
+    # is "{group name}.fbx.pxmesh" (O3DE names the product after the group, so
+    # distinct per-sub-mesh names keep products distinct and the
+    # EditorMeshColliderComponent hint resolves). Many groups may share one
+    # assetinfo (multi-LOD / multi-submesh _COL FBX).
+    #
+    # "export method" enum: 0=TriMesh, 1=Convex, 2=Primitive. Omitting it
+    # defaults to TriMesh (a concave/static collision mesh) — matches a Unity
+    # MeshCollider with m_Convex=0 and O3DE's own minimal serialization of a
+    # default triangle group. Convex colliders (m_Convex=1) carry
+    # "export method": 1; asset params are left at engine defaults in both
+    # cases. See `mem:physx_mesh_collider/physx_mesh_collider_plan` for the
+    # engine-source verification of all of this.
     # -------------------------------------------------------------------------
-    if collider_entity_node_map:
-        # PhysX collider lives in the same mesh-local space as the visual
-        # group, so the same composed rotation + translation applies.
-        physx_coord_rule = dict(coordinate_rule)
+    if physx_specs:
+        for spec in physx_specs:
+            node_paths = [p for p in (spec.get("node_paths") or []) if p]
+            if not node_paths:
+                continue
+            is_convex = bool(spec.get("convex", False))
+            name = spec.get("name") or fbx_stem
+            unselected = [p for p in all_node_paths if p not in node_paths]
+            unselected.append("RootNode")
 
-        for entity_name, node_path in collider_entity_node_map.items():
-            parts = node_path.split(".")
-            parent_path   = ".".join(parts[:-1]) if len(parts) > 1 else node_path
-            mesh_node_name = parts[-1]
-
-            groups.append({
+            group = {
                 "$type": "{5B03C8E6-8CEE-4DA0-A7FA-CD88689DD45B} MeshGroup",
                 "id": "{" + str(_uuid.uuid4()).upper() + "}",
-                "name": f"{fbx_stem}-{entity_name}",
+                "name": name,
                 "NodeSelectionList": {
-                    "selectedNodes": ["RootNode", parent_path],
-                    "unselectedNodes": [{}]
-                },
-                "export method": 1,
-                "ConvexAssetParams": {
-                    "Use16bitIndices": True,
-                    "CheckZeroAreaTriangles": True
+                    "selectedNodes": node_paths,
+                    "unselectedNodes": unselected
                 },
                 "PhysicsMaterialSlots": {
-                    "Slots": [{"Name": mesh_node_name}]
+                    "Slots": [{"Name": node_paths[0].split(".")[-1]}]
                 },
-                "rules": {
-                    "rules": [physx_coord_rule]
-                }
-            })
+            }
+            if is_convex:
+                group["export method"] = 1  # MeshExportMethod::Convex
+            # The collision mesh gets the per-node rotation; its translation is
+            # the explicit render-alignment when the producer supplied one
+            # (dedicated _COL FBX), else the node's own auto-center. Identity
+            # rule omitted.
+            phys_rule = rule_for(node_paths[0])
+            spec_tr = spec.get("translation")
+            if spec_tr is not None:
+                if any(abs(float(v)) > 1e-6 for v in spec_tr):
+                    phys_rule["translation"] = [float(v) for v in spec_tr]
+                else:
+                    phys_rule.pop("translation", None)
+            if "rotation" in phys_rule or "translation" in phys_rule:
+                group["rules"] = {"rules": [phys_rule]}
 
-        log(f"    [Mesh] Added {len(collider_entity_node_map)} PhysX MeshGroup(s)")
+            groups.append(group)
+
+        log(f"    [Mesh] Added {len(physx_specs)} PhysX MeshGroup(s)")
 
     sidecar = Path(str(fbx_dest_path) + ".assetinfo")
     try:

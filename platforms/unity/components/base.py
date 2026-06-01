@@ -29,8 +29,9 @@ class ProcessingContext:
     """All shared resources needed by component processors during the emit phase."""
 
     material_mapping:       Dict[str, str]          # unity guid  -> o3de asset hint
-    mesh_mapping:           Dict[str, str]          # unity guid  -> o3de asset hint
+    mesh_mapping:           Dict[str, str]          # go.file_id  -> o3de .azmodel hint
     fbx_material_labels:    Dict[str, List[str]]    # go.file_id  -> [fbx_material_name_0, ...]
+    collider_pxmesh_mapping: Dict                   # (mesh_guid, fileID) -> .pxmesh hint
     entities_dict:          Dict[str, Dict]         # entity_id   -> entity dict (mutated in place)
     entity_id_map:          Dict[str, str]          # go.file_id  -> entity_id
 

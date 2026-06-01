@@ -40,6 +40,10 @@ class MeshComponentProcessor(ComponentProcessor):
             guid = mesh_ref.get('guid', '')
             if guid:
                 go.mesh_guid = guid
+                # fileID identifies which sub-mesh within the FBX this GO
+                # renders. Captured so a MeshCollider that references the
+                # same (guid, fileID) can be correlated to this node.
+                go.mesh_file_id = str(mesh_ref.get('fileID', '') or '')
                 log(f"    [Mesh] MeshFilter   → guid={guid[:8]}...")
             else:
                 log(f"    [Mesh] ⚠ MeshFilter has no mesh GUID (built-in primitive?)")

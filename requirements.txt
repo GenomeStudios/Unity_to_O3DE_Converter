@@ -1,0 +1,13 @@
+# Unity-to-O3DE Converter — Python dependencies
+#
+# Install with:  pip install -r requirements.txt
+#
+# PySide6 drives the GUI (main_app.py). UnityPy + Pillow are only exercised by
+# the Unity terrain path (platforms/unity/terrain_data.py): UnityPy reads the
+# binary TerrainData .asset, Pillow writes heightmap / splatmap images. The
+# converter degrades gracefully without UnityPy — the Unity platform's
+# dependency check flags it as missing only when a Unity source is in use.
+
+PySide6>=6.5
+UnityPy>=1.10
+Pillow>=10.0

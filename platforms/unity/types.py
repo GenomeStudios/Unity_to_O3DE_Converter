@@ -79,6 +79,7 @@ class GameObject:
     parent_id:     Optional[str] = None
     children_ids:  List[str] = field(default_factory=list)
     mesh_guid:     Optional[str] = None
+    mesh_file_id:  Optional[str] = None   # Unity m_Mesh.fileID of the render mesh (sub-mesh selector)
     material_guids: List[str] = field(default_factory=list)
     has_rigidbody: bool = False
     rigidbody_data: Optional[Dict] = None

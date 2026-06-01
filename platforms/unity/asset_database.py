@@ -371,7 +371,7 @@ class AssetDatabase:
         # Unity URP/HDRP:
         #   _Surface=0  = Opaque
         #   _Surface=1  = Transparent (blended)
-        #   _AlphaClip=1 on an opaque surface (_Surface=0) = Cutout
+        #   _AlphaClip=1 = alpha-tested mask (Cutout)
         # Unity Standard shader:
         #   _Mode=0 = Opaque, _Mode=1 = Cutout, _Mode>=2 = Transparent
         #   _Cutoff = alpha clip threshold (0..1)
@@ -380,6 +380,14 @@ class AssetDatabase:
         #   "Opaque"  — no transparency
         #   "Cutout"  — opaque with alpha-tested mask, uses opacity.alphaSource + factor
         #   "Blended" — true alpha blending
+        #
+        # CUTOUT TAKES PRECEDENCE over Blended. Materials in the wild set both
+        # signals (Office's MetalShelf: _AlphaClip=1 + _Mode=1 AND _Surface=1)
+        # — an alpha-tested metal authored on a transparent-surface shader.
+        # Reading _Surface first made it Blended → fully invisible in O3DE.
+        # Alpha-clip wins because it fails safe (hard edges, still visible)
+        # whereas a wrong Blended fails worst (the whole mesh vanishes). True
+        # glass (Surface=1, AlphaClip=0, Mode>=2) still resolves to Blended.
         # ---------------------------------------------------------------
         raw_floats = {}
         for float_prop in floats:
@@ -387,11 +395,11 @@ class AssetDatabase:
                 if prop_name in ('_Mode', '_Surface', '_Blend', '_AlphaClip', '_Cutoff'):
                     raw_floats[prop_name] = float(value)
 
-        is_transparent = (raw_floats.get('_Surface', 0) == 1
-                          or raw_floats.get('_Mode', 0) >= 2)
-        is_cutout      = (not is_transparent
-                          and (raw_floats.get('_AlphaClip', 0) == 1
-                               or raw_floats.get('_Mode', 0) == 1))
+        is_cutout      = (raw_floats.get('_AlphaClip', 0) == 1
+                          or raw_floats.get('_Mode', 0) == 1)
+        is_transparent = (not is_cutout
+                          and (raw_floats.get('_Surface', 0) == 1
+                               or raw_floats.get('_Mode', 0) >= 2))
 
         # Unity stores alpha in the baseColor texture's alpha channel for both
         # cutout and transparent surfaces. O3DE StandardPBR requires alphaSource

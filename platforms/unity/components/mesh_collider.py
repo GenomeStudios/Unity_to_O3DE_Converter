@@ -48,6 +48,9 @@ class MeshColliderProcessor(ComponentProcessor):
             'global_index': len(go.colliders),
             'is_trigger':   comp_data.get('m_IsTrigger', 0) == 1,
             'mesh_guid':    mesh_ref.get('guid', ''),
+            # fileID picks the specific sub-mesh inside the (possibly
+            # dedicated _COL) FBX. Drives (guid, fileID) → node resolution.
+            'mesh_file_id': str(mesh_ref.get('fileID', '') or ''),
             'convex':       comp_data.get('m_Convex',    0) == 1,
         }
         go.colliders.append(collider)
@@ -105,21 +108,22 @@ def _write_mesh_collider(components: Dict, collider: Dict, go,
     }
 
     # --- Resolve .pxmesh hint ---
-    hint = None
+    # The collision asset is the sub-mesh m_Mesh = {guid, fileID}. The worker
+    # pre-resolved every collider's (guid, fileID) → per-sub-mesh .pxmesh hint
+    # into ctx.collider_pxmesh_mapping (see process_prefab). guid falls back to
+    # the GO's own render mesh when m_Mesh carries no guid of its own.
+    mesh_guid    = collider.get('mesh_guid', '') or (go.mesh_guid or '')
+    mesh_file_id = collider.get('mesh_file_id', '') or ''
+    hint = ctx.collider_pxmesh_mapping.get((mesh_guid, mesh_file_id))
 
-    mesh_guid = collider.get('mesh_guid', '')
-    if mesh_guid and mesh_guid in ctx.mesh_mapping:
-        hint = ctx.mesh_mapping[mesh_guid].replace('.azmodel', '.pxmesh')
-        ctx.log(f"  [Physics] MeshCollider using collider mesh: {hint}")
-
-    elif go.file_id and go.file_id in ctx.mesh_mapping:
-        hint = ctx.mesh_mapping[go.file_id].replace('.azmodel', '.pxmesh')
-        ctx.log(f"  [Physics] MeshCollider using render mesh: {hint}")
-
+    if hint:
+        ctx.log(f"  [Physics] MeshCollider → {hint}")
     else:
         ctx.log(
-            f"  [Physics] ⚠ MeshCollider — no mesh asset found in mapping; "
-            f"collider created without physics asset hint"
+            f"  [Physics] ⚠ MeshCollider — no .pxmesh resolved for "
+            f"(guid={mesh_guid[:8] + '…' if mesh_guid else 'none'}, "
+            f"fileID={mesh_file_id or 'none'}); collider created without "
+            f"physics asset hint"
         )
 
     if hint:

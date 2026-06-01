@@ -16,6 +16,7 @@ import re
 import shutil
 import math
 import random
+import struct
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple, Optional, Set
@@ -259,6 +260,293 @@ def read_fbx_mesh_node_names(fbx_path: Path) -> List[str]:
     return names
 
 
+# ---------------------------------------------------------------------------
+# FBX node transforms — the "truer state" the converter was blind to.
+#
+# Asset packs bake scene placement into FBX node Lcl Translation/Rotation
+# (e.g. Office furniture roots sit 25-50m off in X + a 90° Z-up→Y-up bake).
+# Unity's importer uses node-LOCAL vertices (drops the scene offset, bakes
+# the axis); O3DE's SceneAPI bakes the node WORLD transform unless told
+# otherwise — the source of the cross-pack "scatter". This reader exposes
+# the baked transforms so the reconciliation report + compensation can see
+# them. See `mem:transform_truth/transform_truth_plan`.
+# ---------------------------------------------------------------------------
+
+def read_fbx_node_transforms(fbx_path: Path) -> Dict[str, dict]:
+    """Parse a binary FBX and return each Model node's local transform.
+
+    Returns ``{node_name: {"translation": [x,y,z],   # FBX units (cm)
+                           "rotation":    [x,y,z],   # Euler degrees
+                           "scaling":     [x,y,z]}}`` in file order.
+    Empty dict for non-binary / unreadable FBX. Handles FBX <7500 (32-bit
+    record offsets) and >=7500 (64-bit)."""
+    try:
+        data = fbx_path.read_bytes()
+    except Exception:
+        return {}
+    if data[:21] != b"Kaydara FBX Binary  \x00":
+        return {}
+
+    version = struct.unpack("<I", data[23:27])[0]
+    large = version >= 7500
+    off_fmt, off_sz = ("<Q", 8) if large else ("<I", 4)
+
+    def read_props(pos: int, num: int):
+        props = []
+        for _ in range(num):
+            typ = chr(data[pos]); pos += 1
+            if   typ == "Y": props.append(struct.unpack("<h", data[pos:pos+2])[0]); pos += 2
+            elif typ == "C": props.append(bool(data[pos])); pos += 1
+            elif typ == "I": props.append(struct.unpack("<i", data[pos:pos+4])[0]); pos += 4
+            elif typ == "F": props.append(struct.unpack("<f", data[pos:pos+4])[0]); pos += 4
+            elif typ == "D": props.append(struct.unpack("<d", data[pos:pos+8])[0]); pos += 8
+            elif typ == "L": props.append(struct.unpack("<q", data[pos:pos+8])[0]); pos += 8
+            elif typ in "fdlib":   # arrays — skip payload, transforms don't need them
+                _len, _enc, comp = struct.unpack("<III", data[pos:pos+12]); pos += 12 + comp
+                props.append(None)
+            elif typ in "SR":
+                ln = struct.unpack("<I", data[pos:pos+4])[0]; pos += 4
+                raw = data[pos:pos+ln]; pos += ln
+                props.append(raw if typ == "R" else raw.decode("utf-8", "ignore"))
+            else:
+                raise ValueError(f"unknown FBX prop type {typ!r}")
+        return props, pos
+
+    def read_record(pos: int):
+        end_off  = struct.unpack(off_fmt, data[pos:pos+off_sz])[0]; pos += off_sz
+        num_prop = struct.unpack(off_fmt, data[pos:pos+off_sz])[0]; pos += off_sz
+        pos += off_sz                                   # property-list length (unused)
+        name_len = data[pos]; pos += 1
+        name = data[pos:pos+name_len].decode("utf-8", "ignore"); pos += name_len
+        if end_off == 0:
+            return None, pos
+        props, pos = read_props(pos, num_prop)
+        children, sentinel = [], (25 if large else 13)
+        while pos < end_off - sentinel:
+            child, pos = read_record(pos)
+            if child is None:
+                break
+            children.append(child)
+        return {"name": name, "props": props, "children": children}, end_off
+
+    # Top-level records.
+    roots, pos = [], 27
+    try:
+        while pos < len(data) - (25 if large else 13):
+            rec, pos = read_record(pos)
+            if rec is None:
+                break
+            roots.append(rec)
+    except (ValueError, struct.error, IndexError):
+        pass   # be tolerant — return whatever Model nodes we resolved
+
+    objects = next((r for r in roots if r["name"] == "Objects"), None)
+    if not objects:
+        return {}
+
+    def lcl(model: dict) -> dict:
+        out = {"translation": [0.0, 0.0, 0.0],
+               "rotation":    [0.0, 0.0, 0.0],
+               "scaling":     [1.0, 1.0, 1.0]}
+        key_map = {"Lcl Translation": "translation",
+                   "Lcl Rotation":    "rotation",
+                   "Lcl Scaling":     "scaling"}
+        for p70 in (c for c in model["children"] if c["name"] == "Properties70"):
+            for p in (c for c in p70["children"] if c["name"] == "P"):
+                if p["props"] and p["props"][0] in key_map:
+                    nums = [v for v in p["props"] if isinstance(v, float)]
+                    if len(nums) >= 3:
+                        out[key_map[p["props"][0]]] = nums[:3]
+        return out
+
+    result: Dict[str, dict] = {}
+    for obj in objects["children"]:
+        if obj["name"] != "Model":
+            continue
+        label = next((p for p in obj["props"] if isinstance(p, str)), "")
+        # "Name\x00\x01Model" → "Name"
+        node_name = label.split("\x00\x01")[0].split("::")[0].strip()
+        if node_name and node_name not in result:
+            result[node_name] = lcl(obj)
+    return result
+
+
+def _read_fbx_geometry_stats(fbx_path: Path, scale: float = 0.01) -> List[dict]:
+    """Parse a binary FBX and return per-Geometry vertex stats (file order):
+    ``{"centroid": [x,y,z], "min": [x,y,z], "max": [x,y,z]}`` in metres. Shared
+    by `read_fbx_geometry_centroids` (modeled offset → auto-center) and
+    `read_fbx_geometry_bbox_centers` (collider↔render alignment)."""
+    import zlib
+    try:
+        data = fbx_path.read_bytes()
+    except Exception:
+        return []
+    if data[:21] != b"Kaydara FBX Binary  \x00":
+        return []
+    version = struct.unpack("<I", data[23:27])[0]
+    large = version >= 7500
+    off_fmt, off_sz = ("<Q", 8) if large else ("<I", 4)
+    sentinel = 25 if large else 13
+    stats: List[dict] = []
+
+    def read_props(pos, num, grab_vertices):
+        verts = None
+        for _ in range(num):
+            typ = chr(data[pos]); pos += 1
+            if typ in "YCIFDL":
+                pos += {"Y": 2, "C": 1, "I": 4, "F": 4, "D": 8, "L": 8}[typ]
+            elif typ in "fdlib":
+                if typ == "d" and grab_vertices and verts is None:
+                    length, enc, comp = struct.unpack("<III", data[pos:pos+12]); pos += 12
+                    payload = data[pos:pos+comp]; pos += comp
+                    if enc == 1:
+                        payload = zlib.decompress(payload)
+                    verts = list(struct.unpack(f"<{length}d", payload[:length*8]))
+                else:
+                    _l, _e, comp = struct.unpack("<III", data[pos:pos+12]); pos += 12 + comp
+            elif typ in "SR":
+                ln = struct.unpack("<I", data[pos:pos+4])[0]; pos += 4 + ln
+            else:
+                raise ValueError(typ)
+        return verts, pos
+
+    def read_record(pos):
+        end_off = struct.unpack(off_fmt, data[pos:pos+off_sz])[0]; pos += off_sz
+        num_prop = struct.unpack(off_fmt, data[pos:pos+off_sz])[0]; pos += off_sz
+        pos += off_sz
+        name_len = data[pos]; pos += 1
+        name = data[pos:pos+name_len].decode("utf-8", "ignore"); pos += name_len
+        if end_off == 0:
+            return None, pos
+        is_geom = (name == "Geometry")
+        _props, pos = read_props(pos, num_prop, grab_vertices=(name == "Vertices"))
+        child_verts = _props if name == "Vertices" else None
+        my_verts = None
+        while pos < end_off - sentinel:
+            child, pos = read_record(pos)
+            if child is None:
+                break
+            if is_geom and child is not None and child.get("verts") is not None:
+                my_verts = child["verts"]
+        if is_geom and my_verts:
+            xs, ys, zs = my_verts[0::3], my_verts[1::3], my_verts[2::3]
+            n = len(xs)
+            stats.append({
+                "centroid": [sum(xs) / n * scale, sum(ys) / n * scale, sum(zs) / n * scale],
+                "min": [min(xs) * scale, min(ys) * scale, min(zs) * scale],
+                "max": [max(xs) * scale, max(ys) * scale, max(zs) * scale],
+            })
+        return {"name": name, "verts": child_verts}, end_off
+
+    pos = 27
+    try:
+        while pos < len(data) - sentinel:
+            rec, pos = read_record(pos)
+            if rec is None:
+                break
+    except (ValueError, struct.error, IndexError):
+        pass
+    return stats
+
+
+def read_fbx_geometry_centroids(fbx_path: Path, scale: float = 0.01) -> List[list]:
+    """Vertex centroid (metres) of each Geometry node, file order. The centroid
+    reveals where a mesh's geometry sits — the modeled offset O3DE bakes but
+    Unity neutralizes (source of the auto-center). Empty for non-binary FBX."""
+    return [s["centroid"] for s in _read_fbx_geometry_stats(fbx_path, scale)]
+
+
+def read_fbx_geometry_bbox_centers(fbx_path: Path, scale: float = 0.01) -> List[list]:
+    """Per-Geometry bounding-box CENTER (min+max)/2 in metres, file order.
+
+    The bbox center (not the vertex centroid) is what aligns a simplified
+    collision mesh to its detailed render mesh — a box vs a dense mesh have
+    different centroids even when their BOUNDS coincide, so centroid-alignment
+    pushes them apart while bbox-center alignment matches (desk COL: bbox delta
+    0.868 ≈ the user's +0.875; centroid delta 0.597 would be wrong)."""
+    return [[(s["min"][i] + s["max"][i]) * 0.5 for i in range(3)]
+            for s in _read_fbx_geometry_stats(fbx_path, scale)]
+
+
+def compute_single_mesh_autocenter(fbx_path: Path) -> Optional[list]:
+    """Auto-center compensation for a SINGLE-mesh FBX: the O3DE
+    `default_position` that cancels where the cook bakes the geometry, so the
+    entity/instance transform alone places it — reproducing Unity's
+    node-local import. Returns None for multi-mesh FBX (sub-meshes keep their
+    FBX-relative bake) or when data is unreadable.
+
+    Formula (calibrated to the Office desk drawers, 5-8 mm):
+    ``(centroid_X, node_Y, -node_Z)`` in metres. Self-limiting — an
+    already-centred mesh yields ~0, so only off-origin-modeled props move.
+    See `mem:transform_truth/working_documentation`."""
+    nodes = read_fbx_node_transforms(fbx_path)
+    if len(nodes) != 1:                                   # multi-mesh → keep bake
+        return None
+    centroids = read_fbx_geometry_centroids(fbx_path)
+    if len(centroids) != 1:
+        return None
+    node_t = next(iter(nodes.values()))["translation"]   # cm
+    n = [v * 0.01 for v in node_t]                        # metres
+    c = centroids[0]                                      # metres
+    return [round(c[0], 4), round(n[1], 4), round(-n[2], 4)]
+
+
+def compute_node_autocenters(fbx_path: Path) -> Dict[str, list]:
+    """Per-node auto-center compensation — centres each mesh node so its
+    entity/instance transform alone places it (reproducing Unity's import).
+    Returns ``{node_name: [x, y, z]}`` (metres, O3DE), Model↔Geometry paired by
+    file order; empty when counts mismatch.
+
+    The formula depends on the FBX up-axis, both calibrated in-engine on the
+    Office furniture:
+      - **Z-up** (up_axis=2): ``(X, node_Y, -node_Z)`` — drawers, drawer_C.
+      - **Y-up** (up_axis=1): ``(X, -node_Z, -node_Y)`` — the +90°X up-correction
+        rotates the mesh, so the offset is expressed in the ORIGINAL (pre-
+        rotation) axes with Y/Z swapped + negated (cabinet doors:
+        node (-0.625, 1.25, 0.222) → comp (-0.625, -0.222, -1.25), user-verified).
+    X source: the geometry centroid (Z-up, or a Y-up ROOT whose node X is the
+    huge scene-layout junk), else the node's real local X (Y-up sub-node).
+    See `mem:transform_truth/working_documentation`."""
+    nodes = read_fbx_node_transforms(fbx_path)
+    cents = read_fbx_geometry_centroids(fbx_path)
+    if not nodes or len(nodes) != len(cents):
+        return {}
+    up_axis = read_fbx_up_axis(fbx_path)
+    out: Dict[str, list] = {}
+    for (name, nt), c in zip(nodes.items(), cents):
+        n = [v * 0.01 for v in nt["translation"]]   # cm → m
+        x = n[0] if (up_axis == 1 and abs(n[0]) <= 5.0) else c[0]
+        comp = [x, -n[2], -n[1]] if up_axis == 1 else [x, n[1], -n[2]]
+        out[name] = [round(v, 4) for v in comp]
+    return out
+
+
+def compute_node_bbox_centers(fbx_path: Path) -> Dict[str, list]:
+    """``{node_name: [x,y,z]}`` bounding-box centre (metres) per Model node,
+    Model↔Geometry paired by file order. Empty when counts mismatch."""
+    nodes = read_fbx_node_transforms(fbx_path)
+    bboxes = read_fbx_geometry_bbox_centers(fbx_path)
+    if not nodes or len(nodes) != len(bboxes):
+        return {}
+    return {name: b for name, b in zip(nodes.keys(), bboxes)}
+
+
+def compute_collider_alignment(col_fbx: Path, col_node: str,
+                               render_fbx: Path, render_node: str) -> Optional[list]:
+    """Translation that aligns a collision sub-mesh to its render counterpart,
+    by matching bounding-box centres (NOT centroids — see
+    `read_fbx_geometry_bbox_centers`). The render mesh's final position is its
+    bbox centre plus its own auto-center; the collider is shifted to match.
+    Returns ``[x,y,z]`` (metres, O3DE) or None when data is missing."""
+    col_bb    = compute_node_bbox_centers(col_fbx).get(col_node)
+    render_bb = compute_node_bbox_centers(render_fbx).get(render_node)
+    if col_bb is None or render_bb is None:
+        return None
+    render_ac = compute_node_autocenters(render_fbx).get(render_node, [0.0, 0.0, 0.0])
+    # render's final world bbox-centre, then cancel the collider's bbox-centre.
+    return [round(render_bb[i] + render_ac[i] - col_bb[i], 4) for i in range(3)]
+
+
 def read_fbx_material_names(fbx_path: Path) -> List[str]:
     """Extract material names from a binary FBX file, in file order.
 
@@ -390,6 +678,68 @@ def build_fbx_node_paths(mesh_entities: list, all_game_objects: dict,
     return result
 
 
+# =============================================================================
+# COLLISION SUB-MESH RESOLUTION
+# Maps a Unity MeshCollider's `m_Mesh = {guid, fileID}` to the FBX node that
+# holds its collision geometry. See `mem:asset_packs/import_catalogue` for the
+# topologies (T1–T4) and the verified fileID scheme.
+# =============================================================================
+
+def resolve_collision_node(mesh_file_id: str,
+                            fbx_node_names: List[str],
+                            render_node: Optional[str] = None) -> Optional[str]:
+    """Resolve one collision sub-mesh to its FBX node path.
+
+    Order:
+      1. ``render_node`` — when a render entity uses the same (guid, fileID),
+         reuse the node path ``build_fbx_node_paths`` derived for it, BUT only
+         if it points at a real FBX node. That helper can fall back to the GO
+         name, which may not exist in the FBX (e.g. NatureManufacture GO
+         ``…_LOD2`` vs FBX node ``…_LOD02``); trusting that fallback would
+         select an empty node. Genuine matches handle hash/negative fileIDs
+         we can't decode arithmetically.
+      2. Single-mesh FBX ⇒ the one node, regardless of fileID.
+      3. Linear fileID decode against file-order ``fbx_node_names``:
+         ``index = (fileID - 4300000) // 2`` (Unity's legacy mesh fileID
+         scheme; verified ground-truth across all three target packs). This is
+         the authority for the common positive-fileID case (T3 multi-LOD,
+         T4 dedicated ``_COL``).
+      4. Out-of-range / non-decodable ⇒ the correlated node if any, else the
+         first node (best-effort whole-FBX).
+
+    Returns ``RootNode.<NodeName>`` or None when the FBX has no mesh nodes.
+    """
+    if not fbx_node_names:
+        return None
+    node_set = set(fbx_node_names)
+    if render_node and render_node.split(".")[-1] in node_set:
+        return render_node
+    if len(fbx_node_names) == 1:
+        return f"RootNode.{fbx_node_names[0]}"
+    try:
+        fid = int(mesh_file_id)
+    except (TypeError, ValueError):
+        fid = None
+    if fid is not None and fid >= 4300000:
+        idx = (fid - 4300000) // 2
+        if 0 <= idx < len(fbx_node_names):
+            return f"RootNode.{fbx_node_names[idx]}"
+    return render_node or f"RootNode.{fbx_node_names[0]}"
+
+
+def physx_group_name(fbx_stem: str, node_path: str,
+                     fbx_node_names: List[str]) -> str:
+    """Deterministic PhysX MeshGroup name → `.pxmesh` product name.
+
+    Single-mesh FBX collapses to the bare stem (matches the Mushroom
+    reference: ``mushroom_big1.fbx.pxmesh``). Multi-mesh FBXs suffix the
+    selected node's leaf so each sub-mesh yields a distinct product
+    (e.g. ``StairsMod_Ground_COL-StairsMod_Ground_Collision``)."""
+    if len(fbx_node_names) <= 1:
+        return fbx_stem
+    return f"{fbx_stem}-{node_path.split('.')[-1]}"
+
+
 # Phase A.3: `Y_UP_ROTATION`, `_euler_deg_to_quat`, `_quat_mul`,
 # `_resolve_mesh_settings`, and `write_fbx_assetinfo` moved to
 # `targets.o3de.assetinfo_writer`. Re-exported here so existing call
@@ -409,6 +759,43 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _find_project_root(start: Path) -> Optional[Path]:
+    """Walk up from ``start`` looking for the directory that contains
+    ``project.json`` (the O3DE project root). Returns that directory,
+    or None when no such ancestor exists within 24 levels."""
+    probe = Path(start)
+    for _ in range(24):
+        if (probe / "project.json").is_file():
+            return probe
+        if probe.parent == probe:
+            return None
+        probe = probe.parent
+    return None
+
+
+def _project_relative_path(target: Path) -> Optional[str]:
+    """Return ``target`` as a forward-slash path relative to its
+    O3DE project root, preserving original case. Returns None when no
+    project root is found above ``target``.
+
+    Used by the prefab writer and scene converter for the ``Source``
+    field on nested-instance entries — O3DE's ``PrefabLoader`` resolves
+    that field as a project-root-relative filesystem path with original
+    case, NOT a lowercased cache hint. Asset HINTS (mesh / material
+    references) go through `_derive_asset_hint_root` instead, which is
+    the lowercased variant of the same project-relative idea."""
+    target = Path(target)
+    start  = target if target.is_dir() else target.parent
+    root   = _find_project_root(start)
+    if root is None:
+        return None
+    try:
+        rel = target.relative_to(root)
+    except ValueError:
+        return None
+    return str(rel).replace("\\", "/")
+
+
 def _derive_asset_hint_root(output_root: Path) -> str:
     """Compute the assetHint prefix every emitted reference must carry.
 
@@ -420,43 +807,35 @@ def _derive_asset_hint_root(output_root: Path) -> str:
 
     Resolution order:
       1. Walk up from ``output_root`` looking for ``project.json``. When
-         found, return ``output_root`` relative to it (lowercased). This
-         is the authoritative answer — it mirrors exactly how the O3DE
-         Asset Processor keys the product cache.
+         found, return ``output_root`` relative to it (lowercased).
       2. No ``project.json`` above us → fall back to the first
          case-insensitive ``assets`` path segment and take everything
          from there. Handles output trees that aren't inside a built
          project yet but still follow the ``Assets/...`` convention.
       3. Last resort → ``assets/<leaf>`` (the legacy leaf-only behaviour).
-         Only fires when the output path has no ``assets`` segment at all.
 
     The leaf-only fallback was the ONLY behaviour before 2026-05-28 and
-    silently dropped intermediate folders (e.g. ``Art/``), leaving every
-    mesh / material reference unresolved when output landed deeper than
+    silently dropped intermediate folders, leaving every mesh / material
+    reference unresolved when output landed deeper than
     ``<proj>/Assets/<leaf>``.
     """
     output_root = Path(output_root)
 
-    # 1. Authoritative: relative to the O3DE project root.
-    probe = output_root
-    for _ in range(24):  # bounded climb — guards against pathological roots
-        if (probe / "project.json").is_file():
-            try:
-                rel = output_root.relative_to(probe)
-            except ValueError:
-                break
+    root = _find_project_root(output_root)
+    if root is not None:
+        try:
+            rel = output_root.relative_to(root)
             return "/".join(part.lower() for part in rel.parts)
-        if probe.parent == probe:
-            break
-        probe = probe.parent
+        except ValueError:
+            pass
 
-    # 2. First `assets` segment in the path.
+    # First `assets` segment in the path.
     parts = output_root.parts
     for i, part in enumerate(parts):
         if part.lower() == "assets":
             return "/".join(seg.lower() for seg in parts[i:])
 
-    # 3. Legacy leaf-only fallback.
+    # Legacy leaf-only fallback.
     return f"assets/{output_root.name.lower()}"
 
 
@@ -707,7 +1086,51 @@ class IntegratedAssetProcessor:
                 if go.mesh_guid and go.mesh_guid in fbx_output_paths:
                     entities_by_guid[go.mesh_guid].append(go)
 
-            for mesh_guid, entity_list in entities_by_guid.items():
+            # --- Collect MeshCollider collision-mesh references ---
+            # A collider's geometry is the sub-mesh m_Mesh = {guid, fileID}
+            # (see `mem:asset_packs/import_catalogue`). The guid may be a
+            # dedicated _COL FBX or the GO's own render FBX; fileID picks the
+            # sub-mesh. Fall back to the GO's render mesh when m_Mesh has no
+            # guid of its own.
+            # Each ref also carries the colliding entity's RENDER mesh
+            # (render_guid, go_name, render_fileID) so a dedicated _COL FBX can
+            # be aligned to the render mesh it collides for (bbox-center match).
+            collider_refs = []
+            for go in game_objects.values():
+                for c in go.colliders:
+                    if c.get('type') != 'MeshCollider':
+                        continue
+                    cg = c.get('mesh_guid') or go.mesh_guid
+                    if cg:
+                        collider_refs.append(
+                            (cg, str(c.get('mesh_file_id', '') or ''),
+                             bool(c.get('convex')),
+                             go.mesh_guid or '', go.name, str(go.mesh_file_id or ''))
+                        )
+
+            # Axis A — scrape dedicated collision FBXs not already copied as
+            # render meshes, so they get an output file + assetinfo to cook.
+            for ref in collider_refs:
+                cg = ref[0]
+                if cg not in fbx_output_paths:
+                    cpath = self._process_mesh(cg)
+                    if cpath:
+                        fbx_output_paths[cg] = cpath
+
+            collider_refs_by_guid = defaultdict(list)
+            for cg, cf, cx, rg, rname, rfid in collider_refs:
+                if cg in fbx_output_paths:
+                    collider_refs_by_guid[cg].append((cf, cx, rg, rname, rfid))
+
+            # (guid, fileID) -> .pxmesh assetHint, consumed by the collider
+            # component to point at the exact per-sub-mesh physics asset.
+            collider_pxmesh_mapping = {}
+
+            # Every FBX needing an assetinfo: render meshes ∪ collision meshes.
+            assetinfo_guids = set(entities_by_guid) | set(collider_refs_by_guid)
+
+            for mesh_guid in assetinfo_guids:
+                entity_list = entities_by_guid.get(mesh_guid, [])
                 fbx_path = fbx_output_paths[mesh_guid]
                 fbx_stem = fbx_path.name.rsplit('.', 1)[0]  # "Closet_A.FBX" → "Closet_A"
 
@@ -721,24 +1144,76 @@ class IntegratedAssetProcessor:
                 fbx_mat_names = read_fbx_material_names(fbx_path)
                 if fbx_mat_names:
                     self.log(f"    [Mesh] FBX materials found: {fbx_mat_names}")
-                else:
+                elif entity_list:
                     self.log(f"    [Mesh] ⚠ No FBX-internal material names "
                              f"read from {fbx_path.name} — materialsByLabel "
                              f"will be empty for entities using this mesh.")
 
-                node_paths = build_fbx_node_paths(entity_list, game_objects, fbx_stem, fbx_node_names)
+                node_paths = (build_fbx_node_paths(entity_list, game_objects,
+                                                   fbx_stem, fbx_node_names)
+                              if entity_list else {})
                 entity_node_map = {
                     go.name: node_paths[go.file_id]
                     for go in entity_list if go.file_id in node_paths
                 }
 
-                # Entities with a MeshCollider also need a PhysX MeshGroup
-                collider_entity_node_map = {
-                    go.name: node_paths[go.file_id]
-                    for go in entity_list
-                    if go.file_id in node_paths
-                    and any(c['type'] == 'MeshCollider' for c in go.colliders)
+                # Render-correlation index: a collider sharing a render
+                # sub-mesh reuses the node path already derived for it.
+                render_node_index = {
+                    (mesh_guid, go.mesh_file_id or ''): node_paths[go.file_id]
+                    for go in entity_list if go.file_id in node_paths
                 }
+
+                # Axis B — one PhysX group per distinct collision sub-mesh of
+                # this FBX. Dedup by group name so two colliders on the same
+                # sub-mesh share one group (and one pxmesh).
+                physx_specs = []
+                seen_groups = set()
+                for cf, cx, rg, rname, rfid in collider_refs_by_guid.get(mesh_guid, []):
+                    node = resolve_collision_node(
+                        cf, fbx_node_names, render_node_index.get((mesh_guid, cf)))
+                    if not node:
+                        self.log(f"    [Physics] ⚠ could not resolve collision "
+                                 f"node (fileID {cf}) in {fbx_path.name}")
+                        continue
+                    gname = physx_group_name(fbx_stem, node, fbx_node_names)
+                    collider_pxmesh_mapping[(mesh_guid, cf)] = (
+                        f"{self.asset_hint_root}/meshes/{gname}.fbx.pxmesh")
+                    if gname in seen_groups:
+                        continue
+                    seen_groups.add(gname)
+                    spec = {"name": gname, "node_paths": [node], "convex": cx}
+                    # Align a dedicated _COL FBX to the render mesh it collides
+                    # for (bbox-center match) — a collider FBX has its own
+                    # geometry that doesn't self-center to the render. Skips when
+                    # the collision IS the render mesh (same FBX → ~0).
+                    if rg and rg != mesh_guid and rg in fbx_output_paths:
+                        rfbx = fbx_output_paths[rg]
+                        rnodes = read_fbx_mesh_node_names(rfbx)
+                        rnode = (rname if rname in rnodes
+                                 else (rnodes[0] if len(rnodes) == 1 else None))
+                        if rnode:
+                            align = compute_collider_alignment(
+                                fbx_path, node.split(".")[-1], rfbx, rnode)
+                            if align and any(abs(v) > 1e-4 for v in align):
+                                spec["translation"] = align
+                                self.log(f"    [Physics] collider→render align "
+                                         f"{gname} → {align}")
+                    physx_specs.append(spec)
+
+                # F-5 `physx_mesh` override — force-generate a whole-mesh
+                # ("everything") collision pxmesh for this FBX even when no
+                # Unity MeshCollider references it. One triangle group over all
+                # the FBX's mesh nodes, named after the stem.
+                if _resolve_mesh_settings(self._mesh_settings, mesh_guid).get("physx_mesh"):
+                    all_nodes = (list(entity_node_map.values())
+                                 or [f"RootNode.{n}" for n in fbx_node_names])
+                    if all_nodes and fbx_stem not in seen_groups:
+                        seen_groups.add(fbx_stem)
+                        physx_specs.append(
+                            {"name": fbx_stem, "node_paths": all_nodes, "convex": False})
+                        self.log(f"    [Physics] physx_mesh override → whole-mesh "
+                                 f"collision for {fbx_path.name}")
 
                 # Pass the platform's source-axis correction quaternion
                 # (follow-up: item 5). Unity supplies its Y-up→Z-up quat;
@@ -749,7 +1224,7 @@ class IntegratedAssetProcessor:
                 )
                 write_fbx_assetinfo(
                     fbx_path, fbx_stem, entity_node_map, self.log,
-                    collider_entity_node_map=collider_entity_node_map or None,
+                    physx_specs=physx_specs or None,
                     mesh_settings=self._mesh_settings,
                     mesh_guid=mesh_guid,
                     correction_quat=correction_quat,
@@ -757,8 +1232,8 @@ class IntegratedAssetProcessor:
                 # F-9.I.4 — record mesh fingerprint AFTER the assetinfo
                 # exists on disk so the recorded output_files list includes
                 # both the .fbx copy and the .assetinfo sidecar. The cached
-                # entity-node maps + fbx_stem are what the Patch worker
-                # replays at re-emit time without re-parsing every prefab
+                # entity_node_map + physx_specs + fbx_stem are what the Patch
+                # worker replays at re-emit time without re-parsing prefabs
                 # (see `mem:mesh_patch_worker/mesh_patch_worker_plan` §I.1).
                 source_mesh_path = self.asset_db.resolve_guid(mesh_guid)
                 if source_mesh_path is not None:
@@ -766,7 +1241,7 @@ class IntegratedAssetProcessor:
                         mesh_guid, source_mesh_path, fbx_path,
                         fbx_stem=fbx_stem,
                         entity_node_map=entity_node_map,
-                        collider_entity_node_map=collider_entity_node_map,
+                        physx_specs=physx_specs,
                     )
 
                 for go in entity_list:
@@ -798,7 +1273,8 @@ class IntegratedAssetProcessor:
                 material_mapping,
                 mesh_mapping,
                 fbx_material_labels,
-                output_path
+                output_path,
+                collider_pxmesh_mapping,
             )
 
             # F-9.I.4 — record the prefab's fingerprint after every
@@ -863,7 +1339,7 @@ class IntegratedAssetProcessor:
             outputs. Re-emit via ``_process_material``.
           - **Meshes** — hash diff on `mesh_settings_effective` + missing
             outputs. Re-emit via ``write_fbx_assetinfo`` using the cached
-            ``entity_node_map`` / ``collider_entity_node_map`` /
+            ``entity_node_map`` / ``physx_specs`` /
             ``fbx_stem`` stored on the state-index entry. See
             `mem:mesh_patch_worker/mesh_patch_worker_plan` §I.2.
           - **Prefabs** — deferred. Go via the orchestrator's
@@ -1000,17 +1476,19 @@ class IntegratedAssetProcessor:
 
             summary["meshes_dirty"].append(guid)
 
-            entity_node_map          = dict(saved_entry.get("entity_node_map") or {})
-            collider_entity_node_map = dict(saved_entry.get("collider_entity_node_map") or {})
-            fbx_stem                 = saved_entry.get("fbx_stem") or ""
+            entity_node_map = dict(saved_entry.get("entity_node_map") or {})
+            physx_specs     = list(saved_entry.get("physx_specs") or [])
+            fbx_stem        = saved_entry.get("fbx_stem") or ""
 
-            if not entity_node_map or not fbx_stem:
+            if (not entity_node_map and not physx_specs) or not fbx_stem:
                 # Pre-I.1 entry, or one written by older code. Cannot
-                # replay without re-parsing the prefab — flag it.
+                # replay without re-parsing the prefab — flag it. A
+                # collision-only FBX legitimately has no entity_node_map
+                # but does carry physx_specs, so don't flag that case.
                 summary["meshes_need_reparse"].append(guid)
                 self.log(
                     f"  [Patch] WARNING: mesh {guid[:8]}… has no cached "
-                    f"entity_node_map — needs full Run All to repopulate."
+                    f"node maps — needs full Run All to repopulate."
                 )
                 continue
 
@@ -1054,7 +1532,7 @@ class IntegratedAssetProcessor:
             try:
                 write_fbx_assetinfo(
                     fbx_path, fbx_stem, entity_node_map, self.log,
-                    collider_entity_node_map=collider_entity_node_map or None,
+                    physx_specs=physx_specs or None,
                     mesh_settings=self._mesh_settings,
                     mesh_guid=guid,
                     correction_quat=platform_correction,
@@ -1072,7 +1550,7 @@ class IntegratedAssetProcessor:
                 guid, source_path, fbx_path,
                 fbx_stem=fbx_stem,
                 entity_node_map=entity_node_map,
-                collider_entity_node_map=collider_entity_node_map,
+                physx_specs=physx_specs,
             )
             summary["meshes_emitted"].append(guid)
 
@@ -1313,13 +1791,14 @@ class IntegratedAssetProcessor:
                             output_path: Path,
                             fbx_stem: str = "",
                             entity_node_map: Optional[Dict[str, str]] = None,
-                            collider_entity_node_map: Optional[Dict[str, str]] = None,
+                            physx_specs: Optional[list] = None,
                             ) -> None:
-        """Record a mesh's fingerprint + the cached entity-node maps the
-        Patch worker needs to re-emit `.assetinfo` without re-parsing
-        every consumer prefab. ``fbx_stem`` + the two maps are the
-        cached subset of prefab-parse state — see
-        `mem:mesh_patch_worker/mesh_patch_worker_plan` §I.1."""
+        """Record a mesh's fingerprint + the cached prefab-parse state the
+        Patch worker replays to re-emit `.assetinfo` without re-parsing
+        every consumer prefab: ``fbx_stem``, ``entity_node_map`` (visual
+        groups) and ``physx_specs`` (per-sub-mesh PhysX groups). See
+        `mem:mesh_patch_worker/mesh_patch_worker_plan` §I.1 and
+        `mem:physx_mesh_collider/physx_mesh_collider_plan`."""
         eff = _resolve_mesh_settings(self._mesh_settings, guid)
         assetinfo = Path(str(output_path) + ".assetinfo")
         payload = {
@@ -1331,6 +1810,13 @@ class IntegratedAssetProcessor:
         outputs = [str(output_path)]
         if assetinfo.exists():
             outputs.append(str(assetinfo))
+        # Transform-truth auto-compensation flags — which auto-processes are
+        # APPLICABLE to this FBX, so the Mesh tab can mark the mesh and the
+        # user can toggle them. `auto_center` carries the per-node derived
+        # values (filtered to non-trivial); `y_up` flags the Y-up rotation.
+        acs = {k: v for k, v in compute_node_autocenters(output_path).items()
+               if any(abs(float(x)) > 1e-4 for x in v)}
+        auto_center_value = acs or None
         self._state_index_out["meshes"][guid] = {
             "source_path":              str(source_path),
             "source_mtime":             payload["source_mtime"],
@@ -1339,7 +1825,11 @@ class IntegratedAssetProcessor:
             "last_emitted":             _utc_now_iso(),
             "fbx_stem":                 fbx_stem,
             "entity_node_map":          dict(entity_node_map or {}),
-            "collider_entity_node_map": dict(collider_entity_node_map or {}),
+            "physx_specs":              list(physx_specs or []),
+            "auto_flags": {
+                "auto_center": auto_center_value,            # [x,y,z] or None
+                "y_up":        read_fbx_up_axis(output_path) == 1,
+            },
         }
 
     def _record_prefab_state(self, guid: str, source_path: Path,
@@ -1724,11 +2214,13 @@ class IntegratedAssetProcessor:
                            transform_map: Dict, material_mapping: Dict,
                            mesh_mapping: Dict,
                            fbx_material_labels: Dict[str, List[str]],
-                           output_path: Path) -> None:
+                           output_path: Path,
+                           collider_pxmesh_mapping: Optional[Dict] = None) -> None:
         from targets.o3de.prefab_writer import create_o3de_prefab
         return create_o3de_prefab(
             self, root_go, all_game_objects, transform_map,
             material_mapping, mesh_mapping, fbx_material_labels, output_path,
+            collider_pxmesh_mapping or {},
         )
 
     def _write_entity_map_sidecar(self, prefab_output_path: Path,

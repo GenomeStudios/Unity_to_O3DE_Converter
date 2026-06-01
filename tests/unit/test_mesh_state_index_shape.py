@@ -41,18 +41,19 @@ def test_record_mesh_state_caches_node_maps():
         guid = "deadbeefcafebabe000000000000ffff"
         entity_node_map = {"Door":  "RootNode.Mesh.Door",
                            "Handle": "RootNode.Mesh.Door.Handle"}
-        collider_map    = {"Door":  "RootNode.Mesh.Door"}
+        physx_specs = [{"name": "Mesh-Door", "node_paths": ["RootNode.Mesh.Door"],
+                        "convex": False}]
         proc._record_mesh_state(
             guid, src_fbx, out_fbx,
             fbx_stem="Mesh",
             entity_node_map=entity_node_map,
-            collider_entity_node_map=collider_map,
+            physx_specs=physx_specs,
         )
 
         entry = proc.state_index()["meshes"][guid]
         assert entry["fbx_stem"] == "Mesh"
         assert entry["entity_node_map"] == entity_node_map
-        assert entry["collider_entity_node_map"] == collider_map
+        assert entry["physx_specs"] == physx_specs
         # Pre-existing fields still present.
         for key in ("source_path", "source_mtime", "output_files",
                     "input_hash", "last_emitted"):
@@ -80,7 +81,7 @@ def test_record_mesh_state_defaults_to_empty_maps():
         entry = proc.state_index()["meshes"][guid]
         assert entry["fbx_stem"] == ""
         assert entry["entity_node_map"] == {}
-        assert entry["collider_entity_node_map"] == {}
+        assert entry["physx_specs"] == []
     finally:
         import shutil; shutil.rmtree(td, ignore_errors=True)
 

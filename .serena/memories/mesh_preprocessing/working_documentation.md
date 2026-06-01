@@ -9,6 +9,29 @@ metadata:
 
 Newest entries on top. Linked plan: [[mesh-preprocessing-plan]].
 
+## 2026-05-28 — Two MeshTab additions (Editor-only wrapper + physx_mesh)
+
+- **Prefab-wrapper Editor-only toggle.** New project-wide key
+  `mesh_processor.prefab_wrapper_editor_only` (default True). MeshTab gains
+  a "Prefab Output" group-box with a "Make prefab wrappers Editor-only"
+  checkbox (persisted via `_on_wrapper_editor_only_changed` →
+  `update_stage`, synced in `_refresh_defaults_fields`).
+  `targets/o3de/prefab_writer.create_container_entity` reads it off
+  `worker._mesh_settings` and emits the ContainerEntity's
+  `EditorOnlyEntityComponent.IsEditorOnly` accordingly (was hardcoded True).
+- **`physx_mesh` per-mesh override.** New bool in `_MESH_FIELDS` (default
+  False) + `mesh_processor.defaults.physx_mesh`. When effective-True for a
+  mesh, `process_prefab` adds a whole-FBX ("everything") triangle PhysX
+  group named `{stem}` over all the FBX's mesh nodes, so a `.pxmesh` cooks
+  even when no Unity MeshCollider referenced that mesh. Deduped against
+  collider-derived specs by group name. `_resolve_mesh_settings` carries
+  `physx_mesh`. See `mem:physx_mesh_collider/working_documentation`.
+- Verified end-to-end: editor-only OFF→`IsEditorOnly:false`,
+  default→true; `physx_mesh` override on the un-collided Moss mesh →
+  whole-FBX PhysX group in its assetinfo. Tests:
+  `test_prefab_wrapper_editor_only` (3), `_resolve_mesh_settings_physx_mesh`.
+  Full suite 24/24 (run `QT_QPA_PLATFORM=offscreen python tests/run_all.py`).
+
 ## 2026-05-27 — F-5 editor shipped ✓
 
 ### What landed

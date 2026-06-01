@@ -14,7 +14,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from tests.harness import run_module_tests
 
-from integrated_asset_processor import _derive_asset_hint_root
+from integrated_asset_processor import (
+    _derive_asset_hint_root,
+    _find_project_root,
+    _project_relative_path,
+)
 
 
 def test_relative_to_project_root_keeps_intermediate_folders():
@@ -81,6 +85,51 @@ def test_project_root_wins_over_assets_segment():
         out.mkdir(parents=True)
         # Relative to project root, not to the outer 'assets' dir.
         assert _derive_asset_hint_root(out) == "assets/art/pack"
+    finally:
+        import shutil; shutil.rmtree(td, ignore_errors=True)
+
+
+# =============================================================================
+# `_project_relative_path` — the case-preserving sibling used by the
+# nested-prefab `Source` field. Regression guard for the 2026-05-31
+# bug where scene-level nested prefab instances pointed at
+# `Prefabs/<name>.prefab` instead of the real `Assets/Art/.../Prefabs/<name>.prefab`.
+# =============================================================================
+
+def test_project_relative_path_preserves_case():
+    td = Path(tempfile.mkdtemp(prefix="u2o_relpath_case_"))
+    try:
+        (td / "project.json").write_text("{}", encoding="utf-8")
+        prefab = td / "Assets" / "Art" / "Alien Fantasy Forest" / "Prefabs" / "Watersprinklerpipe_R.prefab"
+        prefab.parent.mkdir(parents=True)
+        prefab.write_text("{}", encoding="utf-8")
+        assert _project_relative_path(prefab) == (
+            "Assets/Art/Alien Fantasy Forest/Prefabs/Watersprinklerpipe_R.prefab"
+        )
+    finally:
+        import shutil; shutil.rmtree(td, ignore_errors=True)
+
+
+def test_project_relative_path_returns_none_outside_project():
+    td = Path(tempfile.mkdtemp(prefix="u2o_relpath_none_"))
+    try:
+        prefab = td / "loose" / "Pack" / "Prefabs" / "Foo.prefab"
+        prefab.parent.mkdir(parents=True)
+        prefab.write_text("{}", encoding="utf-8")
+        # No project.json anywhere → callers fall back to legacy logic.
+        assert _project_relative_path(prefab) is None
+    finally:
+        import shutil; shutil.rmtree(td, ignore_errors=True)
+
+
+def test_find_project_root_returns_dir_with_project_json():
+    td = Path(tempfile.mkdtemp(prefix="u2o_findroot_"))
+    try:
+        (td / "project.json").write_text("{}", encoding="utf-8")
+        nested = td / "Assets" / "X" / "Y"
+        nested.mkdir(parents=True)
+        assert _find_project_root(nested) == td
+        assert _find_project_root(td) == td
     finally:
         import shutil; shutil.rmtree(td, ignore_errors=True)
 

@@ -48,7 +48,7 @@ def _seed_emission(td: Path, mesh_settings: dict):
 
     guid = "deadbeefcafebabe000000000000ffff"
     entity_node_map = {"Mesh": "RootNode.Mesh"}
-    collider_map    = {}
+    physx_specs     = []
 
     proc = IntegratedAssetProcessor(
         unity, out, log_callback=lambda *_: None,
@@ -56,7 +56,7 @@ def _seed_emission(td: Path, mesh_settings: dict):
     )
     write_fbx_assetinfo(
         out_fbx, "Mesh", entity_node_map, proc.log,
-        collider_entity_node_map=collider_map or None,
+        physx_specs=physx_specs or None,
         mesh_settings=mesh_settings,
         mesh_guid=guid,
         correction_quat=getattr(proc.platform, "correction_quat", None),
@@ -65,7 +65,7 @@ def _seed_emission(td: Path, mesh_settings: dict):
         guid, src_fbx, out_fbx,
         fbx_stem="Mesh",
         entity_node_map=entity_node_map,
-        collider_entity_node_map=collider_map,
+        physx_specs=physx_specs,
     )
     state = proc.state_index()
     assetinfo = Path(str(out_fbx) + ".assetinfo")

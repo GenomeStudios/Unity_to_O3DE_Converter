@@ -554,7 +554,7 @@ class PipelineOrchestrator(QObject):
     Stage queue is derived from the project's current selections:
       - asset_processor   if ≥1 prefab is selected
       - scene_converter   if ≥1 scene is selected
-      - terrain_processor if ≥1 terrain material is selected
+      - terrain_processor if ≥1 terrain is selected
 
     `dispatch_callable(stage_key)` is what actually fires the worker;
     MainWindow passes `_process_stage` so the same code path the
@@ -623,7 +623,7 @@ class PipelineOrchestrator(QObject):
         if sc.get("selected_scenes"):
             q.append("scene_converter")
         tp = project.stage_settings("terrain_processor")
-        if tp.get("selected_materials"):
+        if tp.get("selected_terrains"):
             q.append("terrain_processor")
         return q
 
@@ -1852,17 +1852,18 @@ def compute_stage_readiness(stage_key: str, project) -> dict:
 
     elif stage_key == "terrain_processor":
         reqs.append(_req_source(source))
-        materials = cfg.get("selected_materials", []) or []
-        if materials:
-            reqs.append({"met": True,  "text": f"{len(materials)} materials selected"})
+        terrains = cfg.get("selected_terrains", []) or []
+        if terrains:
+            reqs.append({"met": True,  "text": f"{len(terrains)} terrain(s) selected"})
         else:
-            reqs.append({"met": False, "text": "No materials selected"})
+            reqs.append({"met": False, "text": "No terrains selected"})
         reqs.append(_req_output(output))
         if last_run:
             last_run_summary = (
                 f"Last run {last_run}: "
-                f"{status_info.get('materials_written', 0)}/{status_info.get('materials_total', 0)} materials, "
-                f"{status_info.get('textures_written', 0)} textures, "
+                f"{status_info.get('terrains_total', 0)} terrain(s), "
+                f"{status_info.get('materials_written', 0)} materials, "
+                f"{status_info.get('prefabs_written', 0)} prefab(s), "
                 f"{status_info.get('errors', 0)} errors"
             )
         had_errors = bool(status_info.get("errors", 0))
@@ -2056,9 +2057,10 @@ def input_hash_for(stage_key: str, project) -> str:
             payload["files"] = {}
 
     elif stage_key == "terrain_processor":
-        selected = sorted(cfg.get("selected_materials", []) or [])
-        payload["selected_materials"] = selected
-        payload["files"] = {mat: _fingerprint_file(mat) for mat in selected}
+        selected = sorted(cfg.get("selected_terrains", []) or [])
+        payload["selected_terrains"] = selected
+        payload["outputs"] = sorted(cfg.get("outputs", []) or [])
+        payload["files"] = {t: _fingerprint_file(t) for t in selected}
 
     blob = _hashjson.dumps(payload, sort_keys=True)
     return _hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
@@ -4335,7 +4337,117 @@ _MESH_FIELDS = [
     ("zero_position",    "Zero position on import",     "bool"),
     ("default_position", "Default position (X / Y / Z)", "vec3"),
     ("default_rotation", "Default rotation (X / Y / Z)", "vec3"),
+    ("physx_mesh",       "Generate PhysX collision mesh", "bool"),
+    ("auto_center",      "Auto-center single-mesh (⚙)",  "bool"),
+    ("auto_rotation",    "Auto Y-up→Z-up rotation (⚙)",  "bool"),
 ]
+
+
+# =============================================================================
+# SHARED PATCH PLUMBING
+# =============================================================================
+# The F-9 Patch worker (`IntegratedAssetProcessor.patch()`) re-emits dirty
+# materials AND meshes in a single pass. Every patch entry point — the
+# Materials tab button, the Meshes tab button, and Mission Command's
+# "Patch All" — drives that one operation, so they share this plumbing.
+#
+# Passing BOTH material_settings and mesh_settings is mandatory: the mesh
+# loop recomputes each mesh's input hash from the effective mesh_settings,
+# so a patch started without them would diff against empty defaults, flag
+# every mesh dirty, and re-emit assetinfo that drops the user's rotation /
+# position overrides. The same hazard applies to materials in reverse.
+# Earlier per-tab workers each passed only their own half — fixed 2026-05-28.
+
+def _patch_settings_snapshot(proj):
+    """Return ``(source_root, output_root, material_settings, mesh_settings,
+    state_index)`` for a patch run, or ``None`` when the project has no
+    source/output configured (patch needs the Prefab Processor folders)."""
+    ap = proj.stage_settings("asset_processor")
+    source_root = ap.get("source_path") or str(proj.scope_root or "")
+    output_root = ap.get("output_path") or ""
+    if not source_root or not output_root:
+        return None
+    return (
+        source_root,
+        output_root,
+        copy.deepcopy(proj.stage_settings("material_processor")),
+        copy.deepcopy(proj.stage_settings("mesh_processor")),
+        copy.deepcopy(proj.outputs.get("state_index") or {}),
+    )
+
+
+def _run_full_patch(source_root, output_root, material_settings,
+                    mesh_settings, state_index, log) -> str:
+    """Shared Patch worker body — re-emits dirty materials + meshes.
+    Returns a JSON string the finish handlers decode. ``asset_hint_root``
+    is derived in ``IntegratedAssetProcessor.__init__`` from the output
+    root relative to the O3DE project root; it must NOT be overridden
+    here (doing so was the 2026-05-28 hint-root regression)."""
+    from integrated_asset_processor import IntegratedAssetProcessor
+    log("=" * 60)
+    log("PATCH — re-emit dirty materials + meshes")
+    log("=" * 60)
+    cfg = get_config()
+    proc = IntegratedAssetProcessor(
+        Path(source_root), Path(output_root),
+        log_callback=log,
+        convert_smoothness_to_roughness=cfg["convert_smoothness_to_roughness"],
+        material_settings=material_settings,
+        mesh_settings=mesh_settings,
+        state_index=state_index,
+    )
+    summary = proc.patch()
+    return json.dumps({
+        "materials_dirty":     summary["materials_dirty"],
+        "materials_emitted":   summary["materials_emitted"],
+        "meshes_dirty":        summary["meshes_dirty"],
+        "meshes_emitted":      summary["meshes_emitted"],
+        "meshes_need_reparse": summary["meshes_need_reparse"],
+        "state":               proc.state_index(),
+    })
+
+
+def _decode_patch_payload(payload: str) -> dict:
+    try:
+        return json.loads(payload)
+    except Exception:
+        return {}
+
+
+def _merge_patch_state(proj, run_state) -> None:
+    """Merge a patch run's resulting state_index back onto the project."""
+    if not run_state:
+        return
+    existing = dict(proj.outputs.get("state_index") or {})
+    for bucket_name, bucket in run_state.items():
+        merged = dict(existing.get(bucket_name) or {})
+        merged.update(bucket)
+        existing[bucket_name] = merged
+    project_manager().update_outputs("state_index", existing)
+
+
+def _format_patch_message(info: dict) -> str:
+    """Human-readable summary covering materials, meshes, and meshes that
+    need a full Run All. Used by every patch finish handler so the report
+    is consistent no matter which button started it."""
+    mat_d   = info.get("materials_dirty")     or []
+    mat_e   = info.get("materials_emitted")   or []
+    msh_d   = info.get("meshes_dirty")        or []
+    msh_e   = info.get("meshes_emitted")      or []
+    reparse = info.get("meshes_need_reparse") or []
+    lines = []
+    if mat_d:
+        lines.append(f"Materials: {len(mat_d)} dirty · {len(mat_e)} re-emitted")
+    if msh_d:
+        lines.append(f"Meshes: {len(msh_d)} dirty · {len(msh_e)} re-emitted")
+    if reparse:
+        lines.append(
+            f"⚠ {len(reparse)} mesh(es) need a full Run All "
+            f"(cached node map missing or stale)"
+        )
+    if not lines:
+        return "Nothing to patch — all materials and meshes are in sync."
+    return "\n".join(lines)
 
 
 class MeshTab(QWidget):
@@ -4396,6 +4508,20 @@ class MeshTab(QWidget):
 
         self._default_fields = self._build_field_form(defaults_lay, scope="defaults")
         root.addWidget(defaults_box)
+
+        # ── Prefab Output ───────────────────────────────────────────────
+        wrap_box, wrap_lay = _section_groupbox("Prefab Output")
+        self._wrapper_editor_only_cb = QCheckBox("Make prefab wrappers Editor-only")
+        self._wrapper_editor_only_cb.setToolTip(
+            "Emit each converted prefab's ContainerEntity wrapper as an "
+            "editor-only entity (dissolved at runtime, leaving its content "
+            "entities). On by default."
+        )
+        self._wrapper_editor_only_cb.stateChanged.connect(
+            lambda state: self._on_wrapper_editor_only_changed(state == Qt.Checked)
+        )
+        wrap_lay.addWidget(self._wrapper_editor_only_cb)
+        root.addWidget(wrap_box)
 
         # ── Mesh Inventory ──────────────────────────────────────────────
         inv_box, inv_lay = _section_groupbox("Mesh Inventory")
@@ -4538,6 +4664,8 @@ class MeshTab(QWidget):
         defaults = cfg.get("defaults", {}) or {}
         self._suppress_field_signals = True
         try:
+            self._wrapper_editor_only_cb.setChecked(
+                bool(cfg.get("prefab_wrapper_editor_only", True)))
             for key, _, kind in _MESH_FIELDS:
                 if kind == "bool":
                     cb = self._default_fields[key]
@@ -4591,6 +4719,12 @@ class MeshTab(QWidget):
 
             is_externally_modified = guid in externally_modified
 
+            # ⚙ auto-compensation flags recorded by the converter.
+            auto_flags  = (state_entry or {}).get("auto_flags") or {}
+            auto_center = auto_flags.get("auto_center")
+            auto_y_up   = bool(auto_flags.get("y_up"))
+            has_auto    = (auto_center is not None) or auto_y_up
+
             if has_override:
                 override_count += 1
             if is_dirty:
@@ -4601,6 +4735,8 @@ class MeshTab(QWidget):
             prefix = ""
             if has_override:
                 prefix += "★ "
+            if has_auto:
+                prefix += "⚙ "
             if is_dirty:
                 prefix += "↻ "
             if is_externally_modified:
@@ -4614,6 +4750,10 @@ class MeshTab(QWidget):
             tip_lines = [f"GUID: {guid}", f"Output stem: {stem}"]
             if has_override:
                 tip_lines.append("Override applied")
+            if auto_center is not None:
+                tip_lines.append(f"⚙ Auto-centered (per-node) → {auto_center}")
+            if auto_y_up:
+                tip_lines.append("⚙ Y-up FBX → auto +90° X rotation")
             if is_dirty:
                 tip_lines.append("Dirty — output missing or stale; run Patch")
             if is_externally_modified:
@@ -4760,6 +4900,19 @@ class MeshTab(QWidget):
     # -------------------------------------------------------------------------
     # FIELD EDIT HANDLERS
     # -------------------------------------------------------------------------
+
+    def _on_wrapper_editor_only_changed(self, checked: bool) -> None:
+        """Project-wide toggle (not a per-mesh field): emit prefab
+        ContainerEntity wrappers as editor-only entities."""
+        if self._suppress_field_signals:
+            return
+        pm = project_manager()
+        proj = pm.current()
+        if proj is None:
+            return
+        cfg = dict(proj.stage_settings(self.STAGE_KEY))
+        cfg["prefab_wrapper_editor_only"] = bool(checked)
+        pm.update_stage(self.STAGE_KEY, cfg)
 
     def _on_field_changed(self, scope: str, key, value) -> None:
         """`scope` is 'defaults' or 'override'. `key` is either a field key
@@ -4909,58 +5062,27 @@ class MeshTab(QWidget):
         pm = project_manager()
         proj = pm.current()
         if proj is None:
-            QMessageBox.information(self, "Patch Meshes",
-                                     "Open a project first.")
+            QMessageBox.information(self, "Patch", "Open a project first.")
             return
-        ap_settings = proj.stage_settings("asset_processor")
-        source_root = ap_settings.get("source_path") or str(proj.scope_root or "")
-        output_root = ap_settings.get("output_path") or ""
-        if not source_root or not output_root:
+        snapshot = _patch_settings_snapshot(proj)
+        if snapshot is None:
             QMessageBox.warning(
-                self, "Patch Meshes",
+                self, "Patch",
                 "Patch needs the Prefab Processor's source + output folders "
                 "(set on the Prefabs tab). Run the Prefab Processor at least "
                 "once before patching.",
             )
             return
-
-        mesh_settings = copy.deepcopy(proj.stage_settings(self.STAGE_KEY))
-        state_index   = copy.deepcopy(proj.outputs.get("state_index") or {})
+        source_root, output_root, material_settings, mesh_settings, state_index = snapshot
 
         self._patch_btn.setEnabled(False)
         self._patch_worker = WorkerThread(
-            self._do_patch, source_root, output_root,
-            mesh_settings, state_index,
+            _run_full_patch, source_root, output_root,
+            material_settings, mesh_settings, state_index,
         )
         self._patch_worker.emitter.message.connect(self._on_patch_log)
         self._patch_worker.finished.connect(self._on_patch_finished)
         self._patch_worker.start()
-
-    def _do_patch(self, source_root: str, output_root: str,
-                   mesh_settings: dict, state_index: dict, log) -> str:
-        from integrated_asset_processor import IntegratedAssetProcessor
-        log("=" * 60)
-        log("PATCH — re-emit dirty meshes")
-        log("=" * 60)
-        cfg = get_config()
-        proc = IntegratedAssetProcessor(
-            Path(source_root), Path(output_root),
-            log_callback=log,
-            convert_smoothness_to_roughness=cfg["convert_smoothness_to_roughness"],
-            mesh_settings=mesh_settings,
-            state_index=state_index,
-        )
-        proj_name = (project_manager().current().name
-                     if project_manager().current() else "project")
-        proc.asset_hint_root = f"assets/{proj_name.lower().replace(' ', '_')}"
-        summary = proc.patch()
-        run_state = proc.state_index()
-        return json.dumps({
-            "dirty":         summary["meshes_dirty"],
-            "emitted":       summary["meshes_emitted"],
-            "need_reparse":  summary["meshes_need_reparse"],
-            "state":         run_state,
-        })
 
     def _on_patch_log(self, msg: str) -> None:
         # No dedicated log widget — surface via stdout so the worker's
@@ -4970,42 +5092,14 @@ class MeshTab(QWidget):
     def _on_patch_finished(self, success: bool, payload: str) -> None:
         self._patch_btn.setEnabled(True)
         if not success:
-            QMessageBox.critical(self, "Patch Meshes",
-                                  f"Patch failed:\n{payload}")
+            QMessageBox.critical(self, "Patch", f"Patch failed:\n{payload}")
             return
-        try:
-            info = json.loads(payload)
-        except Exception:
-            info = {"dirty": [], "emitted": [], "need_reparse": [], "state": {}}
-        dirty        = info.get("dirty")        or []
-        emitted      = info.get("emitted")      or []
-        need_reparse = info.get("need_reparse") or []
-        run_state    = info.get("state")        or {}
-
+        info = _decode_patch_payload(payload)
         pm = project_manager()
         proj = pm.current()
-        if proj is not None and run_state:
-            existing = dict(proj.outputs.get("state_index") or {})
-            for bucket_name, bucket in run_state.items():
-                merged = dict(existing.get(bucket_name) or {})
-                merged.update(bucket)
-                existing[bucket_name] = merged
-            pm.update_outputs("state_index", existing)
-
-        # Result dialog — surface need_reparse separately so the user
-        # knows Run All is required for those.
-        lines = [f"{len(dirty)} dirty · {len(emitted)} re-emitted"]
-        if need_reparse:
-            lines.append(
-                f"⚠ {len(need_reparse)} mesh(es) need full Run All "
-                f"(cached node map missing or stale):"
-            )
-            lines.extend(f"  • {g}" for g in need_reparse[:10])
-        elif not dirty:
-            lines = ["No dirty meshes found."]
-        QMessageBox.information(self, "Patch Meshes", "\n".join(lines))
-
-        # Refresh inventory + markers.
+        if proj is not None:
+            _merge_patch_state(proj, info.get("state") or {})
+        QMessageBox.information(self, "Patch", _format_patch_message(info))
         self.apply_project(pm.current())
 
 
@@ -5702,68 +5796,32 @@ class MaterialTab(QWidget):
     def _start_patch(self) -> None:
         """Spawn a WorkerThread that runs IntegratedAssetProcessor.patch().
         Snapshots project state on the UI thread so the worker is isolated
-        from concurrent edits."""
+        from concurrent edits. The patch covers materials AND meshes —
+        see the shared patch plumbing above MeshTab."""
         pm = project_manager()
         proj = pm.current()
         if proj is None:
-            QMessageBox.information(self, "Patch Materials",
-                                     "Open a project first.")
+            QMessageBox.information(self, "Patch", "Open a project first.")
             return
-        ap_outputs = proj.outputs.get("asset_processor") or {}
-        source_root = (ap_outputs.get("last_run") and
-                       proj.stage_settings("asset_processor").get("source_path")) \
-                      or str(proj.scope_root or "")
-        output_root = proj.stage_settings("asset_processor").get("output_path") or ""
-        if not source_root or not output_root:
+        snapshot = _patch_settings_snapshot(proj)
+        if snapshot is None:
             QMessageBox.warning(
-                self, "Patch Materials",
+                self, "Patch",
                 "Patch needs the Prefab Processor's source + output folders "
                 "(set on the Prefabs tab). Run the Prefab Processor at least "
                 "once before patching.",
             )
             return
-
-        material_settings = copy.deepcopy(proj.stage_settings("material_processor"))
-        state_index       = copy.deepcopy(proj.outputs.get("state_index") or {})
+        source_root, output_root, material_settings, mesh_settings, state_index = snapshot
 
         self._patch_btn.setEnabled(False)
         self._patch_worker = WorkerThread(
-            self._do_patch, source_root, output_root,
-            material_settings, state_index,
+            _run_full_patch, source_root, output_root,
+            material_settings, mesh_settings, state_index,
         )
         self._patch_worker.emitter.message.connect(self._on_patch_log)
         self._patch_worker.finished.connect(self._on_patch_finished)
         self._patch_worker.start()
-
-    def _do_patch(self, source_root: str, output_root: str,
-                   material_settings: dict, state_index: dict, log) -> str:
-        from integrated_asset_processor import IntegratedAssetProcessor
-        log("=" * 60)
-        log("PATCH — re-emit dirty materials")
-        log("=" * 60)
-        cfg = get_config()
-        proc = IntegratedAssetProcessor(
-            Path(source_root), Path(output_root),
-            log_callback=log,
-            convert_smoothness_to_roughness=cfg["convert_smoothness_to_roughness"],
-            material_settings=material_settings,
-            state_index=state_index,
-        )
-        # Asset hint root matches the Prefab Processor's convention so the
-        # re-emitted .material's asset_hint string lines up with the existing
-        # prefab references.
-        proj_name = (project_manager().current().name
-                     if project_manager().current() else "project")
-        proc.asset_hint_root = f"assets/{proj_name.lower().replace(' ', '_')}"
-        summary = proc.patch()
-        # Return the resulting state-index delta encoded as a JSON string so
-        # _on_patch_finished can merge it back on the UI thread.
-        run_state = proc.state_index()
-        return json.dumps({
-            "dirty":    summary["materials_dirty"],
-            "emitted":  summary["materials_emitted"],
-            "state":    run_state,
-        })
 
     def _on_patch_log(self, msg: str) -> None:
         # No dedicated log widget on this tab; surface via the project
@@ -5773,35 +5831,14 @@ class MaterialTab(QWidget):
     def _on_patch_finished(self, success: bool, payload: str) -> None:
         self._patch_btn.setEnabled(True)
         if not success:
-            QMessageBox.critical(self, "Patch Materials",
-                                  f"Patch failed:\n{payload}")
+            QMessageBox.critical(self, "Patch", f"Patch failed:\n{payload}")
             return
-        try:
-            info = json.loads(payload)
-        except Exception:
-            info = {"dirty": [], "emitted": [], "state": {}}
-        dirty   = info.get("dirty")   or []
-        emitted = info.get("emitted") or []
-        run_state = info.get("state") or {}
-
-        # Merge the worker's state_index back onto the project file.
+        info = _decode_patch_payload(payload)
         pm = project_manager()
         proj = pm.current()
-        if proj is not None and run_state:
-            existing = dict(proj.outputs.get("state_index") or {})
-            for bucket_name, bucket in run_state.items():
-                merged = dict(existing.get(bucket_name) or {})
-                merged.update(bucket)
-                existing[bucket_name] = merged
-            pm.update_outputs("state_index", existing)
-
-        msg = (f"{len(dirty)} dirty · {len(emitted)} re-emitted"
-               if dirty else "No dirty materials found.")
-        if dirty:
-            QMessageBox.information(self, "Patch Materials",
-                                     f"{msg}\n\n" + "\n".join(f"  • {g}" for g in dirty[:20]))
-        else:
-            QMessageBox.information(self, "Patch Materials", msg)
+        if proj is not None:
+            _merge_patch_state(proj, info.get("state") or {})
+        QMessageBox.information(self, "Patch", _format_patch_message(info))
         # Refresh the inventory so any ↻ markers clear.
         self.apply_project(pm.current())
 
@@ -6235,7 +6272,8 @@ class TerrainTab(QWidget):
     def __init__(self):
         super().__init__()
         self._worker: WorkerThread = None
-        self._selected_materials: list = []   # absolute paths to .mat files
+        self._selected_terrains: set = set()   # absolute paths to TerrainData .asset
+        self._suppress_terrain_signals = False
         self._build_ui()
         pm = project_manager()
         pm.project_changed.connect(self.apply_project)
@@ -6277,29 +6315,51 @@ class TerrainTab(QWidget):
         out_btn.clicked.connect(self._browse_output)
         out_lay.addLayout(_hbox(self._output_edit, out_btn))
         info_label = QLabel(
-            "  Terrain/Materials/  — O3DE .material files referencing\n"
-            "                          @gemroot:Terrain@/Assets/Materials/Types/\n"
-            "                          TerrainBaseMaterial.materialtype\n"
-            "  Terrain/Textures/   — Textures referenced by the materials above"
+            "  Terrain/Materials/   — one detail .material per splat layer\n"
+            "  Terrain/Textures/    — albedo + normal textures (deduped)\n"
+            "  Terrain/Heightmaps/  — 16-bit heightmap PNG + world-size sidecar\n"
+            "  Terrain/Splatmaps/   — per-layer weight masks\n"
+            "  Terrain/Prefabs/     — terrain entity .prefab + .terrain.json manifest"
         )
         info_label.setStyleSheet("color: #6c7086; font-size: 9pt;")
         out_lay.addWidget(info_label)
         root.addWidget(out_box)
 
-        # ── Selected Unity Materials ────────────────────────────────────
-        self._material_list = QListWidget()
-        self._material_list.setSelectionMode(QListWidget.ExtendedSelection)
-        add_btn    = QPushButton("Add Materials…")
-        remove_btn = QPushButton("Remove Selected")
-        clear_btn  = QPushButton("Clear All")
-        add_btn.clicked.connect(self._add_materials)
-        remove_btn.clicked.connect(self._remove_selected_materials)
-        clear_btn.clicked.connect(self._clear_materials)
+        # ── Detected Unity Terrains ─────────────────────────────────────
+        self._terrain_list = QListWidget()
+        self._terrain_list.itemChanged.connect(self._on_terrain_item_changed)
+        scan_btn  = QPushButton("Scan for Terrains")
+        clear_btn = QPushButton("Clear Selection")
+        scan_btn.clicked.connect(self._scan_terrains)
+        clear_btn.clicked.connect(self._clear_terrain_selection)
         root.addWidget(_managed_list_section(
-            "Selected Unity Materials", self._material_list,
-            add_btn, remove_btn, clear_btn,
-            min_h=120, max_h=200,
+            "Detected Unity Terrains  (TerrainData .asset)", self._terrain_list,
+            scan_btn, clear_btn,
+            min_h=110, max_h=190,
         ))
+
+        # ── Outputs (à la carte) ────────────────────────────────────────
+        out_toggle_box, out_toggle_lay = _section_groupbox("Outputs")
+        self._output_checks = {}
+        for key, label in (
+            ("materials", "Detail Materials + Textures"),
+            ("heightmap", "Heightmap image"),
+            ("splatmaps", "Splatmap weight masks"),
+            ("entity",    "Full Terrain Entity (.prefab)"),
+        ):
+            cb = QCheckBox(label)
+            cb.setChecked(True)
+            cb.stateChanged.connect(lambda *_: self._save_settings())
+            self._output_checks[key] = cb
+            out_toggle_lay.addWidget(cb)
+        hint = QLabel(
+            "Outputs are independent — tick only \"Detail Materials\" to gather "
+            "layer materials without rebuilding the terrain object."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6c7086; font-size: 9pt;")
+        out_toggle_lay.addWidget(hint)
+        root.addWidget(out_toggle_box)
 
         # ── Processing Log ──────────────────────────────────────────────
         self._log_edit = _log_widget()
@@ -6331,10 +6391,19 @@ class TerrainTab(QWidget):
         cfg = project.stage_settings(self.STAGE_KEY) if project else {}
         self._source_edit.setText(cfg.get("source_path", ""))
         self._output_edit.setText(cfg.get("output_path", ""))
-        self._selected_materials = []
-        self._material_list.clear()
-        for path in cfg.get("selected_materials", []):
-            self._add_material_to_list(path)
+
+        # Migration: the old design persisted `selected_materials` (.mat list).
+        # v2 is terrain-driven — drop the legacy key and load `selected_terrains`.
+        self._selected_terrains = set(cfg.get("selected_terrains", []) or [])
+
+        outputs = cfg.get("outputs")
+        if isinstance(outputs, list):
+            enabled = set(outputs)
+            for key, cb in self._output_checks.items():
+                cb.setChecked(key in enabled)
+
+        # Show the persisted terrains without re-scanning (scan is explicit).
+        self._rebuild_terrain_list(self._selected_terrains)
         self._refresh_effective_source_label()
 
     def _refresh_effective_source_label(self) -> None:
@@ -6353,10 +6422,14 @@ class TerrainTab(QWidget):
 
     def _collect_stage_settings(self) -> dict:
         return {
-            "source_path":        self._source_edit.text(),
-            "output_path":        self._output_edit.text(),
-            "selected_materials": list(self._selected_materials),
+            "source_path":       self._source_edit.text(),
+            "output_path":       self._output_edit.text(),
+            "selected_terrains": sorted(self._selected_terrains),
+            "outputs":           self._selected_outputs(),
         }
+
+    def _selected_outputs(self) -> list:
+        return [key for key, cb in self._output_checks.items() if cb.isChecked()]
 
     def _save_settings(self) -> None:
         pm = project_manager()
@@ -6384,41 +6457,85 @@ class TerrainTab(QWidget):
             self._log(f"Output: {d}")
             self._save_settings()
 
-    def _add_materials(self) -> None:
-        # Start the picker inside the source folder when one is set so the
-        # user doesn't have to navigate from scratch each time.
-        start_dir = _resolve_start_dir(self._source_edit.text().strip())
-        paths, _ = QFileDialog.getOpenFileNames(
-            self, "Select Unity Material Files", start_dir,
-            "Unity Materials (*.mat);;All files (*.*)"
-        )
-        added = 0
-        for p in paths:
-            if p not in self._selected_materials:
-                self._add_material_to_list(p)
-                added += 1
-        if added:
-            self._log(f"Added {added} material(s); list now has {len(self._selected_materials)}.")
-            self._save_settings()
+    def _effective_source_text(self) -> str:
+        proj = project_manager().current()
+        if proj is not None:
+            return proj.effective_source(self.STAGE_KEY)
+        return self._source_edit.text().strip()
 
-    def _add_material_to_list(self, path: str) -> None:
-        self._selected_materials.append(path)
-        self._material_list.addItem(QListWidgetItem(path))
+    def _scan_terrains(self) -> None:
+        """Walk the effective source for binary TerrainData .asset files and
+        rebuild the checklist, preserving the current selection."""
+        from platforms.unity import terrain_data as _td
+        if not _td.unitypy_available():
+            QMessageBox.warning(
+                self, "UnityPy required",
+                "Scanning Unity terrains needs the 'UnityPy' package.\n\n"
+                "Install it with:  pip install -r requirements.txt")
+            return
 
-    def _remove_selected_materials(self) -> None:
-        rows = sorted(
-            (self._material_list.row(item) for item in self._material_list.selectedItems()),
-            reverse=True,
-        )
-        for row in rows:
-            self._material_list.takeItem(row)
-            self._selected_materials.pop(row)
-        if rows:
-            self._save_settings()
+        root = self._effective_source_text()
+        if not root or not os.path.isdir(root):
+            QMessageBox.warning(self, "No source",
+                "Set a Unity Assets source (this field or the project scope root) "
+                "before scanning.")
+            return
 
-    def _clear_materials(self) -> None:
-        self._material_list.clear()
-        self._selected_materials.clear()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            found = _td.scan_for_terrains(Path(root))
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        found_strs = [str(p) for p in found]
+        # Keep selections that still resolve; auto-select brand-new finds so a
+        # fresh scan is immediately actionable.
+        known = set(found_strs)
+        self._selected_terrains = (self._selected_terrains & known) or set()
+        for s in found_strs:
+            self._selected_terrains.add(s)
+
+        self._rebuild_terrain_list(set(found_strs))
+        self._log(f"Scan found {len(found_strs)} terrain(s) under {root}")
+        self._save_settings()
+
+    def _rebuild_terrain_list(self, paths: set) -> None:
+        """Populate the checkable terrain list from ``paths`` (absolute strings).
+        Items in ``_selected_terrains`` are checked."""
+        self._suppress_terrain_signals = True
+        try:
+            self._terrain_list.clear()
+            for path in sorted(paths | self._selected_terrains):
+                item = QListWidgetItem(Path(path).name)
+                item.setData(Qt.UserRole, path)
+                item.setToolTip(path)
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(
+                    Qt.Checked if path in self._selected_terrains else Qt.Unchecked)
+                self._terrain_list.addItem(item)
+        finally:
+            self._suppress_terrain_signals = False
+
+    def _on_terrain_item_changed(self, item) -> None:
+        if self._suppress_terrain_signals:
+            return
+        path = item.data(Qt.UserRole)
+        if not path:
+            return
+        if item.checkState() == Qt.Checked:
+            self._selected_terrains.add(path)
+        else:
+            self._selected_terrains.discard(path)
+        self._save_settings()
+
+    def _clear_terrain_selection(self) -> None:
+        self._suppress_terrain_signals = True
+        try:
+            for i in range(self._terrain_list.count()):
+                self._terrain_list.item(i).setCheckState(Qt.Unchecked)
+        finally:
+            self._suppress_terrain_signals = False
+        self._selected_terrains.clear()
         self._save_settings()
 
     # -------------------------------------------------------------------------
@@ -6457,9 +6574,15 @@ class TerrainTab(QWidget):
         if not os.path.exists(source):
             QMessageBox.critical(self, "Error", f"Source folder not found:\n{source}")
             return
-        if not self._selected_materials:
+        if not self._selected_terrains:
             QMessageBox.warning(self, "Warning",
-                "No materials selected. Add at least one .mat file to convert.")
+                "No terrains selected. Click 'Scan for Terrains' and tick at "
+                "least one TerrainData .asset to convert.")
+            return
+        if not self._selected_outputs():
+            QMessageBox.warning(self, "Warning",
+                "No outputs selected. Tick at least one output (Detail Materials, "
+                "Heightmap, Splatmaps, or Full Terrain Entity).")
             return
 
         self._save_settings()
@@ -6468,72 +6591,94 @@ class TerrainTab(QWidget):
         project_manager().set_processing(self.STAGE_KEY, True)
 
         self._worker = WorkerThread(
-            self._do_generation, source, output, list(self._selected_materials),
+            self._do_generation, source, output,
+            sorted(self._selected_terrains), self._selected_outputs(),
         )
         self._worker.emitter.message.connect(self._log)
         self._worker.finished.connect(self._on_finished)
         self._worker.start()
 
     def _do_generation(self, source_path: str, output_path: str,
-                       material_paths: list, log) -> str:
-        from platforms.unity.terrain import TerrainMaterialProcessor
+                       terrain_paths: list, outputs: list, log) -> str:
+        from platforms.unity.terrain import TerrainProcessor
 
         log("\n" + "=" * 60)
-        log("STARTING TERRAIN MATERIAL GENERATION")
+        log("STARTING TERRAIN CONVERSION")
         log("=" * 60)
-        log(f"Source        : {source_path}")
-        log(f"Output        : {output_path}")
-        log(f"Materials in  : {len(material_paths)}")
+        log(f"Source   : {source_path}")
+        log(f"Output   : {output_path}")
+        log(f"Terrains : {len(terrain_paths)}")
+        log(f"Outputs  : {', '.join(outputs)}")
 
-        processor = TerrainMaterialProcessor(
+        processor = TerrainProcessor(
             Path(source_path), Path(output_path), log_callback=log,
         )
-        result = processor.process_materials([Path(p) for p in material_paths])
+
+        totals = {
+            "materials_written": 0, "textures_written": 0,
+            "heightmaps_written": 0, "splatmaps_written": 0,
+            "prefabs_written": 0, "errors": 0,
+        }
+        terrain_records: dict = {}
+        run_ts = _utc_now_iso()
+
+        for tp in terrain_paths:
+            r = processor.process_terrain(Path(tp), set(outputs))
+            totals["materials_written"]  += r["materials_written"]
+            totals["textures_written"]   += r["textures_written"]
+            totals["heightmaps_written"] += r["heightmaps_written"]
+            totals["splatmaps_written"]  += r["splatmaps_written"]
+            totals["prefabs_written"]    += 1 if r["prefab_written"] else 0
+            totals["errors"]             += len(r["errors"])
+            terrain_records[str(tp)] = {
+                "source_path":       str(tp),
+                "layers":            r["layers"],
+                "outputs":           list(outputs),
+                "materials_written": r["materials_written"],
+                "prefab_written":    r["prefab_written"],
+                "written_at":        run_ts,
+            }
 
         log("\n" + "=" * 60)
-        log("GENERATION COMPLETE!")
+        log("CONVERSION COMPLETE!")
         log("=" * 60)
-        log(f"Materials written : {result['materials_written']}/{len(material_paths)}")
-        log(f"Textures written  : {result['textures_written']}")
-        if result["errors"]:
-            log(f"Errors ({len(result['errors'])}):")
-            for err in result["errors"]:
-                log(f"  ⚠ {err}")
+        log(f"Terrains          : {len(terrain_paths)}")
+        log(f"Materials written : {totals['materials_written']}")
+        log(f"Textures written  : {totals['textures_written']}")
+        log(f"Heightmaps written: {totals['heightmaps_written']}")
+        log(f"Splatmaps written : {totals['splatmaps_written']}")
+        log(f"Prefabs written   : {totals['prefabs_written']}")
+        log(f"Errors            : {totals['errors']}")
         log("=" * 60)
 
-        run_ts = _utc_now_iso()
-        errors  = len(result["errors"])
-        sstatus = "warn" if errors else "ok"
-
-        # Build per-material records for the project outputs.
-        material_records: dict = {
-            str(p): {
-                "source_path": str(p),
-                "written_at":  run_ts,
-            }
-            for p in material_paths
-        }
+        sstatus = "warn" if totals["errors"] else "ok"
 
         project_manager().update_outputs(self.STAGE_KEY, {
             "last_run":        run_ts,
             "last_status":     sstatus,
             "last_input_hash": input_hash_for(self.STAGE_KEY, project_manager().current()),
-            "materials":       material_records,
-            "coverage":        {"errors": list(result.get("errors", []))},
+            "terrains":        terrain_records,
+            "coverage":        {"errors": []},
         })
 
         project_manager().update_status(self.STAGE_KEY, {
-            "last_run":          run_ts,
-            "materials_written": result["materials_written"],
-            "materials_total":   len(material_paths),
-            "textures_written":  result["textures_written"],
-            "errors":            errors,
+            "last_run":           run_ts,
+            "terrains_total":     len(terrain_paths),
+            "materials_written":  totals["materials_written"],
+            "textures_written":   totals["textures_written"],
+            "heightmaps_written": totals["heightmaps_written"],
+            "splatmaps_written":  totals["splatmaps_written"],
+            "prefabs_written":    totals["prefabs_written"],
+            "errors":             totals["errors"],
         })
 
         return (
-            f"Materials: {result['materials_written']}/{len(material_paths)}  |  "
-            f"Textures: {result['textures_written']}  |  "
-            f"Errors: {len(result['errors'])}"
+            f"Terrains: {len(terrain_paths)}  |  "
+            f"Materials: {totals['materials_written']}  |  "
+            f"Heightmaps: {totals['heightmaps_written']}  |  "
+            f"Splatmaps: {totals['splatmaps_written']}  |  "
+            f"Prefabs: {totals['prefabs_written']}  |  "
+            f"Errors: {totals['errors']}"
         )
 
     def _on_finished(self, success: bool, summary: str) -> None:
@@ -6569,12 +6714,26 @@ def get_config() -> dict:
 # single most common install issue on Windows machines with multiple Pythons.
 # =============================================================================
 
-# (import_name, pypi_name, role_text, is_hard_dep)
+# (import_name, pypi_name, role_text, is_hard_dep, platform_gate)
+# platform_gate=None → always relevant; otherwise only checked when the active
+# project platform matches (so e.g. UnityPy is only flagged for Unity sources).
 DEPENDENCIES = [
-    ("PySide6", "PySide6", "GUI framework",                              True),
-    ("yaml",    "PyYAML",  "Unity prefab / scene YAML parser",           True),
-    ("PIL",     "Pillow",  "Smoothness→Roughness texture re-bake",       False),
+    ("PySide6", "PySide6", "GUI framework",                              True,  None),
+    ("yaml",    "PyYAML",  "Unity prefab / scene YAML parser",           True,  None),
+    ("PIL",     "Pillow",  "Smoothness→Roughness texture re-bake",       False, None),
+    ("UnityPy", "UnityPy", "Unity terrain (TerrainData .asset) parser",  False, "unity"),
 ]
+
+
+def _active_platform() -> str:
+    """Lowercase active platform of the current project, defaulting to unity."""
+    try:
+        proj = project_manager().current()
+        if proj is not None:
+            return (proj.active_platform or "unity").strip().lower()
+    except Exception:
+        pass
+    return "unity"
 
 
 def _probe_dependency(import_name: str, pypi_name: str):
@@ -6602,8 +6761,13 @@ def check_dependencies() -> list:
     import importlib
     importlib.invalidate_caches()
 
+    active = _active_platform()
     results = []
-    for import_name, pypi_name, role, is_hard in DEPENDENCIES:
+    for import_name, pypi_name, role, is_hard, platform_gate in DEPENDENCIES:
+        # Skip platform-gated deps that don't apply to the active platform —
+        # UnityPy is only a concern when converting a Unity source.
+        if platform_gate is not None and platform_gate != active:
+            continue
         installed, version = _probe_dependency(import_name, pypi_name)
         results.append({
             "import_name": import_name,
@@ -6695,7 +6859,7 @@ class ConfigTab(QWidget):
 
         # Per-dependency status, refreshed by _refresh_dep_status().
         self._dep_status_labels: dict = {}
-        for import_name, pypi_name, role, is_hard in DEPENDENCIES:
+        for import_name, pypi_name, role, is_hard, platform_gate in DEPENDENCIES:
             lbl = QLabel("")
             lbl.setWordWrap(True)
             self._dep_status_labels[pypi_name] = lbl
@@ -6769,10 +6933,16 @@ class ConfigTab(QWidget):
         nothing is missing it falls back to the "install all" form so a
         fresh clone can copy a single line to bootstrap everything.
         """
+        # Platform-gated deps (e.g. UnityPy) drop out of check_dependencies()
+        # when they don't apply — hide their labels so no blank row lingers.
+        for lbl in self._dep_status_labels.values():
+            lbl.setVisible(False)
+
         missing_pypi: list = []
         for entry in check_dependencies():
             pypi_name = entry["pypi_name"]
             lbl = self._dep_status_labels[pypi_name]
+            lbl.setVisible(True)
             if entry["installed"]:
                 ver = entry["version"] or "version unknown"
                 lbl.setText(f"  ✓  {pypi_name} {ver} — {entry['role']}")
@@ -7041,21 +7211,47 @@ class MainWindow(QMainWindow):
             self._tabs.setCurrentWidget(self._dashboard_tab)
 
     def _on_patch_all(self) -> None:
-        """Mission Command Patch All clicked. Delegates to the
-        MaterialTab's existing F-9 patch path (the only stage with a
-        patch worker in F-9 scope). Future iterations will extend to
-        mesh + prefab patches when those tabs gain matching workers."""
+        """Mission Command Patch All clicked. Runs the comprehensive F-9
+        patch — dirty materials AND meshes — via its own worker, reporting
+        both. Decoupled from the per-tab buttons so it works regardless of
+        which tabs are constructed / visible for the active platform."""
         proj = project_manager().current()
         if proj is None:
             QMessageBox.warning(self, "Patch All", "Open a project first.")
             return
-        material_tab = self._tabs.widget(self._material_tab_index)
-        if material_tab is None or not hasattr(material_tab, "_start_patch"):
-            QMessageBox.warning(self, "Patch All",
-                                 "Material tab is unavailable.")
+        snapshot = _patch_settings_snapshot(proj)
+        if snapshot is None:
+            QMessageBox.warning(
+                self, "Patch All",
+                "Patch needs the Prefab Processor's source + output folders "
+                "(set on the Prefabs tab). Run the Prefab Processor at least "
+                "once before patching.",
+            )
             return
-        self._log_to_dashboard("PATCH ALL — re-emit dirty materials")
-        material_tab._start_patch()
+        source_root, output_root, material_settings, mesh_settings, state_index = snapshot
+        self._log_to_dashboard("PATCH ALL — re-emit dirty materials + meshes")
+        self._patch_all_worker = WorkerThread(
+            _run_full_patch, source_root, output_root,
+            material_settings, mesh_settings, state_index,
+        )
+        self._patch_all_worker.emitter.message.connect(self._log_to_dashboard)
+        self._patch_all_worker.finished.connect(self._on_patch_all_finished)
+        self._patch_all_worker.start()
+
+    def _on_patch_all_finished(self, success: bool, payload: str) -> None:
+        if not success:
+            QMessageBox.critical(self, "Patch All", f"Patch failed:\n{payload}")
+            return
+        info = _decode_patch_payload(payload)
+        proj = project_manager().current()
+        if proj is not None:
+            _merge_patch_state(proj, info.get("state") or {})
+        self._log_to_dashboard(_format_patch_message(info).replace("\n", "  |  "))
+        QMessageBox.information(self, "Patch All", _format_patch_message(info))
+        # Refresh dashboard cards so dirty markers + Patch-button states update.
+        dash = getattr(self, "_dashboard_tab", None)
+        if dash is not None:
+            dash.apply_project(proj)
 
     def _update_title(self, project) -> None:
         if project is None:
