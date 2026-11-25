@@ -1045,6 +1045,95 @@ class _NotesEdit(QTextEdit):
         self.blurred.emit()
 
 
+class NewProjectDialog(QDialog):
+    """New-project onboarding form. Collects the project name plus the
+    optional starting metadata — project type (source engine), source root,
+    and target O3DE project root — so a fresh project lands pre-populated.
+    Only the name is effectively required (it defaults if left blank); the
+    paths and type are optional and can be edited later in the header."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("New Project")
+        self.setMinimumWidth(520)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+
+        # --- Name ---
+        self._name_edit = QLineEdit("Untitled Project")
+        form.addRow("Name:", self._name_edit)
+
+        # --- Project type (source engine) ---
+        self._type_combo = QComboBox()
+        for engine in SourceEngine:
+            self._type_combo.addItem(engine.display_name(), engine.value)
+        form.addRow("Project Type:", self._type_combo)
+
+        # --- Source root (optional) ---
+        self._source_edit, source_btn = _path_row("Source assets root (optional)")
+        source_btn.clicked.connect(self._browse_source)
+        form.addRow("Source Root:", self._wrap_path_row(self._source_edit, source_btn))
+
+        # --- Target O3DE project / destination (optional) ---
+        self._dest_edit, dest_btn = _path_row("Target O3DE project root (optional)")
+        dest_btn.clicked.connect(self._browse_dest)
+        form.addRow("Target O3DE Project:", self._wrap_path_row(self._dest_edit, dest_btn))
+
+        hint = QLabel("Paths and type are optional — you can set them later in the project header.")
+        hint.setStyleSheet("color: #6c7086; font-size: 9pt;")
+        hint.setWordWrap(True)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(hint)
+        layout.addWidget(buttons)
+
+    # --- Helpers ---
+
+    @staticmethod
+    def _wrap_path_row(edit: QLineEdit, btn: QPushButton) -> QWidget:
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(edit)
+        row.addWidget(btn)
+        wrap = QWidget()
+        wrap.setLayout(row)
+        return wrap
+
+    def _browse_source(self) -> None:
+        start = _resolve_start_dir(self._source_edit.text().strip())
+        chosen = QFileDialog.getExistingDirectory(self, "Select source assets root", start)
+        if chosen:
+            self._source_edit.setText(chosen)
+
+    def _browse_dest(self) -> None:
+        start = _resolve_start_dir(self._dest_edit.text().strip())
+        chosen = QFileDialog.getExistingDirectory(self, "Select target O3DE project root", start)
+        if chosen:
+            self._dest_edit.setText(chosen)
+
+    # --- Result accessors ---
+
+    def project_name(self) -> str:
+        return self._name_edit.text().strip() or "Untitled Project"
+
+    def source_engine(self) -> "SourceEngine":
+        return SourceEngine.from_string(self._type_combo.currentData())
+
+    def scope_root(self) -> "Optional[Path]":
+        text = self._source_edit.text().strip()
+        return Path(text) if text else None
+
+    def o3de_project_root(self) -> "Optional[Path]":
+        text = self._dest_edit.text().strip()
+        return Path(text) if text else None
+
+
 class ProjectHeaderBanner(QFrame):
     """Top banner showing the active project's header. Replaces the in-tab
     project header that used to live on the Project tab. Holds the Project
@@ -1156,6 +1245,22 @@ class ProjectHeaderBanner(QFrame):
         self._scope_root_status = QLabel("")
         self._scope_root_status.setStyleSheet("color: #6c7086; font-size: 9pt;")
 
+        # Target O3DE project root — the engine project converted assets land
+        # in. Read by the Collisions tab to locate physxsystemconfiguration.setreg.
+        self._o3de_root_edit, o3de_browse_btn = _path_row(
+            "Target O3DE project root (blank = none set)"
+        )
+        self._o3de_root_edit.editingFinished.connect(self._on_o3de_root_changed)
+        o3de_browse_btn.clicked.connect(self._browse_o3de_root)
+        o3de_row = QHBoxLayout()
+        o3de_row.addWidget(self._o3de_root_edit)
+        o3de_row.addWidget(o3de_browse_btn)
+        o3de_row.setContentsMargins(0, 0, 0, 0)
+        o3de_wrap = QWidget()
+        o3de_wrap.setLayout(o3de_row)
+        self._o3de_root_status = QLabel("")
+        self._o3de_root_status.setStyleSheet("color: #6c7086; font-size: 9pt;")
+
         self._notes_edit = _NotesEdit()
         self._notes_edit.setPlaceholderText("Free-form notes about this conversion project…")
         self._notes_edit.setMaximumHeight(80)
@@ -1171,6 +1276,8 @@ class ProjectHeaderBanner(QFrame):
         form.addRow("Source Engine:", self._scope_combo)
         form.addRow("Source Root:",   root_wrap)
         form.addRow("",             self._scope_root_status)
+        form.addRow("Target O3DE Project:", o3de_wrap)
+        form.addRow("",             self._o3de_root_status)
         form.addRow("Notes:",       self._notes_edit)
         form.addRow("Created:",     self._created_lbl)
         form.addRow("Modified:",    self._modified_lbl)
@@ -1314,6 +1421,8 @@ class ProjectHeaderBanner(QFrame):
                 self._scope_combo.setCurrentIndex(idx if idx >= 0 else 0)
                 self._scope_root_edit.setText(str(project.scope_root) if project.scope_root else "")
                 self._refresh_scope_root_status(project)
+                self._o3de_root_edit.setText(str(project.o3de_project_root) if project.o3de_project_root else "")
+                self._refresh_o3de_root_status(project)
                 self._notes_edit.setPlainText(project.notes)
                 self._created_lbl.setText(project.created or "—")
                 self._modified_lbl.setText(project.modified or "—")
@@ -1350,6 +1459,26 @@ class ProjectHeaderBanner(QFrame):
             return
         self._scope_root_status.setText("(stages with blank source will walk this root)")
         self._scope_root_status.setStyleSheet("color: #a6e3a1; font-size: 9pt;")
+
+    def _refresh_o3de_root_status(self, project) -> None:
+        if project is None or not project.o3de_project_root:
+            self._o3de_root_status.setText("(unset — Collisions tab can't load layer names)")
+            self._o3de_root_status.setStyleSheet("color: #f9e2af; font-size: 9pt;")
+            return
+        root = Path(project.o3de_project_root)
+        if not root.exists():
+            self._o3de_root_status.setText(f"(path does not exist: {root})")
+            self._o3de_root_status.setStyleSheet("color: #f38ba8; font-size: 9pt;")
+            return
+        setreg = project.physx_setreg_path()
+        if setreg and setreg.exists():
+            self._o3de_root_status.setText("(physics config found — collision layers loadable)")
+            self._o3de_root_status.setStyleSheet("color: #a6e3a1; font-size: 9pt;")
+        else:
+            self._o3de_root_status.setText(
+                "(no Registry/physxsystemconfiguration.setreg — collision layers unavailable)"
+            )
+            self._o3de_root_status.setStyleSheet("color: #f9e2af; font-size: 9pt;")
 
     # -------------------------------------------------------------------------
     # FORM-FIELD HANDLERS
@@ -1475,6 +1604,27 @@ class ProjectHeaderBanner(QFrame):
             self._scope_root_edit.setText(chosen)
             self._on_scope_root_changed()
 
+    def _on_o3de_root_changed(self) -> None:
+        if self._suppress_emits: return
+        pm = project_manager()
+        proj = pm.current()
+        if proj is None: return
+        text = self._o3de_root_edit.text().strip()
+        new_root = Path(text) if text else None
+        if new_root == proj.o3de_project_root: return
+        proj.set_o3de_project_root(new_root)
+        self._refresh_o3de_root_status(proj)
+        pm.commit_metadata()
+
+    def _browse_o3de_root(self) -> None:
+        start = _resolve_start_dir(self._o3de_root_edit.text().strip())
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Select target O3DE project root", start,
+        )
+        if chosen:
+            self._o3de_root_edit.setText(chosen)
+            self._on_o3de_root_changed()
+
     def _on_notes_changed(self) -> None:
         if self._suppress_emits: return
         pm = project_manager()
@@ -1490,11 +1640,15 @@ class ProjectHeaderBanner(QFrame):
     # -------------------------------------------------------------------------
 
     def _on_new(self) -> None:
-        name, ok = QInputDialog.getText(
-            self, "New Project", "Project name:", text="Untitled Project",
+        dlg = NewProjectDialog(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        project_manager().new_project(
+            name=dlg.project_name(),
+            source_engine=dlg.source_engine(),
+            scope_root=dlg.scope_root(),
+            o3de_project_root=dlg.o3de_project_root(),
         )
-        if not ok: return
-        project_manager().new_project(name.strip() or "Untitled Project")
 
     def _on_open(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -3008,6 +3162,19 @@ class PrefabProcessorTab(QWidget):
         out_lay.addWidget(info_label)
         root.addWidget(out_box)
 
+        # ── Conversion Options ──────────────────────────────────────────
+        opts_box, opts_lay = _section_groupbox("Conversion Options")
+        self._strip_lods_cb = QCheckBox("Strip LODs — keep LOD0 only")
+        self._strip_lods_cb.setToolTip(
+            "Collapse Unity LODGroups to their highest-detail level (LOD0) on "
+            "import, dropping LOD1+ entities. O3DE selects LODs inside a single "
+            "model asset, so keeping every Unity LOD child as its own entity "
+            "renders them all at once. On by default."
+        )
+        self._strip_lods_cb.toggled.connect(self._on_strip_lods_changed)
+        opts_lay.addWidget(self._strip_lods_cb)
+        root.addWidget(opts_box)
+
         # ── Processing Log ──────────────────────────────────────────────
         self._log_edit = _log_widget()
         root.addWidget(_fill_section("Processing Log", self._log_edit), stretch=1)
@@ -3045,6 +3212,11 @@ class PrefabProcessorTab(QWidget):
         self._source_edit.setText(cfg.get("source_path", ""))
         self._output_edit.setText(cfg.get("output_path", ""))
         self._selected_prefabs = set(cfg.get("selected_prefabs", []))
+        self._suppress_prefab_signals = True
+        try:
+            self._strip_lods_cb.setChecked(bool(cfg.get("strip_lods", True)))
+        finally:
+            self._suppress_prefab_signals = False
         self._refresh_effective_source_label()
         self._refresh_prefab_list()
         self._refresh_usage_summary(project)
@@ -3071,6 +3243,7 @@ class PrefabProcessorTab(QWidget):
             "source_path":      self._source_edit.text(),
             "selected_prefabs": sorted(self._selected_prefabs),
             "output_path":      self._output_edit.text(),
+            "strip_lods":       self._strip_lods_cb.isChecked(),
         }
 
     def _save_settings(self) -> None:
@@ -3079,6 +3252,13 @@ class PrefabProcessorTab(QWidget):
         if pm.current() is None:
             return
         pm.update_stage(self.STAGE_KEY, self._collect_stage_settings())
+
+    def _on_strip_lods_changed(self, checked: bool) -> None:
+        """Prefab-stage toggle: collapse Unity LODGroups to LOD0 on import,
+        dropping LOD1+ entities (O3DE selects LODs inside one model asset)."""
+        if self._suppress_prefab_signals:
+            return
+        self._save_settings()
 
     # -------------------------------------------------------------------------
     # BROWSE HELPERS
@@ -3348,10 +3528,14 @@ class PrefabProcessorTab(QWidget):
                               if proj else None)
         mesh_settings     = (copy.deepcopy(proj.stage_settings("mesh_processor"))
                               if proj else None)
+        collision_settings = (copy.deepcopy(proj.stage_settings("collision_processor"))
+                              if proj else None)
+        strip_lods        = (bool(proj.stage_settings("asset_processor").get("strip_lods", True))
+                              if proj else True)
 
         self._worker = WorkerThread(
             self._do_processing, source, output, resolved,
-            material_settings, mesh_settings,
+            material_settings, mesh_settings, collision_settings, strip_lods,
         )
         self._worker.emitter.message.connect(self._log)
         self._worker.finished.connect(self._on_finished)
@@ -3360,6 +3544,8 @@ class PrefabProcessorTab(QWidget):
     def _do_processing(self, source_path: str, output_path: str,
                        prefab_files: list,
                        material_settings: dict, mesh_settings: dict,
+                       collision_settings: dict,
+                       strip_lods: bool,
                        log) -> str:
         from integrated_asset_processor import IntegratedAssetProcessor
 
@@ -3375,6 +3561,8 @@ class PrefabProcessorTab(QWidget):
             convert_smoothness_to_roughness=cfg["convert_smoothness_to_roughness"],
             material_settings=material_settings,
             mesh_settings=mesh_settings,
+            collision_settings=collision_settings,
+            strip_lods=strip_lods,
         )
 
         log(f"\nProcessing {len(prefab_files)} selected Unity prefab(s)")
@@ -6258,6 +6446,546 @@ class MaterialTab(QWidget):
 # TAB 5 — TERRAIN
 # =============================================================================
 
+# =============================================================================
+# COLLISION CHOICE FIELD  (F-Collision)
+# =============================================================================
+
+# Per-collider fields edited on both the Defaults and the Selection-Override
+# forms. `kind` drives value parsing: "layer" → int index, "group" → str UUID.
+_COLLISION_FIELDS = [
+    ("collision_layer",    "Collision layer (from)",     "layer"),
+    ("collision_group_id", "Collides-with group (to)",   "group"),
+]
+
+
+class _CollisionChoiceField(QComboBox):
+    """Editable combo for a collision layer index ("layer") or group UUID
+    ("group"). Item userData carries the stored value: None (engine default),
+    an int layer index, or a str group UUID. Editable so a raw index / UUID
+    can still be typed when the target O3DE project's names aren't loaded.
+    Shows '…' for a mixed multi-selection.
+
+    Mirrors the _FloatField API used by MeshTab: set_common / set_disabled_blank
+    plus a `committed` signal carrying the resolved value."""
+
+    committed = Signal(object)          # None | int | str
+    _MIXED = "…"
+
+    def __init__(self, kind: str):
+        super().__init__()
+        self._kind = kind               # "layer" | "group"
+        self._suppress = False
+        self.setEditable(True)
+        self.setInsertPolicy(QComboBox.NoInsert)
+        # `activated` is user-only (programmatic changes don't fire it);
+        # editingFinished catches a typed raw value on focus-out.
+        self.activated.connect(lambda *_: self._commit())
+        self.lineEdit().editingFinished.connect(self._commit)
+
+    def set_choices(self, choices: list) -> None:
+        """`choices`: list of (value, label). The engine-default entry is
+        always prepended."""
+        self._suppress = True
+        self.clear()
+        self.addItem("(engine default)", None)
+        for value, label in choices:
+            self.addItem(label, value)
+        self._suppress = False
+
+    def set_disabled_blank(self) -> None:
+        self._suppress = True
+        self.setEnabled(False)
+        self.setCurrentIndex(0)
+        self.lineEdit().setText("")
+        self._suppress = False
+
+    def set_common(self, value) -> None:
+        """`value`: None (engine default) | int | str | _MIXED."""
+        self._suppress = True
+        self.setEnabled(True)
+        if value == self._MIXED:
+            self.setCurrentIndex(-1)
+            self.lineEdit().setText(self._MIXED)
+        else:
+            idx = self.findData(value)
+            if idx >= 0:
+                self.setCurrentIndex(idx)
+            else:
+                self.setCurrentIndex(-1)
+                self.lineEdit().setText("" if value is None else str(value))
+        self._suppress = False
+
+    def current_value(self):
+        """Resolve the current selection / typed text to None | int | str."""
+        idx  = self.currentIndex()
+        text = self.currentText().strip()
+        # A real item is selected and untouched → use its stored data.
+        if idx >= 0 and self.itemText(idx) == text:
+            return self.itemData(idx)
+        if text in ("", "(engine default)", self._MIXED):
+            return None
+        if self._kind == "layer":
+            head = text.split("—")[0].split("-")[0].strip()  # accept "N — Name"
+            try:
+                return int(head)
+            except ValueError:
+                return None
+        return text                                          # group → raw UUID
+
+    def _commit(self) -> None:
+        if self._suppress:
+            return
+        self.committed.emit(self.current_value())
+
+
+class CollisionTab(QWidget):
+    """Collision preprocessing — F-Collision.
+
+    Layout (top to bottom):
+      1. Default Collision Settings — global layer ("from") + group ("to")
+         stamped onto every collider unless an override exists. A button
+         loads real layer / group names from the target O3DE project's
+         physxsystemconfiguration.setreg (read-only).
+      2. Collision Object Inventory — read-only list of collider-bearing
+         entities from `outputs.asset_processor.collision_objects`.
+         Multi-selectable; ★ marks objects with overrides.
+      3. Selection Overrides — appears when ≥1 object is selected; common
+         values display, `…` for mixed; editing applies to all selected.
+      4. Last Run Details.
+
+    Collision objects are NEVER de-selectable; selection is for editing
+    overrides only.
+    """
+
+    STAGE_KEY = "collision_processor"
+
+    def __init__(self):
+        super().__init__()
+        self._suppress_field_signals = False
+        self._build_ui()
+        pm = project_manager()
+        pm.project_changed.connect(self.apply_project)
+        pm.status_changed.connect(self._on_status_changed)
+        self.apply_project(pm.current())
+
+    # -------------------------------------------------------------------------
+    # UI
+    # -------------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        content = QWidget()
+        root = QVBoxLayout(content)
+        root.setSpacing(12)
+        root.setContentsMargins(16, 16, 16, 16)
+
+        # ── Default Collision Settings ──────────────────────────────────
+        defaults_box, defaults_lay = _section_groupbox("Default Collision Settings")
+        info = QLabel(
+            "Default collision layer (\"from\") and group (\"to\") stamped onto "
+            "every collider unless an object below has its own override. "
+            "Leave a field at \"(engine default)\" to emit nothing for it "
+            "(O3DE keeps its built-in default)."
+        )
+        info.setStyleSheet("color: #6c7086; font-size: 9pt;")
+        info.setWordWrap(True)
+        defaults_lay.addWidget(info)
+
+        # Physics-vocabulary loader (reads the target O3DE project's setreg).
+        load_row = QHBoxLayout()
+        self._reload_btn = QPushButton("Reload physics layers")
+        self._reload_btn.setToolTip(
+            "Read collision layer + group names from the target O3DE project's "
+            "Registry/physxsystemconfiguration.setreg (set the project root in "
+            "the header), or from an override .setreg path."
+        )
+        self._reload_btn.clicked.connect(self._reload_physics_layers)
+        load_row.addWidget(self._reload_btn)
+        load_row.addStretch(1)
+        defaults_lay.addLayout(load_row)
+
+        self._vocab_status = QLabel("")
+        self._vocab_status.setStyleSheet("color: #6c7086; font-size: 9pt;")
+        self._vocab_status.setWordWrap(True)
+        defaults_lay.addWidget(self._vocab_status)
+
+        self._default_fields = self._build_field_form(defaults_lay, scope="defaults")
+        root.addWidget(defaults_box)
+
+        # ── Collision Object Inventory ──────────────────────────────────
+        inv_box, inv_lay = _section_groupbox("Collision Object Inventory")
+        inv_info = QLabel(
+            "Collider-bearing entities the Prefab Processor produced. Selection "
+            "is for editing overrides only. ★ marks objects with an override."
+        )
+        inv_info.setStyleSheet("color: #6c7086; font-size: 9pt;")
+        inv_info.setWordWrap(True)
+        inv_lay.addWidget(inv_info)
+
+        self._inv_list = QListWidget()
+        _bound_list_height(self._inv_list, min_h=140, max_h=260)
+        self._inv_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self._inv_list.itemSelectionChanged.connect(self._on_selection_changed)
+        inv_lay.addWidget(self._inv_list)
+
+        self._inv_summary = QLabel("")
+        self._inv_summary.setStyleSheet("color: #6c7086; font-size: 9pt;")
+        self._inv_summary.setWordWrap(True)
+        inv_lay.addWidget(self._inv_summary)
+        root.addWidget(inv_box)
+
+        # ── Selection Overrides ─────────────────────────────────────────
+        self._override_box, override_lay = _section_groupbox("Selection Overrides")
+        self._override_header = QLabel("Select one or more collision objects above to edit.")
+        self._override_header.setStyleSheet("color: #6c7086; font-size: 9pt;")
+        self._override_header.setWordWrap(True)
+        override_lay.addWidget(self._override_header)
+
+        self._override_fields = self._build_field_form(override_lay, scope="override")
+
+        self._clear_override_btn = QPushButton("Clear Override for Selection")
+        self._clear_override_btn.clicked.connect(self._clear_override_for_selection)
+        self._clear_override_btn.setEnabled(False)
+        clear_row = QHBoxLayout()
+        clear_row.addStretch(1)
+        clear_row.addWidget(self._clear_override_btn)
+        override_lay.addLayout(clear_row)
+        root.addWidget(self._override_box)
+
+        # ── Last Run Details ────────────────────────────────────────────
+        self._last_run_box = _section_groupbox("Last Run Details")[0]
+        self._last_run_box_lay = self._last_run_box.layout()
+        self._last_run_box.setVisible(False)
+        root.addWidget(self._last_run_box)
+
+        outer.addWidget(_scroll_wrap(content))
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        proj = project_manager().current()
+        if proj is not None:
+            self.apply_project(proj)
+
+    def _build_field_form(self, parent_lay: QVBoxLayout, *, scope: str) -> dict:
+        """One _CollisionChoiceField per entry in `_COLLISION_FIELDS`."""
+        widgets: dict = {}
+        form = QFormLayout()
+        form.setSpacing(8)
+        form.setContentsMargins(0, 4, 0, 4)
+        for key, label, kind in _COLLISION_FIELDS:
+            field = _CollisionChoiceField(kind)
+            field.committed.connect(
+                lambda value, k=key, s=scope: self._on_field_changed(s, k, value)
+            )
+            widgets[key] = field
+            form.addRow(label, field)
+        parent_lay.addLayout(form)
+        return widgets
+
+    # -------------------------------------------------------------------------
+    # APPLY / REFRESH
+    # -------------------------------------------------------------------------
+
+    def apply_project(self, project) -> None:
+        self._refresh_choices(project)
+        self._refresh_vocab_status(project)
+        self._refresh_defaults_fields(project)
+        self._refresh_inventory(project)
+        self._refresh_override_fields()
+        self._refresh_last_run(project)
+
+    def _on_status_changed(self, stage_key: str) -> None:
+        if stage_key not in ("asset_processor", self.STAGE_KEY):
+            return
+        self.apply_project(project_manager().current())
+
+    def _layer_choices(self, cfg: dict) -> list:
+        names = cfg.get("layer_names", {}) or {}
+        # Sorted by numeric index; label "N — Name".
+        out = []
+        for idx_str, name in sorted(names.items(), key=lambda kv: int(kv[0])):
+            out.append((int(idx_str), f"{idx_str} — {name}"))
+        return out
+
+    def _group_choices(self, cfg: dict) -> list:
+        names = cfg.get("group_names", {}) or {}
+        return [(uuid, name) for uuid, name in
+                sorted(names.items(), key=lambda kv: kv[1].lower())]
+
+    def _refresh_choices(self, project) -> None:
+        """Rebuild the combo item lists for all four fields from the stage's
+        cached layer_names / group_names."""
+        cfg = project.stage_settings(self.STAGE_KEY) if project else {}
+        layer_choices = self._layer_choices(cfg)
+        group_choices = self._group_choices(cfg)
+        self._suppress_field_signals = True
+        try:
+            for fields in (self._default_fields, self._override_fields):
+                fields["collision_layer"].set_choices(layer_choices)
+                fields["collision_group_id"].set_choices(group_choices)
+        finally:
+            self._suppress_field_signals = False
+
+    def _refresh_vocab_status(self, project) -> None:
+        if project is None:
+            self._vocab_status.setText("(no project loaded)")
+            return
+        cfg = project.stage_settings(self.STAGE_KEY)
+        n_layers = len(cfg.get("layer_names", {}) or {})
+        n_groups = len(cfg.get("group_names", {}) or {})
+        if n_layers or n_groups:
+            self._vocab_status.setText(
+                f"{n_layers} layer(s) · {n_groups} group(s) loaded from the "
+                f"target O3DE project. Reload after editing the project's physics config."
+            )
+            self._vocab_status.setStyleSheet("color: #a6e3a1; font-size: 9pt;")
+        else:
+            self._vocab_status.setText(
+                "No physics layers loaded — set a Target O3DE Project in the "
+                "header (or an override .setreg) and click Reload to choose by "
+                "name. You can still type a raw index / group UUID."
+            )
+            self._vocab_status.setStyleSheet("color: #f9e2af; font-size: 9pt;")
+
+    def _reload_physics_layers(self) -> None:
+        from targets.o3de.collision_config import parse_physx_collision_config
+        pm = project_manager()
+        proj = pm.current()
+        if proj is None:
+            QMessageBox.information(self, "Reload physics layers", "Open a project first.")
+            return
+        cfg = dict(proj.stage_settings(self.STAGE_KEY))
+        override = (cfg.get("setreg_override") or "").strip()
+        setreg = Path(override) if override else proj.physx_setreg_path()
+        if not setreg:
+            QMessageBox.warning(
+                self, "Reload physics layers",
+                "Set a Target O3DE Project in the project header (or a "
+                "setreg_override path) so the collision layers can be read.",
+            )
+            return
+        layer_names, group_names = parse_physx_collision_config(setreg)
+        if not layer_names and not group_names:
+            QMessageBox.warning(
+                self, "Reload physics layers",
+                f"No collision layers/groups found in:\n{setreg}\n\n"
+                "Check the path points at a valid physxsystemconfiguration.setreg.",
+            )
+            return
+        cfg["layer_names"] = layer_names
+        cfg["group_names"] = group_names
+        pm.update_stage(self.STAGE_KEY, cfg)
+        self.apply_project(proj)
+
+    def _refresh_defaults_fields(self, project) -> None:
+        if project is None:
+            return
+        cfg = project.stage_settings(self.STAGE_KEY)
+        defaults = cfg.get("defaults", {}) or {}
+        self._suppress_field_signals = True
+        try:
+            self._default_fields["collision_layer"].set_common(defaults.get("collision_layer"))
+            self._default_fields["collision_group_id"].set_common(defaults.get("collision_group_id"))
+        finally:
+            self._suppress_field_signals = False
+
+    def _refresh_inventory(self, project) -> None:
+        self._inv_list.clear()
+        if project is None:
+            self._inv_summary.setText("(no project loaded)")
+            return
+        ap = project.outputs.get("asset_processor", {})
+        objects = ap.get("collision_objects", {}) or {}
+        cfg = project.stage_settings(self.STAGE_KEY)
+        overrides = cfg.get("overrides", {}) or {}
+
+        if not objects:
+            self._inv_summary.setText(
+                "No collision objects yet. Mark prefabs and run the Prefab Processor."
+            )
+            return
+
+        override_count = 0
+        for key, rec in sorted(objects.items(),
+                               key=lambda kv: str(kv[1].get("entity_name", "")).lower()):
+            has_override = key in overrides
+            if has_override:
+                override_count += 1
+            prefix = "★ " if has_override else "   "
+            name    = rec.get("entity_name", "(unnamed)")
+            prefab  = rec.get("prefab_name", "")
+            summary = rec.get("collider_summary", "")
+            text = f"{prefix}{name}  ·  {prefab}  ·  {summary}"
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, key)
+            tip = [f"Entity: {name}", f"Prefab: {prefab}", f"Colliders: {summary}",
+                   f"Key: {key}"]
+            if has_override:
+                tip.append("Override applied")
+                f = item.font(); f.setBold(True); item.setFont(f)
+                item.setForeground(Qt.cyan)
+            item.setToolTip("\n".join(tip))
+            self._inv_list.addItem(item)
+
+        self._inv_summary.setText(
+            f"{len(objects)} collision object(s) · {override_count} with override(s)"
+        )
+
+    def _selected_keys(self) -> list:
+        keys = []
+        for item in self._inv_list.selectedItems():
+            k = item.data(Qt.UserRole)
+            if k:
+                keys.append(k)
+        return keys
+
+    def _on_selection_changed(self) -> None:
+        self._refresh_override_fields()
+
+    def _refresh_override_fields(self) -> None:
+        keys = self._selected_keys()
+        proj = project_manager().current()
+        if not keys or proj is None:
+            self._override_header.setText("Select one or more collision objects above to edit.")
+            self._clear_override_btn.setEnabled(False)
+            for key, _, _ in _COLLISION_FIELDS:
+                self._override_fields[key].set_disabled_blank()
+            return
+
+        cfg = proj.stage_settings(self.STAGE_KEY)
+        defaults  = cfg.get("defaults",  {}) or {}
+        overrides = cfg.get("overrides", {}) or {}
+
+        n_over = sum(1 for k in keys if k in overrides)
+        self._override_header.setText(
+            f"{len(keys)} object(s) selected · {n_over} with override(s) · "
+            f"editing applies to all selected"
+        )
+        self._clear_override_btn.setEnabled(n_over > 0)
+
+        self._suppress_field_signals = True
+        try:
+            for key, _, _ in _COLLISION_FIELDS:
+                # Effective value per selected object: override → default.
+                values = [overrides.get(k, {}).get(key, defaults.get(key)) for k in keys]
+                distinct = {repr(v) for v in values}
+                self._override_fields[key].set_common(
+                    values[0] if len(distinct) == 1 else _CollisionChoiceField._MIXED
+                )
+        finally:
+            self._suppress_field_signals = False
+
+    # -------------------------------------------------------------------------
+    # FIELD EDIT HANDLERS
+    # -------------------------------------------------------------------------
+
+    def _on_field_changed(self, scope: str, key, value) -> None:
+        if self._suppress_field_signals:
+            return
+        pm = project_manager()
+        proj = pm.current()
+        if proj is None:
+            return
+        cfg = dict(proj.stage_settings(self.STAGE_KEY))
+        defaults  = dict(cfg.get("defaults",  {}) or {})
+        overrides = dict(cfg.get("overrides", {}) or {})
+
+        if scope == "defaults":
+            defaults[key] = value
+        else:
+            for k in self._selected_keys():
+                entry = dict(overrides.get(k, {}))
+                entry[key] = value
+                overrides[k] = entry
+
+        overrides = self._prune_redundant_overrides(overrides, defaults)
+        cfg["defaults"]  = defaults
+        cfg["overrides"] = overrides
+        pm.update_stage(self.STAGE_KEY, cfg)
+
+        self._refresh_inventory(proj)
+        self._refresh_override_fields()
+
+    @classmethod
+    def _prune_redundant_overrides(cls, overrides: dict, defaults: dict) -> dict:
+        """Drop any object whose override entry equals `defaults` on every key
+        it carries (and empty entries). Keeps the ★ marker honest."""
+        out = {}
+        for key, entry in (overrides or {}).items():
+            if not isinstance(entry, dict) or not entry:
+                continue
+            if all(entry[k] == defaults.get(k) for k in entry):
+                continue
+            out[key] = entry
+        return out
+
+    def _clear_override_for_selection(self) -> None:
+        pm = project_manager()
+        proj = pm.current()
+        if proj is None:
+            return
+        cfg = dict(proj.stage_settings(self.STAGE_KEY))
+        overrides = dict(cfg.get("overrides", {}) or {})
+        for k in self._selected_keys():
+            overrides.pop(k, None)
+        cfg["overrides"] = overrides
+        pm.update_stage(self.STAGE_KEY, cfg)
+        self._refresh_inventory(proj)
+        self._refresh_override_fields()
+
+    # -------------------------------------------------------------------------
+    # LAST-RUN DETAILS
+    # -------------------------------------------------------------------------
+
+    def _refresh_last_run(self, project) -> None:
+        while self._last_run_box_lay.count():
+            item = self._last_run_box_lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        if project is None:
+            self._last_run_box.setVisible(False)
+            return
+        outputs = project.outputs.get("asset_processor", {})
+        objects = outputs.get("collision_objects", {}) or {}
+        last_run = outputs.get("last_run")
+        if not last_run or not objects:
+            self._last_run_box.setVisible(False)
+            return
+        cfg = project.stage_settings(self.STAGE_KEY)
+        defaults  = cfg.get("defaults",  {}) or {}
+        overrides = cfg.get("overrides", {}) or {}
+
+        header = QLabel(
+            f"{len(objects)} collision object(s) · Last Prefab Processor run {last_run}"
+        )
+        header.setStyleSheet("color: #a6e3a1; font-size: 9pt; font-weight: bold;")
+        self._last_run_box_lay.addWidget(header)
+        shown_limit = 20
+        for i, (key, rec) in enumerate(sorted(
+                objects.items(), key=lambda kv: str(kv[1].get("entity_name", "")).lower())):
+            if i >= shown_limit:
+                break
+            eff = overrides.get(key, {})
+            layer = eff.get("collision_layer", defaults.get("collision_layer"))
+            group = eff.get("collision_group_id", defaults.get("collision_group_id"))
+            layer_txt = "engine default" if layer is None else f"layer {layer}"
+            group_txt = "engine default" if not group else "custom group"
+            label = QLabel(f"  • {rec.get('entity_name','?')}  →  {layer_txt} / {group_txt}")
+            label.setStyleSheet("color: #cdd6f4; font-size: 9pt;")
+            label.setWordWrap(True)
+            self._last_run_box_lay.addWidget(label)
+        overflow = len(objects) - shown_limit
+        if overflow > 0:
+            more = QLabel(f"  … and {overflow} more")
+            more.setStyleSheet("color: #6c7086; font-size: 9pt; font-style: italic;")
+            self._last_run_box_lay.addWidget(more)
+        self._last_run_box.setVisible(True)
+
+
 class TerrainTab(QWidget):
     """
     Converts a user-picked set of Unity .mat files into O3DE terrain detail
@@ -7027,17 +7755,19 @@ class MainWindow(QMainWindow):
         prefab_idx   = self._tabs.addTab(PrefabProcessorTab(), "Prefabs")   # 2
         mesh_idx     = self._tabs.addTab(MeshTab(),            "Meshes")    # 3
         material_idx = self._tabs.addTab(MaterialTab(),        "Materials") # 4
-        terrain_idx  = self._tabs.addTab(TerrainTab(),         "Terrain")   # 5
-        self._config_index = self._tabs.addTab(ConfigTab(),    "Config")    # 6
+        collision_idx = self._tabs.addTab(CollisionTab(),      "Collisions")# 5
+        terrain_idx  = self._tabs.addTab(TerrainTab(),         "Terrain")   # 6
+        self._config_index = self._tabs.addTab(ConfigTab(),    "Config")    # 7
         self._tabs.tabBar().setTabVisible(self._config_index, False)
         self._tabs.setCurrentIndex(start_tab)
 
         self._STAGE_TAB_INDEX = {
-            "scene_converter":    scene_idx,
-            "asset_processor":    prefab_idx,
-            "mesh_processor":     mesh_idx,
-            "material_processor": material_idx,
-            "terrain_processor":  terrain_idx,
+            "scene_converter":     scene_idx,
+            "asset_processor":     prefab_idx,
+            "mesh_processor":      mesh_idx,
+            "material_processor":  material_idx,
+            "collision_processor": collision_idx,
+            "terrain_processor":   terrain_idx,
         }
         # Follow-up 6 — per-platform tab gating. Map each tab to its
         # SUPPORTED_TABS key so platform switches can show/hide tabs
@@ -7049,6 +7779,7 @@ class MainWindow(QMainWindow):
             prefab_idx:              "prefabs",
             mesh_idx:                "meshes",
             material_idx:            "materials",
+            collision_idx:           "collisions",
             terrain_idx:             "terrain",
             self._config_index:      "config",
         }

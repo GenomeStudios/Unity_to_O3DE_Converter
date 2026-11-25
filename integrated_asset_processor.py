@@ -849,8 +849,10 @@ class IntegratedAssetProcessor:
                  *,
                  material_settings: Optional[Dict] = None,
                  mesh_settings:     Optional[Dict] = None,
+                 collision_settings: Optional[Dict] = None,
                  scope_root:        Optional[Path] = None,
                  state_index:       Optional[Dict] = None,
+                 strip_lods:        bool = True,
                  platform=None):
         self.unity_assets_root = unity_assets_root
         self.output_root = output_root
@@ -883,6 +885,13 @@ class IntegratedAssetProcessor:
         # last-emitted per-asset fingerprints for the F-9.I.5 patch worker.
         self._material_settings = material_settings or {}
         self._mesh_settings     = mesh_settings or {}
+        # F-Collision: {defaults, overrides, layer_names, group_names,
+        # setreg_override}. None falls back to "no collision stamping" so older
+        # call sites keep emitting engine-default colliders.
+        self._collision_settings = collision_settings or {}
+        # Prefab-stage toggle (asset_processor.strip_lods): collapse Unity
+        # LODGroups to a single LOD level on parse. See _parser_context.
+        self._strip_lods        = strip_lods
         self._scope_root        = scope_root
         self._state_index_in    = state_index or {}
         # F-9.I.4 — per-asset emission fingerprints. Populated as each
@@ -924,6 +933,10 @@ class IntegratedAssetProcessor:
         # are also kept in `self._entity_map_cache` for cross-prefab
         # override reads within the same run.
         self._project_prefab_records: Dict[str, Dict] = {}
+        # F-Collision: per-collider-bearing-entity inventory for the
+        # Collisions tab, keyed "<prefab_guid>:<entity_file_id>". Surfaced via
+        # to_outputs() under `collision_objects`.
+        self._collision_objects: Dict[str, Dict] = {}
         # F-6: per-material metadata (shader name, source path, bound
         # texture slots). Surfaced on the Materials tab so the user can
         # see which shaders need a mapping.
@@ -1266,6 +1279,14 @@ class IntegratedAssetProcessor:
             output_name = prefab_path.stem
             output_path = self.prefabs_dir / f"{output_name}.prefab"
             
+            # F-Collision — resolve per-entity collision layer/group from the
+            # collision_processor stage (defaults + per-object overrides),
+            # keyed "<prefab_guid>:<file_id>". prefab_guid is resolved here so
+            # both the stamping and the later state/inventory records share it.
+            prefab_guid = self.asset_db.path_to_guid(prefab_path) or str(prefab_path)
+            collision_config_mapping = self._build_collision_config_mapping(
+                prefab_guid, game_objects)
+
             self._create_o3de_prefab(
                 root_go,
                 game_objects,
@@ -1275,13 +1296,13 @@ class IntegratedAssetProcessor:
                 fbx_material_labels,
                 output_path,
                 collider_pxmesh_mapping,
+                collision_config_mapping,
             )
 
             # F-9.I.4 — record the prefab's fingerprint after every
             # dependent material/mesh has its own entry. The prefab hash
             # folds in their input_hashes so a profile or mesh-override
             # change downstream marks this prefab dirty too.
-            prefab_guid = self.asset_db.path_to_guid(prefab_path) or str(prefab_path)
             self._record_prefab_state(
                 prefab_guid,
                 prefab_path,
@@ -1289,6 +1310,10 @@ class IntegratedAssetProcessor:
                 sorted(g for g in all_material_guids if g),
                 sorted(g for g in all_mesh_guids if g),
             )
+
+            # F-Collision — record every collider-bearing entity so the
+            # Collisions tab can offer per-object layer/group overrides.
+            self._record_collision_objects(prefab_guid, prefab_path, game_objects)
 
             self.log(f"  ✓ Created O3DE prefab: {output_path.name}")
             return True
@@ -1554,6 +1579,78 @@ class IntegratedAssetProcessor:
             )
             summary["meshes_emitted"].append(guid)
 
+    # =========================================================================
+    # COLLISION OBJECT INVENTORY  (F-Collision)
+    # =========================================================================
+
+    # Unity collider type → short label for the Collisions-tab inventory.
+    _COLLIDER_LABELS = {
+        'BoxCollider':     'Box',
+        'SphereCollider':  'Sphere',
+        'CapsuleCollider': 'Capsule',
+        'MeshCollider':    'Mesh',
+    }
+
+    def _build_collision_config_mapping(self, prefab_guid: str,
+                                        game_objects: Dict) -> Dict[str, Dict]:
+        """Resolve each collider-bearing entity's effective collision layer
+        ("from") and group ("to") and return ``{file_id: {"layer","group"}}``.
+
+        Effective value per field: per-object override → project default →
+        None. An entity whose effective layer AND group are both unset is
+        omitted entirely, so colliders keep their engine defaults (byte-compat
+        with pre-F-Collision output)."""
+        settings  = self._collision_settings or {}
+        defaults  = settings.get("defaults")  or {}
+        overrides = settings.get("overrides") or {}
+        def_layer = defaults.get("collision_layer")
+        def_group = defaults.get("collision_group_id")
+
+        mapping: Dict[str, Dict] = {}
+        for go in game_objects.values():
+            if not go.colliders:
+                continue
+            ov    = overrides.get(f"{prefab_guid}:{go.file_id}") or {}
+            layer = ov.get("collision_layer",    def_layer)
+            group = ov.get("collision_group_id", def_group)
+            if layer is None and not group:
+                continue
+            mapping[str(go.file_id)] = {"layer": layer, "group": group}
+        return mapping
+
+    def _record_collision_objects(self, prefab_guid: str, prefab_path,
+                                  game_objects: Dict) -> None:
+        """Record one inventory entry per collider-bearing GameObject, keyed
+        `"<prefab_guid>:<file_id>"`. The Collisions tab reads these to offer
+        per-object collision-layer / group overrides."""
+        from collections import Counter
+
+        prefab_name = prefab_path.stem
+        for go in game_objects.values():
+            if not go.colliders:
+                continue
+
+            labels = []
+            for c in go.colliders:
+                label = self._COLLIDER_LABELS.get(c.get('type'), c.get('type') or 'Collider')
+                if c.get('type') == 'MeshCollider' and c.get('convex'):
+                    label += ' (convex)'
+                if c.get('is_trigger'):
+                    label += ' (trigger)'
+                labels.append(label)
+            counts = Counter(labels)
+            summary = ', '.join(f"{lbl} ×{n}" if n > 1 else lbl
+                                for lbl, n in counts.items())
+
+            self._collision_objects[f"{prefab_guid}:{go.file_id}"] = {
+                "prefab_guid":     prefab_guid,
+                "prefab_name":     prefab_name,
+                "entity_file_id":  str(go.file_id),
+                "entity_name":     go.name,
+                "collider_types":  [c.get('type') for c in go.colliders],
+                "collider_summary": summary,
+            }
+
     def to_outputs(self) -> dict:
         """Consolidate this run's bookkeeping into the dict the project
         file stores under `outputs.asset_processor`. Replaces the old
@@ -1571,6 +1668,7 @@ class IntegratedAssetProcessor:
             "materials":         dict(self.asset_index["materials"]),
             "material_metadata": dict(self._material_metadata),
             "meshes":             dict(self.asset_index["meshes"]),
+            "collision_objects": dict(self._collision_objects),
             "coverage":           self.coverage.to_dict(),
         }
 
@@ -1594,6 +1692,7 @@ class IntegratedAssetProcessor:
             log=self.log,
             coverage=self.coverage,
             component_dispatch=self.component_dispatch,
+            strip_lods=self._strip_lods,
         )
 
     def _parse_unity_prefab(self, prefab_path: Path) -> Tuple[Dict[str, GameObject], Dict[str, str]]:
@@ -2215,12 +2314,14 @@ class IntegratedAssetProcessor:
                            mesh_mapping: Dict,
                            fbx_material_labels: Dict[str, List[str]],
                            output_path: Path,
-                           collider_pxmesh_mapping: Optional[Dict] = None) -> None:
+                           collider_pxmesh_mapping: Optional[Dict] = None,
+                           collision_config_mapping: Optional[Dict] = None) -> None:
         from targets.o3de.prefab_writer import create_o3de_prefab
         return create_o3de_prefab(
             self, root_go, all_game_objects, transform_map,
             material_mapping, mesh_mapping, fbx_material_labels, output_path,
             collider_pxmesh_mapping or {},
+            collision_config_mapping or {},
         )
 
     def _write_entity_map_sidecar(self, prefab_output_path: Path,

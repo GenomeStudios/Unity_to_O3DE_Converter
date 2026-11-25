@@ -87,7 +87,7 @@ class SourcePlatform(ABC):
 
     SUPPORTED_TABS: List[str] = [
         "dashboard", "scenes", "prefabs", "meshes", "materials",
-        "terrain", "config",
+        "collisions", "terrain", "config",
     ]
     """Tab keys this platform exposes in the UI. The MainWindow toggles
     tab visibility based on this list when the active platform changes.

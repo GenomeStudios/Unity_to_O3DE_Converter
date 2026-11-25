@@ -15,7 +15,7 @@ Resolution order for the .pxmesh asset hint:
 from typing import Callable, Dict, List
 
 from .base import ComponentProcessor, ProcessingContext
-from .box_collider import _resolve_target
+from .box_collider import _resolve_target, _apply_collision_config
 
 
 class MeshColliderProcessor(ComponentProcessor):
@@ -100,6 +100,7 @@ def _write_mesh_collider(components: Dict, collider: Dict, go,
     }
     if is_trigger:
         collider_cfg['Trigger'] = True
+    _apply_collision_config(collider_cfg, go, ctx)
 
     mesh_comp: Dict = {
         '$type': 'EditorMeshColliderComponent',

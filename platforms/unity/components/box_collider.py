@@ -57,6 +57,28 @@ def _resolve_target(
     return child['Components'], child_id
 
 
+def _apply_collision_config(collider_cfg: Dict, go, ctx: ProcessingContext) -> None:
+    """Stamp CollisionLayer ("from") + CollisionGroupId ("to") onto a
+    ColliderConfiguration from the entity's resolved collision config
+    (ctx.collision_config[go.file_id]). A None layer or empty group is left
+    unset so the collider keeps its O3DE engine default — shared by all four
+    collider writers (box / sphere / capsule / mesh).
+
+    Serialization (engine-verified, ColliderConfiguration v7):
+      CollisionLayer   → {"Index":   <u8 0..63>}
+      CollisionGroupId → {"GroupId": "<AZ::Uuid>"}
+    """
+    cfg = ctx.collision_config.get(str(go.file_id))
+    if not cfg:
+        return
+    layer = cfg.get("layer")
+    group = cfg.get("group")
+    if layer is not None:
+        collider_cfg['CollisionLayer'] = {'Index': layer}
+    if group:
+        collider_cfg['CollisionGroupId'] = {'GroupId': group}
+
+
 # =============================================================================
 # BOX COLLIDER PROCESSOR
 # =============================================================================
@@ -123,7 +145,7 @@ class BoxColliderProcessor(ComponentProcessor):
             if child_id:
                 child_ids.append(child_id)
 
-            _write_box_shape(target_comps, collider, ctx)
+            _write_box_shape(target_comps, collider, go, ctx)
             ctx.log(
                 f"  [Physics] ✓ BoxCollider [{global_idx}] → "
                 f"{'main entity' if global_idx == 0 else 'child entity'}"
@@ -137,7 +159,7 @@ class BoxColliderProcessor(ComponentProcessor):
 # SHAPE WRITER
 # =============================================================================
 
-def _write_box_shape(components: Dict, collider: Dict,
+def _write_box_shape(components: Dict, collider: Dict, go,
                      ctx: ProcessingContext) -> None:
     """Write EditorBoxShapeComponent + EditorShapeColliderComponent."""
     cx, cy, cz = collider.get('center', (0, 0, 0))
@@ -165,6 +187,7 @@ def _write_box_shape(components: Dict, collider: Dict,
         collider_cfg['Trigger'] = True
     if has_offset:
         collider_cfg['Position'] = offset
+    _apply_collision_config(collider_cfg, go, ctx)
 
     components['EditorShapeColliderComponent'] = {
         '$type':                 'EditorShapeColliderComponent',

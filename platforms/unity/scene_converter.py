@@ -186,9 +186,13 @@ class UnitySceneConverter:
         with open(scene_path, 'r', encoding='utf-8') as f:
             content = f.read()
         
-        # First pass: Extract PrefabInstance blocks to get GUID mappings
+        # First pass: Extract PrefabInstance blocks to get GUID mappings.
+        # The doc body key is `PrefabInstance:` in the modern (Unity 2018.3+)
+        # prefab system and `Prefab:` in the legacy (pre-2018.3) one; both are
+        # !u!1001. The first guid encountered in the body is the source-prefab
+        # guid in either format (modification targets reference it by guid).
         prefab_instance_guids = {}  # fileID -> GUID
-        prefab_instance_pattern = r'--- !u!1001 &(\d+)\nPrefabInstance:.*?guid:\s*([a-f0-9]+)'
+        prefab_instance_pattern = r'--- !u!1001 &(\d+)\n(?:PrefabInstance|Prefab):.*?guid:\s*([a-f0-9]+)'
         for match in re.finditer(prefab_instance_pattern, content, re.DOTALL):
             instance_id = match.group(1)
             prefab_guid = match.group(2)
@@ -212,6 +216,13 @@ class UnitySceneConverter:
                     self._parse_game_object(doc['GameObject'], anchor, prefab_instance_guids)
                 elif 'PrefabInstance' in doc:
                     self._parse_prefab_instance(doc['PrefabInstance'])
+                elif 'Prefab' in doc and isinstance(doc['Prefab'], dict):
+                    # Legacy (pre-2018.3) prefab instance: doc key is `Prefab:`,
+                    # source ref is `m_ParentPrefab:`. m_IsPrefabParent == 1 marks
+                    # a prefab-asset reference rather than a scene instance — skip
+                    # those; only m_IsPrefabParent == 0 docs are real placements.
+                    if int(doc['Prefab'].get('m_IsPrefabParent', 0) or 0) == 0:
+                        self._parse_prefab_instance(doc['Prefab'])
                 else:
                     # Collect component blocks for the processor pipeline,
                     # and record every top-level key into coverage so the
@@ -354,7 +365,10 @@ class UnitySceneConverter:
         sibling override fields (added/removed components, added GameObjects)
         so _create_prefab_instance can emit non-transform patches.
         """
-        source_prefab = prefab_data.get('m_SourcePrefab', {})
+        # `m_SourcePrefab` is the modern (2018.3+) field; `m_ParentPrefab` is the
+        # legacy (pre-2018.3) equivalent. The m_Modification block is identical
+        # across both formats, so everything below is format-agnostic.
+        source_prefab = prefab_data.get('m_SourcePrefab') or prefab_data.get('m_ParentPrefab') or {}
         prefab_guid   = source_prefab.get('guid', '')
         if not prefab_guid:
             return

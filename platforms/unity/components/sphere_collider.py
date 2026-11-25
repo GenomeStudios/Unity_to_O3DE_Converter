@@ -10,7 +10,7 @@ Emits:    EditorSphereShapeComponent + EditorShapeColliderComponent
 from typing import Callable, Dict, List
 
 from .base import ComponentProcessor, ProcessingContext
-from .box_collider import _resolve_target
+from .box_collider import _resolve_target, _apply_collision_config
 
 
 class SphereColliderProcessor(ComponentProcessor):
@@ -69,7 +69,7 @@ class SphereColliderProcessor(ComponentProcessor):
             if child_id:
                 child_ids.append(child_id)
 
-            _write_sphere_shape(target_comps, collider, ctx)
+            _write_sphere_shape(target_comps, collider, go, ctx)
             ctx.log(
                 f"  [Physics] ✓ SphereCollider [{global_idx}] → "
                 f"{'main entity' if global_idx == 0 else 'child entity'}"
@@ -83,7 +83,7 @@ class SphereColliderProcessor(ComponentProcessor):
 # SHAPE WRITER
 # =============================================================================
 
-def _write_sphere_shape(components: Dict, collider: Dict,
+def _write_sphere_shape(components: Dict, collider: Dict, go,
                         ctx: ProcessingContext) -> None:
     """Write EditorSphereShapeComponent + EditorShapeColliderComponent."""
     cx, cy, cz = collider.get('center', (0, 0, 0))
@@ -110,6 +110,7 @@ def _write_sphere_shape(components: Dict, collider: Dict,
         collider_cfg['Trigger'] = True
     if has_offset:
         collider_cfg['Position'] = offset
+    _apply_collision_config(collider_cfg, go, ctx)
 
     components['EditorShapeColliderComponent'] = {
         '$type':                 'EditorShapeColliderComponent',

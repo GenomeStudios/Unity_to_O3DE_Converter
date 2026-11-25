@@ -348,6 +348,11 @@ def _default_stages() -> dict:
             "source_path":      "",   # F-2 override (walking root for prefab scrubbing)
             "selected_prefabs": [],   # F-4 relative paths under effective_source
             "output_path":      "",
+            # Collapse Unity LODGroups to a single LOD level (keep LOD0) on
+            # import. O3DE selects LODs inside one model asset, so keeping every
+            # Unity LOD child as its own entity renders them all at once. On by
+            # default — toggled from the Prefab Processor tab.
+            "strip_lods":       True,
         },
         "scene_converter": {
             "source_path":     "",   # F-2 override (walking root for scene scrubbing)
@@ -420,6 +425,28 @@ def _default_stages() -> dict:
             #   "materialtype":  raw materialtype path (escape hatch)
             #   "textures":      { slot: path, ... } per-slot texture rebinds
             "overrides": {},
+        },
+        "collision_processor": {
+            # F-Collision: project-wide default collision layer ("from") and
+            # group ("to") stamped onto every emitted collider, with per-
+            # collision-object overrides. Effective value per entity/field is:
+            #   overrides["<prefab_guid>:<file_id>"][field]
+            #     → defaults[field]
+            #     → None  (None = emit nothing → engine default; back-compat)
+            "defaults": {
+                "collision_layer":    None,   # int 0..63, or None
+                "collision_group_id": None,   # O3DE group preset UUID, or None
+            },
+            # Per-collision-object overrides keyed "<prefab_guid>:<file_id>".
+            "overrides": {},
+            # Display-only caches populated (read-only) from the target O3DE
+            # project's physxsystemconfiguration.setreg. Let the tab offer real
+            # layer/group names instead of raw indices/UUIDs.
+            "layer_names": {},   # {"0": "Default", "63": "TouchBend", ...}
+            "group_names": {},   # {"{uuid}": "All", ...}
+            # Optional .setreg path override. Blank → derive from the project's
+            # target O3DE project root (Project.physx_setreg_path()).
+            "setreg_override": "",
         },
         "terrain_processor": {
             "source_path": "", "output_path": "",
@@ -519,6 +546,12 @@ class Project:
     pipeline_status: dict
     outputs:         dict = field(default_factory=_default_outputs)
     scope_root:      Optional[Path] = None
+    # Target O3DE project root (the engine project converted assets are
+    # consumed by). Read-only from the converter's side: used to locate the
+    # project's `Registry/physxsystemconfiguration.setreg` so the Collisions
+    # tab can offer real collision-layer / group names. A general base field
+    # reusable beyond collisions (output-path derivation, in-engine checks).
+    o3de_project_root: Optional[Path] = None
     # F-8: per-yellow-row Acknowledge state. Keys are `ack_key` strings
     # the preflight check functions emit (e.g. "material.unmapped"); each
     # value is the snapshot hash that was current when the user clicked
@@ -589,6 +622,7 @@ class Project:
             "name":                self.name,
             "source_engine":       self.source_engine.value,
             "scope_root":          str(self.scope_root) if self.scope_root else "",
+            "o3de_project_root":   str(self.o3de_project_root) if self.o3de_project_root else "",
             "notes":               self.notes,
             "created":             self.created,
             "modified":            self.modified,
@@ -673,6 +707,9 @@ class Project:
         raw_root = (data.get("scope_root") or "").strip()
         scope_root = Path(raw_root) if raw_root else None
 
+        raw_o3de = (data.get("o3de_project_root") or "").strip()
+        o3de_project_root = Path(raw_o3de) if raw_o3de else None
+
         # F-8 — preflight acknowledgements survive load. Missing on legacy
         # files is fine; defaults to empty so every yellow row re-arms on
         # first open under the new schema.
@@ -689,6 +726,7 @@ class Project:
             pipeline_status=status,
             outputs=outputs_by_platform[active_platform],
             scope_root=scope_root,
+            o3de_project_root=o3de_project_root,
             preflight_acks=preflight_acks,
             stages_by_platform=stages_by_platform,
             outputs_by_platform=outputs_by_platform,
@@ -785,6 +823,23 @@ class Project:
             self.scope_root = new_value
             self._mark_dirty()
 
+    def set_o3de_project_root(self, path: Optional[Path]) -> None:
+        """Set the target O3DE project root (the engine project that consumes
+        converted assets), or None to clear."""
+        new_value: Optional[Path] = Path(path) if path else None
+        if new_value != self.o3de_project_root:
+            self.o3de_project_root = new_value
+            self._mark_dirty()
+
+    def physx_setreg_path(self) -> Optional[Path]:
+        """Resolve the target O3DE project's PhysX system-configuration
+        settings registry (holds collision-layer names + group presets), or
+        None when no project root is set. Existence is NOT checked here — the
+        caller decides what to do with a missing file."""
+        if not self.o3de_project_root:
+            return None
+        return Path(self.o3de_project_root) / "Registry" / "physxsystemconfiguration.setreg"
+
     def effective_source(self, stage_key: str) -> str:
         """Resolve the walking root a stage should actually use:
           - The stage's own `source_path` override if non-empty,
@@ -860,8 +915,10 @@ class ProjectManager(QObject):
 
     def new_project(
         self,
-        name:          str           = "Untitled Project",
-        source_engine: SourceEngine  = SourceEngine.UNITY,
+        name:              str                = "Untitled Project",
+        source_engine:     SourceEngine       = SourceEngine.UNITY,
+        scope_root:        Optional[Path]     = None,
+        o3de_project_root: Optional[Path]     = None,
     ) -> Project:
         now = _utc_now_iso()
         proj = Project(
@@ -873,6 +930,8 @@ class ProjectManager(QObject):
             modified=now,
             stages=_default_stages(),
             pipeline_status=_default_status(),
+            scope_root=Path(scope_root) if scope_root else None,
+            o3de_project_root=Path(o3de_project_root) if o3de_project_root else None,
         )
         proj._mark_dirty()
         self._current = proj

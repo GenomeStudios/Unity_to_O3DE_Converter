@@ -37,7 +37,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 import yaml
 
@@ -60,6 +60,15 @@ class UnityParseContext:
                                 types were seen (handled + unhandled).
       ``component_dispatch`` — ``{unity_type_name: ComponentProcessor}``
                                 from the active platform plugin.
+      ``strip_lods``         — when True (default), Unity LODGroups are
+                                collapsed to a single level on parse so
+                                only ``lod_keep_level`` survives into
+                                entity emission (see ``strip_lod_groups``).
+                                O3DE selects LODs inside one model asset,
+                                not via per-LOD entities, so keeping every
+                                Unity LOD child renders them all at once.
+      ``lod_keep_level``     — which LOD level to keep when stripping
+                                (0 = LOD0, the highest detail).
 
     The dataclass is immutable per-call — every parser invocation gets
     its own context bundle. The worker constructs one each time it
@@ -68,6 +77,8 @@ class UnityParseContext:
     log:                Callable[[str], None]
     coverage:           Any  # CoverageTracker; not type-imported to keep cycles out
     component_dispatch: Dict[str, Any]
+    strip_lods:         bool = True
+    lod_keep_level:     int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +100,12 @@ def parse_unity_prefab(ctx: UnityParseContext,
     game_objects: Dict[str, GameObject] = {}
     components_data: Dict[str, Dict] = {}
     transform_to_gameobject: Dict[str, str] = {}
+    # LOD stripping support: component fileID → owning GameObject fileID (for
+    # every component, not just dispatched ones) and LODGroup fileID → its
+    # per-level renderer fileID lists. LODGroup has no processor, so this is
+    # the only place its data is retained.
+    component_owner: Dict[str, str] = {}
+    lod_groups: Dict[str, List[List[str]]] = {}
 
     with open(prefab_path, 'r', encoding='utf-8') as f:
         content = f.read()
@@ -116,6 +133,18 @@ def parse_unity_prefab(ctx: UnityParseContext,
                                                 anchor, game_objects,
                                                 transform_to_gameobject)
             else:
+                # Record component → owning-GO for LOD renderer resolution, and
+                # capture LODGroup m_LODs renderer lists (LODGroup has no
+                # processor, so its data would otherwise be discarded).
+                for top_key, top_val in doc.items():
+                    if not isinstance(top_val, dict):
+                        continue
+                    owner_id = str((top_val.get('m_GameObject') or {}).get('fileID', ''))
+                    if owner_id:
+                        component_owner[anchor] = owner_id
+                    if top_key == 'LODGroup':
+                        lod_groups[anchor] = _extract_lod_renderer_levels(top_val)
+
                 # Dispatch to registered component processors and record every
                 # top-level key into coverage so the end-of-run report shows
                 # both handled and unhandled component types.
@@ -141,6 +170,11 @@ def parse_unity_prefab(ctx: UnityParseContext,
 
     # Build hierarchy and assign components.
     build_hierarchy(ctx, game_objects, transform_to_gameobject, components_data)
+
+    # Collapse Unity LODGroups so only the kept level survives into emission.
+    if ctx.strip_lods and lod_groups:
+        strip_lod_groups(ctx, game_objects, lod_groups, component_owner,
+                         keep_level=ctx.lod_keep_level)
 
     return game_objects, transform_to_gameobject
 
@@ -398,6 +432,93 @@ def build_hierarchy(ctx: UnityParseContext,
             processor.parse(comp_type, comp_data, go, ctx.log)
         else:
             ctx.log(f"  [Hierarchy] ⚠ No processor for component type '{comp_type}' — skipped")
+
+
+# ---------------------------------------------------------------------------
+# LOD stripping
+# ---------------------------------------------------------------------------
+# O3DE has no LODGroup component: LODs live inside a single model asset and are
+# selected automatically by one MeshComponent (LodRule at import + the runtime
+# LodConfiguration). Unity LODGroups instead are separate child GameObjects
+# (LOD0/LOD1/…), each with its own renderer. Emitting every Unity LOD child as
+# its own O3DE entity makes them all render simultaneously. Until the converter
+# bakes LODs into a single model (LodRule path), the default behaviour is to
+# collapse each LODGroup to a single level — see mem:lod_handling/lod_handling_plan.
+
+
+def _extract_lod_renderer_levels(lod_group_data: Dict) -> List[List[str]]:
+    """Return, per LOD level (LOD0 first), the renderer component FileIDs a
+    Unity ``LODGroup``'s ``m_LODs`` references. Each renderer FileID points at
+    a MeshRenderer component, not a GameObject — resolved to the owning GO by
+    the caller via the ``component_owner`` map."""
+    levels: List[List[str]] = []
+    for lod in (lod_group_data.get('m_LODs') or []):
+        renderer_fids: List[str] = []
+        for entry in (lod.get('renderers') or []):
+            fid = str((entry.get('renderer') or {}).get('fileID', ''))
+            if fid and fid != '0':
+                renderer_fids.append(fid)
+        levels.append(renderer_fids)
+    return levels
+
+
+def _remove_go_subtree(game_objects: Dict[str, GameObject], go_id: str,
+                       keep: set, log: Callable[[str], None]) -> int:
+    """Remove ``go_id`` and all descendants from ``game_objects``, unlinking it
+    from its parent's ``children_ids``. A GO in ``keep`` (a retained-LOD
+    renderer GO) is never removed, so a kept entity nested under a dropped one
+    survives. Returns the count of GameObjects removed."""
+    go = game_objects.get(go_id)
+    if go is None or go_id in keep:
+        return 0
+
+    parent = game_objects.get(go.parent_id) if go.parent_id else None
+    if parent and go_id in parent.children_ids:
+        parent.children_ids.remove(go_id)
+
+    removed = 0
+    for child_id in list(go.children_ids):
+        removed += _remove_go_subtree(game_objects, child_id, keep, log)
+    if game_objects.pop(go_id, None) is not None:
+        removed += 1
+    return removed
+
+
+def strip_lod_groups(ctx: UnityParseContext,
+                     game_objects: Dict[str, GameObject],
+                     lod_groups: Dict[str, List[List[str]]],
+                     component_owner: Dict[str, str],
+                     keep_level: int = 0) -> None:
+    """Collapse each parsed Unity LODGroup to a single LOD level, dropping the
+    other levels' renderer GameObjects (and their subtrees) so they don't all
+    emit as enabled O3DE entities.
+
+    ``keep_level`` selects the surviving level (0 = LOD0, highest detail),
+    clamped to the group's available levels. A renderer shared across levels is
+    kept (keep wins over drop)."""
+    for lod_go_id, levels in lod_groups.items():
+        if not levels:
+            continue
+        keep_idx = max(0, min(keep_level, len(levels) - 1))
+
+        keep_gos: set = set()
+        drop_gos: set = set()
+        for idx, renderer_fids in enumerate(levels):
+            for rfid in renderer_fids:
+                owner = component_owner.get(rfid)
+                if not owner:
+                    continue
+                (keep_gos if idx == keep_idx else drop_gos).add(owner)
+        drop_gos -= keep_gos
+
+        removed = 0
+        for go_id in drop_gos:
+            removed += _remove_go_subtree(game_objects, go_id, keep_gos, ctx.log)
+
+        ctx.log(f"  [LOD] LODGroup {lod_go_id}: kept LOD{keep_idx} "
+                f"({len(keep_gos)} renderer GO), dropped {len(drop_gos)} "
+                f"lower-LOD GO ({removed} entit{'y' if removed == 1 else 'ies'} "
+                f"removed incl. subtrees)")
 
 
 # ---------------------------------------------------------------------------

@@ -124,7 +124,8 @@ def create_o3de_prefab(worker, root_go: GameObject, all_game_objects: Dict,
                        mesh_mapping: Dict,
                        fbx_material_labels: Dict[str, List[str]],
                        output_path: Path,
-                       collider_pxmesh_mapping: Dict = None) -> None:
+                       collider_pxmesh_mapping: Dict = None,
+                       collision_config_mapping: Dict = None) -> None:
     """Write an O3DE ``.prefab`` JSON file + its
     ``.entitymap.json`` sidecar from a parsed source scene-graph
     rooted at ``root_go``."""
@@ -132,6 +133,9 @@ def create_o3de_prefab(worker, root_go: GameObject, all_game_objects: Dict,
     # create_entity_recursive from worker.*) can read it without threading the
     # map through every recursive signature. {(guid, fileID): .pxmesh hint}.
     worker._collider_pxmesh_mapping = collider_pxmesh_mapping or {}
+    # F-Collision: {file_id: {"layer": int|None, "group": uuid|None}} stamped
+    # onto each collider's ColliderConfiguration. Same stash pattern.
+    worker._collision_config_mapping = collision_config_mapping or {}
     # ContainerEntity uses the root GameObject's name.
     prefab_data = {
         "ContainerEntity": create_container_entity(worker, root_go),
@@ -701,6 +705,7 @@ def create_entity_recursive(worker, go: GameObject, all_game_objects: Dict,
         mesh_mapping          = mesh_mapping,
         fbx_material_labels   = fbx_material_labels,
         collider_pxmesh_mapping = getattr(worker, "_collider_pxmesh_mapping", {}),
+        collision_config      = getattr(worker, "_collision_config_mapping", {}),
         entities_dict         = entities_dict,
         entity_id_map         = entity_id_map,
         generate_component_id = (lambda: generate_component_id(worker)),

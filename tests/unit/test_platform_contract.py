@@ -138,7 +138,7 @@ def test_supported_tabs_default_is_full_set():
     from platforms.base import SourcePlatform
     from platforms.unity.unity_platform import UnityPlatform
     full = {"dashboard", "scenes", "prefabs", "meshes", "materials",
-            "terrain", "config"}
+            "collisions", "terrain", "config"}
     assert set(SourcePlatform.SUPPORTED_TABS) == full
     assert set(UnityPlatform.SUPPORTED_TABS) == full
 

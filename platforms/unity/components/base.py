@@ -12,7 +12,7 @@ Base classes for the pluggable Unity → O3DE component processor system.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Dict, List, Any
 
 if TYPE_CHECKING:
@@ -41,6 +41,11 @@ class ProcessingContext:
 
     log:                    Callable[[str], None]
     stats:                  Dict[str, int]          # component stats, incremented during emit
+
+    # F-Collision: go.file_id -> {"layer": int|None, "group": uuid|None}.
+    # Collider processors stamp CollisionLayer/CollisionGroupId from this.
+    # Defaulted so non-prefab call sites (scene converter) need not supply it.
+    collision_config:       Dict[str, Dict] = field(default_factory=dict)
 
 
 # =============================================================================
