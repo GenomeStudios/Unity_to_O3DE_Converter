@@ -2166,58 +2166,9 @@ def _fingerprint_files_under(root: str, pattern: str) -> dict:
         return {}
 
 
-def _fingerprint_file(p) -> int:
-    try:
-        return int(Path(p).stat().st_mtime)
-    except Exception:
-        return 0
-
-
-def input_hash_for(stage_key: str, project) -> str:
-    """Stable 16-char SHA-256 prefix over every input that affects this
-    stage's output. Recomputing for the same inputs returns the same hash;
-    changing any path / selection / file mtime changes the hash."""
-    if project is None:
-        return ""
-
-    cfg     = project.stage_settings(stage_key)
-    source  = project.effective_source(stage_key)
-    payload = {
-        "scope_root":       str(project.scope_root) if project.scope_root else "",
-        "effective_source": source,
-        "output_path":      (cfg.get("output_path") or "").strip(),
-    }
-
-    if stage_key == "asset_processor":
-        selected = sorted(cfg.get("selected_prefabs", []) or [])
-        payload["selected_prefabs"] = selected
-        if source:
-            payload["files"] = {
-                rel: _fingerprint_file(Path(source) / rel) for rel in selected
-            }
-        else:
-            payload["files"] = {}
-
-    elif stage_key == "scene_converter":
-        selected = sorted(cfg.get("selected_scenes", []) or [])
-        payload["selected_scenes"] = selected
-        payload["prefab_dirs"]     = sorted(cfg.get("prefab_dirs", []) or [])
-        if source:
-            payload["files"] = {
-                rel: _fingerprint_file(Path(source) / rel)
-                for rel in selected
-            }
-        else:
-            payload["files"] = {}
-
-    elif stage_key == "terrain_processor":
-        selected = sorted(cfg.get("selected_terrains", []) or [])
-        payload["selected_terrains"] = selected
-        payload["outputs"] = sorted(cfg.get("outputs", []) or [])
-        payload["files"] = {t: _fingerprint_file(t) for t in selected}
-
-    blob = _hashjson.dumps(payload, sort_keys=True)
-    return _hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+# `input_hash_for` and `_fingerprint_file` moved to `stage_runner` so the
+# command line shares them. Re-exported here for existing callers.
+from stage_runner import input_hash_for, _fingerprint_file  # noqa: E402,F401
 
 
 # Sync-state colors. Keyed by `state` returned from compute_stage_sync_state.
@@ -3547,92 +3498,22 @@ class PrefabProcessorTab(QWidget):
                        collision_settings: dict,
                        strip_lods: bool,
                        log) -> str:
-        from integrated_asset_processor import IntegratedAssetProcessor
+        # The run itself lives in `stage_runner`, shared with
+        # `converter_cli.py`; this tab only stores its bookkeeping.
+        from stage_runner import run_asset_processor, store_run
 
-        log("\n" + "=" * 60)
-        log("STARTING ASSET PROCESSING")
-        log("=" * 60)
-
-        cfg = get_config()
-        processor = IntegratedAssetProcessor(
-            Path(source_path),
-            Path(output_path),
-            log_callback=log,
-            convert_smoothness_to_roughness=cfg["convert_smoothness_to_roughness"],
+        run = run_asset_processor(
+            source_path, output_path, prefab_files,
             material_settings=material_settings,
             mesh_settings=mesh_settings,
             collision_settings=collision_settings,
             strip_lods=strip_lods,
+            convert_smoothness_to_roughness=get_config()["convert_smoothness_to_roughness"],
+            log=log,
         )
-
-        log(f"\nProcessing {len(prefab_files)} selected Unity prefab(s)")
-
-        success_count = 0
-        for i, prefab_file in enumerate(prefab_files, 1):
-            log(f"\n[{i}/{len(prefab_files)}] {prefab_file.name}")
-            if processor.process_prefab(prefab_file):
-                success_count += 1
-
-        processor.finalize()
-
-        # Merge asset-level counts into stats dict (displayed first)
-        asset_stats = {
-            "Materials created": len(processor.processed_materials),
-            "Textures copied":   len(processor.processed_textures),
-            "Meshes copied":     len(processor.processed_meshes),
-        }
-        asset_stats.update(processor.stats)
-
-        log("\n" + "=" * 60)
-        log("PROCESSING COMPLETE!")
-        log("=" * 60)
-        log(f"Prefabs processed : {success_count}/{len(prefab_files)}")
-        for label, count in asset_stats.items():
-            log(f"{label:<20}: {count}")
-        log(f"Output            : {output_path}")
-        log("=" * 60)
-
-        run_ts  = _utc_now_iso()
-        errors  = max(0, len(prefab_files) - success_count)
-        sstatus = "warn" if errors else "ok"
-
-        # Persist the run's bookkeeping into the project file (replaces
-        # the old `.ImporterData/` sidecars).
-        proc_outputs = processor.to_outputs()
-        proc_outputs["last_run"]        = run_ts
-        proc_outputs["last_status"]     = sstatus
-        proc_outputs["last_input_hash"] = input_hash_for(
-            self.STAGE_KEY, project_manager().current()
-        )
-        project_manager().update_outputs(self.STAGE_KEY, proc_outputs)
-
-        # F-9.I.4 — merge this run's state_index onto the existing one so
-        # assets the run didn't touch keep their prior fingerprints. The
-        # patch worker (I.5) consults the merged index when deciding what's
-        # dirty on the next run.
-        run_state = processor.state_index()
-        proj = project_manager().current()
-        if proj is not None:
-            existing = dict(proj.outputs.get("state_index") or {})
-            for bucket_name, bucket in run_state.items():
-                merged = dict(existing.get(bucket_name) or {})
-                merged.update(bucket)
-                existing[bucket_name] = merged
-            project_manager().update_outputs("state_index", existing)
-
-        project_manager().update_status(self.STAGE_KEY, {
-            "last_run":          run_ts,
-            "prefabs_processed": success_count,
-            "prefabs_total":     len(prefab_files),
-            "materials_written": len(processor.processed_materials),
-            "textures_copied":   len(processor.processed_textures),
-            "meshes_copied":     len(processor.processed_meshes),
-            "errors":            errors,
-        })
-
-        summary_parts = [f"Prefabs: {success_count}/{len(prefab_files)}"]
-        summary_parts += [f"{label}: {count}" for label, count in asset_stats.items()]
-        return "  |  ".join(summary_parts)
+        pm = project_manager()
+        store_run(pm, pm.current(), run, input_hash_for(self.STAGE_KEY, pm.current()))
+        return run.summary
 
     def _on_finished(self, success: bool, summary: str) -> None:
         self._process_btn.setEnabled(True)
@@ -4144,140 +4025,17 @@ class SceneConverterTab(QWidget):
                              prefab_dirs: list, log) -> str:
         """Serial multi-scene conversion. Each scene gets its own
         UnitySceneConverter, output goes into <output>/<SceneName>/."""
-        from platforms.unity.scene_converter import PrefabDatabase, UnitySceneConverter
+        # The run itself lives in `stage_runner`, shared with
+        # `converter_cli.py`; this tab only stores its bookkeeping.
+        from stage_runner import run_scene_converter, store_run
 
-        log("\n" + "=" * 60)
-        log("STARTING MULTI-SCENE CONVERSION")
-        log("=" * 60)
-        log(f"Scenes : {len(scenes)}")
-        log(f"Output : {output_dir}")
-        log(f"Prefab search dirs: {len(prefab_dirs)}")
-        log("=" * 60)
-
-        prefab_db = PrefabDatabase()
-        for d in prefab_dirs:
-            prefab_db.add_search_directory(Path(d))
-
-        # Pull Stage-1 outputs out of the project so the per-scene converters
-        # can resolve entity-map and asset-index lookups without sidecar files.
-        proj = project_manager().current()
+        pm = project_manager()
+        proj = pm.current()
         ap_outputs = (proj.outputs.get("asset_processor", {}) if proj else {})
-        ap_prefabs = ap_outputs.get("prefabs", {})  # guid_or_stem → record
-        entity_maps_by_stem: dict = {}
-        for record in ap_prefabs.values():
-            stem = Path(record.get("output_path", "")).stem
-            if stem:
-                entity_maps_by_stem[stem] = record
-        asset_index_for_scene = {
-            "materials": dict(ap_outputs.get("materials", {})),
-            "meshes":    dict(ap_outputs.get("meshes",    {})),
-            "prefabs":   {g: r.get("source_path", "") for g, r in ap_prefabs.items()},
-        }
-
-        totals = {
-            "scenes_converted":      0,
-            "total_entities":        0,
-            "total_prefab_refs":     0,
-            "total_missing_prefabs": 0,
-            "failures":              [],
-        }
-        # Per-scene records accumulated into project.outputs.scene_converter.
-        scene_records: dict = {}
-        # Coverage from the last scene that converted (Stage 2's coverage
-        # is global to the run rather than per-scene; this is one source).
-        last_coverage: dict = {}
-
-        for i, scene_path in enumerate(scenes, 1):
-            scene_stem    = scene_path.stem
-            scene_out_dir = Path(output_dir) / scene_stem
-            scene_out_dir.mkdir(parents=True, exist_ok=True)
-            level_prefab  = scene_out_dir / f"{scene_stem}.prefab"
-
-            log(f"\n[{i}/{len(scenes)}] {scene_path.name}  →  {scene_out_dir.name}/")
-            try:
-                conv = UnitySceneConverter(
-                    prefab_db, log_callback=log,
-                    entity_maps_by_stem=entity_maps_by_stem,
-                    asset_index=asset_index_for_scene,
-                )
-                conv.parse_unity_scene(str(scene_path))
-                log(f"  Parsed {len(conv.game_objects)} GameObject(s)")
-                prefab_instances = sum(
-                    1 for go in conv.game_objects.values() if go.is_prefab_instance
-                )
-                log(f"  Prefab instances: {prefab_instances}, "
-                    f"resolved: {len(conv.prefab_references)}, "
-                    f"missing: {len(conv.missing_prefabs)}")
-
-                total, refs, blanks = conv.create_o3de_level(
-                    str(level_prefab), scene_out_dir
-                )
-                conv.finalize(scene_out_dir)
-
-                # Record this scene's outputs for the project file.
-                try:
-                    output_rel = str(level_prefab.relative_to(Path(output_dir)))
-                except Exception:
-                    output_rel = level_prefab.name
-                scene_records[scene_path.name] = {
-                    "output_path":       output_rel.replace("\\", "/"),
-                    "entities":          total,
-                    "prefab_references": refs,
-                    "blanks":            blanks,
-                    "missing_prefabs":   sorted(conv.missing_prefabs),
-                    "written_at":        _utc_now_iso(),
-                }
-                last_coverage = conv.to_coverage()
-
-                totals["scenes_converted"]      += 1
-                totals["total_entities"]        += total
-                totals["total_prefab_refs"]     += refs
-                totals["total_missing_prefabs"] += len(conv.missing_prefabs)
-                log(f"  ✓ Wrote {level_prefab.name}")
-            except Exception as exc:
-                log(f"  ✗ Scene failed: {exc}")
-                totals["failures"].append(scene_path.name)
-
-        log("\n" + "=" * 60)
-        log("CONVERSION COMPLETE!")
-        log("=" * 60)
-        log(f"Scenes converted   : {totals['scenes_converted']}/{len(scenes)}")
-        log(f"Total entities     : {totals['total_entities']}")
-        log(f"Total prefab refs  : {totals['total_prefab_refs']}")
-        log(f"Total missing refs : {totals['total_missing_prefabs']}")
-        if totals["failures"]:
-            log(f"Failures           : {', '.join(totals['failures'])}")
-        log("=" * 60)
-
-        run_ts = _utc_now_iso()
-        had_errors = (totals["total_missing_prefabs"] > 0
-                      or len(totals["failures"]) > 0)
-        sstatus = "warn" if had_errors else "ok"
-
-        project_manager().update_outputs(self.STAGE_KEY, {
-            "last_run":        run_ts,
-            "last_status":     sstatus,
-            "last_input_hash": input_hash_for(self.STAGE_KEY, project_manager().current()),
-            "scenes":          scene_records,
-            "coverage":        last_coverage,
-        })
-
-        project_manager().update_status(self.STAGE_KEY, {
-            "last_run":                run_ts,
-            "scenes_converted":        totals["scenes_converted"],
-            "scenes_total":            len(scenes),
-            "total_entities":          totals["total_entities"],
-            "total_prefab_references": totals["total_prefab_refs"],
-            "total_missing_prefabs":   totals["total_missing_prefabs"],
-        })
-        self._last_run_totals = totals
-
-        return (
-            f"Scenes: {totals['scenes_converted']}/{len(scenes)}  |  "
-            f"Entities: {totals['total_entities']}  |  "
-            f"Prefab refs: {totals['total_prefab_refs']}  |  "
-            f"Missing: {totals['total_missing_prefabs']}"
-        )
+        run = run_scene_converter(scenes, output_dir, prefab_dirs, ap_outputs, log)
+        store_run(pm, pm.current(), run, input_hash_for(self.STAGE_KEY, pm.current()))
+        self._last_run_totals = run.totals
+        return run.summary
 
     def _on_finished(self, success: bool, summary: str) -> None:
         self._convert_btn.setEnabled(True)

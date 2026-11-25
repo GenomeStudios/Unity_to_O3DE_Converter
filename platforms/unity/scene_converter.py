@@ -125,7 +125,8 @@ class UnitySceneConverter:
 
     def __init__(self, prefab_db: PrefabDatabase, log_callback=None, *,
                  entity_maps_by_stem: Optional[Dict[str, Dict]] = None,
-                 asset_index: Optional[Dict] = None):
+                 asset_index: Optional[Dict] = None,
+                 trace=None):
         """
         `entity_maps_by_stem` and `asset_index` are sourced from the
         project file's `outputs.asset_processor` section by the tab
@@ -137,6 +138,9 @@ class UnitySceneConverter:
         """
         self.prefab_db = prefab_db
         self.log = log_callback or print
+        # Optional `conversion_trace.ConversionTrace`; None changes nothing.
+        self.trace = trace
+        self.scene_path = ""
         self.game_objects: Dict[str, GameObject] = {}
         self.transforms: Dict[str, Transform] = {}
         self.transform_to_gameobject: Dict[str, str] = {}
@@ -175,6 +179,7 @@ class UnitySceneConverter:
     
     def parse_unity_scene(self, scene_path: str) -> None:
         """Parse Unity scene file"""
+        self.scene_path = str(scene_path)
         self.game_objects.clear()
         self.transforms.clear()
         self.transform_to_gameobject.clear()
@@ -215,14 +220,14 @@ class UnitySceneConverter:
                 elif 'GameObject' in doc:
                     self._parse_game_object(doc['GameObject'], anchor, prefab_instance_guids)
                 elif 'PrefabInstance' in doc:
-                    self._parse_prefab_instance(doc['PrefabInstance'])
+                    self._parse_prefab_instance(doc['PrefabInstance'], anchor)
                 elif 'Prefab' in doc and isinstance(doc['Prefab'], dict):
                     # Legacy (pre-2018.3) prefab instance: doc key is `Prefab:`,
                     # source ref is `m_ParentPrefab:`. m_IsPrefabParent == 1 marks
                     # a prefab-asset reference rather than a scene instance — skip
                     # those; only m_IsPrefabParent == 0 docs are real placements.
                     if int(doc['Prefab'].get('m_IsPrefabParent', 0) or 0) == 0:
-                        self._parse_prefab_instance(doc['Prefab'])
+                        self._parse_prefab_instance(doc['Prefab'], anchor)
                 else:
                     # Collect component blocks for the processor pipeline,
                     # and record every top-level key into coverage so the
@@ -358,7 +363,7 @@ class UnitySceneConverter:
                 prefab_name=name if is_prefab else None
             )
     
-    def _parse_prefab_instance(self, prefab_data: Dict) -> None:
+    def _parse_prefab_instance(self, prefab_data: Dict, anchor: str = "") -> None:
         """
         Parse PrefabInstance data — capture transform overrides for the existing
         prefab_instances pipeline, AND capture the full m_Modifications array +
@@ -426,6 +431,9 @@ class UnitySceneConverter:
         instance_data['rotation'] = tuple(rot)
         instance_data['scale']    = tuple(scale_vals)
 
+        # The PrefabInstance's file id in the scene: its identity for the
+        # conversion trace. Not used for emission.
+        instance_data['unity_file_id'] = str(anchor)
         self.prefab_instances.append(instance_data)
     
     def _build_hierarchy(self) -> None:
@@ -512,6 +520,7 @@ class UnitySceneConverter:
             )
             # Carry the full override payload so _create_prefab_instance can emit
             # non-transform JSON patches and record unhandled paths into coverage.
+            go.component_data['unity_prefab_instance_file_id'] = instance.get('unity_file_id', '')
             go.prefab_modifications      = instance.get('modifications', []) or []
             go.prefab_added_components   = instance.get('added_components', []) or []
             go.prefab_removed_components = instance.get('removed_components', []) or []
@@ -543,6 +552,8 @@ class UnitySceneConverter:
     
     def create_o3de_level(self, output_path: str, output_base: Path) -> Tuple[int, int, int]:
         """Create O3DE level file in JSON format"""
+        if self.trace is not None:
+            self.trace.begin_scene(Path(output_path).stem, Path(self.scene_path), Path(output_path))
         level_data = {
             "ContainerEntity": self._create_level_container(),
             "Entities": {},
@@ -566,6 +577,9 @@ class UnitySceneConverter:
                 level_data["Instances"][instance_id] = self._create_prefab_instance(
                     root_go, prefab_path, output_base, "Entity_[1000000]"
                 )
+                if self.trace is not None:
+                    self.trace.record_instance(root_go, instance_id, prefab_path,
+                                               level_data["Instances"][instance_id])
                 
                 child_order.append(f"{instance_id}/ContainerEntity")
                 prefab_ref_count += 1
@@ -987,6 +1001,9 @@ class UnitySceneConverter:
             instances_dict[instance_id] = self._create_prefab_instance(
                 go, prefab_path, output_base, parent_entity_id
             )
+            if self.trace is not None:
+                self.trace.record_instance(go, instance_id, prefab_path,
+                                           instances_dict[instance_id])
             return f"{instance_id}/ContainerEntity"
         
         entity_id = self._generate_entity_id()
@@ -1071,10 +1088,30 @@ class UnitySceneConverter:
             log                   = self.log,
             stats                 = self.stats,
         )
+        # For the conversion trace: which processor added which component or
+        # child entity, and whether one of them rewrote the transform.
+        component_owner: Dict[str, str] = {}
+        child_owner: Dict[str, str] = {}
+        transform_modified_by = ""
+
         collider_child_ids: List[str] = []
         for processor in self.component_processors:
+            keys_before = set(entity["Components"])
+            transform_before = json.dumps(entity["Components"]["TransformComponent"], sort_keys=True)                 if self.trace is not None else ""
             child_ids = processor.emit(go, entity, ctx)
             collider_child_ids.extend(child_ids)
+            if self.trace is not None:
+                owner = type(processor).__name__
+                for key in set(entity["Components"]) - keys_before:
+                    component_owner[key] = owner
+                for child_id in child_ids:
+                    child_owner[child_id] = owner
+                if json.dumps(entity["Components"]["TransformComponent"], sort_keys=True) != transform_before:
+                    transform_modified_by = owner
+
+        if self.trace is not None:
+            self.trace.record_entity(go, entity, "axis_swap", component_owner, child_owner,
+                                     transform_modified_by)
 
         # ---------------------------------------------------------------
         # Child entities: GO children + any collider overflow sub-entities

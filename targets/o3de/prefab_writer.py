@@ -598,6 +598,9 @@ def create_entity_recursive(worker, go: GameObject, all_game_objects: Dict,
             instances_dict[instance_id] = create_nested_prefab_instance(
                 worker, go, prefab_path, parent_entity_id,
             )
+            if getattr(worker, "trace", None) is not None:
+                worker.trace.record_instance(go, instance_id, prefab_path,
+                                             instances_dict[instance_id])
             return f"{instance_id}/ContainerEntity"
         # If we can't find the prefab, fall through to create regular entity.
 
@@ -617,6 +620,7 @@ def create_entity_recursive(worker, go: GameObject, all_game_objects: Dict,
     # method comment for full reasoning — when this entity is the
     # prefab's root (parent is ContainerEntity), force identity.
     is_prefab_root = (parent_entity_id == "ContainerEntity")
+    transform_rule = "axis_swap"        # for the conversion trace
     if is_prefab_root and (
         any(abs(v) > 0.0001 for v in o3de_transform.position)
         or any(abs(v) > 0.0001 for v in quaternion_to_euler(o3de_transform.rotation))
@@ -632,6 +636,7 @@ def create_entity_recursive(worker, go: GameObject, all_game_objects: Dict,
         )
         o3de_transform   = Transform((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), (1.0, 1.0, 1.0))
         needs_nonuniform = False
+        transform_rule   = "root_discarded"
 
     entity = {
         "Id":   entity_id,
@@ -716,10 +721,32 @@ def create_entity_recursive(worker, go: GameObject, all_game_objects: Dict,
         stats                 = worker.stats,
     )
 
+    # For the conversion trace: which processor added which component or
+    # child entity, and whether one of them rewrote the transform.
+    trace = getattr(worker, "trace", None)
+    component_owner: Dict[str, str] = {}
+    child_owner: Dict[str, str] = {}
+    transform_modified_by = ""
+
     collider_child_ids: List[str] = []
     for processor in worker.component_processors:
+        keys_before = set(entity["Components"])
+        transform_before = json.dumps(entity["Components"]["TransformComponent"], sort_keys=True) \
+            if trace is not None else ""
         child_ids = processor.emit(go, entity, ctx)
         collider_child_ids.extend(child_ids)
+        if trace is not None:
+            owner = type(processor).__name__
+            for key in set(entity["Components"]) - keys_before:
+                component_owner[key] = owner
+            for child_id in child_ids:
+                child_owner[child_id] = owner
+            if json.dumps(entity["Components"]["TransformComponent"], sort_keys=True) != transform_before:
+                transform_modified_by = owner
+
+    if trace is not None:
+        trace.record_entity(go, entity, transform_rule, component_owner, child_owner,
+                            transform_modified_by)
 
     # Child entities: GO children + any collider sub-entities.
     child_order: List[str] = []

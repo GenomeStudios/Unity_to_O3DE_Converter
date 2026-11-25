@@ -116,7 +116,8 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
                          mesh_settings: Optional[Dict] = None,
                          mesh_guid: Optional[str] = None,
                          *,
-                         correction_quat: Optional[list] = None) -> None:
+                         correction_quat: Optional[list] = None,
+                         trace=None) -> None:
     """Write an O3DE .assetinfo with one named MeshGroup per mesh entity.
 
     Group name format: "{fbx_stem}-{entity_name}"  e.g. "Closet_A-Glass_L"
@@ -317,3 +318,10 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
         log(f"    [Mesh] .assetinfo written — {len(groups)} group(s) ({sidecar.name})")
     except Exception as e:
         log(f"    [Mesh] WARNING: Could not write .assetinfo: {e}")
+
+    # Conversion trace: which rule each group got, and from what.
+    if trace is not None:
+        trace.record_assetinfo(
+            fbx_dest_path, mesh_guid, up_axis, eff, rot_quat,
+            node_autocenters, shared_translation, groups, physx_specs,
+        )

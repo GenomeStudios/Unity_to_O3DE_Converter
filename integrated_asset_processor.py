@@ -853,10 +853,16 @@ class IntegratedAssetProcessor:
                  scope_root:        Optional[Path] = None,
                  state_index:       Optional[Dict] = None,
                  strip_lods:        bool = True,
-                 platform=None):
+                 platform=None,
+                 trace=None):
         self.unity_assets_root = unity_assets_root
         self.output_root = output_root
         self.log = log_callback or print
+
+        # Optional `conversion_trace.ConversionTrace`. When set, the emitters
+        # record how every value they write was produced. None changes
+        # nothing about what is emitted.
+        self.trace = trace
 
         # Per-run config flags
         self.convert_smoothness_to_roughness = convert_smoothness_to_roughness
@@ -1048,7 +1054,14 @@ class IntegratedAssetProcessor:
                 return False
             
             self.log(f"  Found {len(game_objects)} GameObjects")
-            
+
+            if self.trace is not None:
+                self.trace.begin_prefab(
+                    self.asset_db.path_to_guid(prefab_path) or str(prefab_path),
+                    prefab_path,
+                    self.prefabs_dir / f"{prefab_path.stem}.prefab",
+                )
+
             # Process materials referenced by this prefab
             all_material_guids = set()
             all_mesh_guids = set()
@@ -1241,6 +1254,7 @@ class IntegratedAssetProcessor:
                     mesh_settings=self._mesh_settings,
                     mesh_guid=mesh_guid,
                     correction_quat=correction_quat,
+                    trace=self.trace,
                 )
                 # F-9.I.4 — record mesh fingerprint AFTER the assetinfo
                 # exists on disk so the recorded output_files list includes

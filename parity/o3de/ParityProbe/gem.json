@@ -1,0 +1,17 @@
+{
+    "gem_name": "ParityProbe",
+    "version": "1.0.0",
+    "display_name": "Parity Probe",
+    "license": "Same as the To-O3DE Project Converter",
+    "origin": "To-O3DE Project Converter, parity harness",
+    "type": "Tool",
+    "summary": "Editor console command parity_dump: writes every editor entity's prefab identity, transforms, model vertices and collider geometry, for comparison with the Unity truth dump.",
+    "canonical_tags": [
+        "Gem"
+    ],
+    "user_tags": [
+        "ParityProbe"
+    ],
+    "requirements": "",
+    "dependencies": []
+}
