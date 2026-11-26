@@ -37,10 +37,11 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import yaml
 
+from platforms.unity.model_import import instance_object_id
 from platforms.unity.types import GameObject, Transform
 
 
@@ -69,6 +70,13 @@ class UnityParseContext:
                                 Unity LOD child renders them all at once.
       ``lod_keep_level``     — which LOD level to keep when stripping
                                 (0 = LOD0, the highest detail).
+      ``model_objects``      — given the guid a PrefabInstance names as its
+                                source, the objects Unity makes of that model
+                                file (``model_import.ModelObject`` list), or
+                                None when the source is not a model. With it
+                                an instance of a model becomes plain objects
+                                (see ``add_model_instance``); without it such
+                                an instance stays an empty object.
 
     The dataclass is immutable per-call — every parser invocation gets
     its own context bundle. The worker constructs one each time it
@@ -79,6 +87,7 @@ class UnityParseContext:
     component_dispatch: Dict[str, Any]
     strip_lods:         bool = True
     lod_keep_level:     int = 0
+    model_objects:      Optional[Callable[[str], Optional[list]]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +306,14 @@ def parse_prefab_instance_in_prefab(ctx: UnityParseContext,
     if not prefab_guid:
         return
 
+    # An instance of a model file is not an instance of a prefab: there is no
+    # converted prefab to point at. It becomes the objects Unity makes of it.
+    model = ctx.model_objects(prefab_guid) if ctx.model_objects else None
+    if model:
+        add_model_instance(ctx, instance_data, anchor, prefab_guid, model,
+                           game_objects, transform_map)
+        return
+
     modification         = instance_data.get('m_Modification', {})
     modifications        = modification.get('m_Modifications', []) or []
     added_components     = modification.get('m_AddedComponents', []) or []
@@ -305,13 +322,16 @@ def parse_prefab_instance_in_prefab(ctx: UnityParseContext,
     parent_transform     = modification.get('m_TransformParent', {}) or {}
     parent_id            = str(parent_transform.get('fileID', ''))
 
-    # Project transform-related overrides onto a Transform. All other
-    # overrides stay in modifications[] for the emitter to handle.
+    # Project the transform overrides of the instance's own root onto a
+    # Transform. Overrides that target an object inside the instance (a door
+    # moved in its frame) are not the instance's: they stay in
+    # modifications[] with all the others, for the emitter to handle.
     name     = 'PrefabInstance'
     position = [0.0, 0.0, 0.0]
     rotation = [0.0, 0.0, 0.0, 1.0]
     scale    = [1.0, 1.0, 1.0]
     TRANSFORM_AXIS = {'x': 0, 'y': 1, 'z': 2, 'w': 3}
+    root_target = root_override_target(modifications)
 
     for mod in modifications:
         prop_path = mod.get('propertyPath', '') or ''
@@ -319,6 +339,8 @@ def parse_prefab_instance_in_prefab(ctx: UnityParseContext,
 
         if prop_path == 'm_Name':
             name = str(value) if value else name
+        elif not targets_root(mod, root_target):
+            continue
         elif prop_path.startswith('m_LocalPosition.'):
             axis = prop_path.rsplit('.', 1)[-1]
             if axis in TRANSFORM_AXIS and TRANSFORM_AXIS[axis] < 3:
@@ -375,6 +397,176 @@ def parse_prefab_instance_in_prefab(ctx: UnityParseContext,
     )
     # Don't add to transform_map since PrefabInstance doesn't have a
     # separate Transform component.
+
+
+# ---------------------------------------------------------------------------
+# Which override is the instance's own
+# ---------------------------------------------------------------------------
+
+# Unity stores these seven for the root of every instance, changed or not.
+_ROOT_OVERRIDES = frozenset(
+    [f'm_LocalPosition.{axis}' for axis in 'xyz'] + [f'm_LocalRotation.{axis}' for axis in 'xyzw'])
+
+
+def root_override_target(modifications: List[Dict]) -> Optional[str]:
+    """The file id, in the source prefab, of the transform at the root of an
+    instance, read off the instance's overrides.
+
+    An override names the object it changes by that object's id in the source
+    prefab. The root's position and rotation are always stored, all seven
+    numbers; an object inside the instance has only what was changed. So the
+    root is the target that carries all seven. Should several, the one that
+    also carries ``m_RootOrder``, else the first listed. None when no target
+    carries them all (then nothing tells the overrides apart)."""
+    paths_of: Dict[str, set] = {}
+    for mod in modifications:
+        target = str((mod.get('target') or {}).get('fileID', ''))
+        paths_of.setdefault(target, set()).add(str(mod.get('propertyPath', '') or ''))
+    candidates = [target for target, paths in paths_of.items() if _ROOT_OVERRIDES <= paths]
+    if not candidates:
+        return None
+    return next((target for target in candidates if 'm_RootOrder' in paths_of[target]), candidates[0])
+
+
+def targets_root(mod: Dict, root_target: Optional[str]) -> bool:
+    """Whether an override is on the instance's own root. With no root known
+    every override counts as the root's, as before the two were told apart."""
+    return root_target is None or str((mod.get('target') or {}).get('fileID', '')) == root_target
+
+
+def nested_prefabs_first(prefab_files: List[Path], guid_of: Callable[[Path], Optional[str]]) -> List[Path]:
+    """The same prefab files, ordered so that a prefab comes after the ones
+    it nests. A prefab that nests another needs the nested one's entity map
+    to place its overrides, and that map exists once the nested prefab is
+    converted. The given order is kept wherever nesting does not decide."""
+    by_guid = {guid_of(path): path for path in prefab_files}
+    nests: Dict[Path, List[Path]] = {}
+    for path in prefab_files:
+        try:
+            text = Path(path).read_text(encoding='utf-8', errors='ignore')
+        except OSError:
+            text = ''
+        guids = re.findall(r'm_SourcePrefab:\s*\{fileID:\s*-?\d+,\s*guid:\s*(\w+)', text)
+        nests[path] = [by_guid[guid] for guid in dict.fromkeys(guids) if guid in by_guid and by_guid[guid] != path]
+
+    ordered: List[Path] = []
+    state: Dict[Path, str] = {}
+
+    def visit(path: Path) -> None:
+        if state.get(path):
+            return                      # done, or a loop back into a prefab being visited
+        state[path] = 'visiting'
+        for nested in nests[path]:
+            visit(nested)
+        state[path] = 'done'
+        ordered.append(path)
+
+    for path in prefab_files:
+        visit(path)
+    return ordered
+
+
+# ---------------------------------------------------------------------------
+# Instances of model files
+# ---------------------------------------------------------------------------
+
+_AXIS = {'x': 0, 'y': 1, 'z': 2, 'w': 3}
+
+# Overrides every instance carries that say nothing the converter needs.
+_OVERRIDES_WITHOUT_EFFECT = ('m_RootOrder', 'm_LocalEulerAnglesHint.')
+
+
+def add_model_instance(ctx: UnityParseContext,
+                       instance_data: Dict, anchor: str, model_guid: str,
+                       model: list,
+                       game_objects: Dict, transform_map: Dict) -> None:
+    """Add one instance of a model file (an FBX dropped into a prefab or a
+    scene) as plain GameObjects: one per object Unity makes of the model,
+    with the model's own transforms, meshes and materials, and the
+    instance's overrides on top.
+
+    Each object gets the id Unity gives it in the file that holds the
+    instance (``instance_object_id``), so components and children the file
+    adds to it attach by id like to any other object. An object whose id in
+    the model is not known gets a made-up id; nothing can be added to it.
+
+    ``model`` comes from ``ctx.model_objects`` (root first, parents before
+    children)."""
+    modification = instance_data.get('m_Modification', {}) or {}
+    parent_transform_id = str((modification.get('m_TransformParent') or {}).get('fileID', ''))
+
+    # ---- One object per object of the model.
+    made: List[GameObject] = []
+    by_source_id: Dict[str, GameObject] = {}      # the model's own ids -> the object made
+    for index, source in enumerate(model):
+        file_id = (instance_object_id(anchor, source.game_object_id) if source.game_object_id
+                   else f"{anchor}:{source.node or index}")
+        go = GameObject(
+            file_id=file_id,
+            name=source.name,
+            transform=Transform(tuple(source.position), tuple(source.rotation), tuple(source.scale)),
+        )
+        if source.mesh_file_id:
+            go.mesh_guid      = model_guid
+            go.mesh_file_id   = source.mesh_file_id
+            go.material_guids = list(source.material_guids)
+        if source.parent >= 0:
+            go.parent_id = made[source.parent].file_id
+        elif parent_transform_id and parent_transform_id != '0':
+            go.parent_id = parent_transform_id
+
+        if source.game_object_id:
+            by_source_id[source.game_object_id] = go
+        if source.transform_id:
+            by_source_id[source.transform_id] = go
+            transform_map[instance_object_id(anchor, source.transform_id)] = file_id
+        made.append(go)
+        game_objects[file_id] = go
+
+    # ---- The instance's overrides, each on the object it targets.
+    renderers = [go for go in made if go.mesh_guid]
+    modifications = modification.get('m_Modifications', []) or []
+    skipped = 0
+    for mod in modifications:
+        target = by_source_id.get(str((mod.get('target') or {}).get('fileID', '')))
+        if target is None and len(renderers) == 1 and str(mod.get('propertyPath', '')).startswith('m_Materials.'):
+            target = renderers[0]     # the model's only renderer
+        if target is None or not _apply_model_override(target, mod):
+            skipped += 1
+
+    ctx.log(
+        f"  [ModelInstance] '{made[0].name}' src={model_guid[:8]}… "
+        f"objects={len(made)}, overrides={len(modifications)} "
+        f"({skipped} not applied)"
+    )
+
+
+def _apply_model_override(go: GameObject, mod: Dict) -> bool:
+    """Apply one override of a model instance to the object it targets.
+    False when the override is of a kind this does not carry over."""
+    path  = str(mod.get('propertyPath', '') or '')
+    value = mod.get('value', 0)
+    field, _, axis = path.partition('.')
+
+    if path == 'm_Name':
+        go.name = str(value) if value else go.name
+    elif field in ('m_LocalPosition', 'm_LocalRotation', 'm_LocalScale') and axis in _AXIS:
+        attribute = {'m_LocalPosition': 'position', 'm_LocalRotation': 'rotation',
+                     'm_LocalScale': 'scale'}[field]
+        values = list(getattr(go.transform, attribute))
+        if _AXIS[axis] >= len(values):
+            return False
+        values[_AXIS[axis]] = float(value)
+        setattr(go.transform, attribute, tuple(values))
+    elif path.startswith('m_Materials.Array.data['):
+        slot = int(path[len('m_Materials.Array.data['):].rstrip(']'))
+        guid = str((mod.get('objectReference') or {}).get('guid', '') or '')
+        if not guid or slot > len(go.material_guids):
+            return False
+        go.material_guids[slot:slot + 1] = [guid]
+    elif not path.startswith(_OVERRIDES_WITHOUT_EFFECT):
+        return False
+    return True
 
 
 def build_hierarchy(ctx: UnityParseContext,

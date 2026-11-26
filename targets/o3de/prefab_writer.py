@@ -75,44 +75,102 @@ def generate_entity_id(worker) -> str:
 # ---------------------------------------------------------------------------
 
 def quaternion_to_euler(quaternion: Tuple[float, float, float, float]) -> List[float]:
-    """Convert quaternion ``[x, y, z, w]`` to Euler angles in degrees
-    (XYZ order). Pure function — no worker dependency."""
+    """Convert quaternion ``[x, y, z, w]`` to the Euler angles, in degrees,
+    that O3DE turns back into the same rotation. Pure function.
+
+    O3DE builds a rotation from the ``Rotate`` field of a transform as
+    ``rot = rotx * roty * rotz`` (``AZ::Quaternion::SetFromEulerRadians``).
+    The angles are therefore read off the matrix ``Rx(a) * Ry(b) * Rz(c)``:
+
+        R[0][2] =  sin(b)
+        R[1][2] = -sin(a) cos(b)      R[2][2] = cos(a) cos(b)
+        R[0][1] = -cos(b) sin(c)      R[0][0] = cos(b) cos(c)
+
+    Any other order gives angles that are right for a turn about one axis
+    and wrong as soon as two axes are involved."""
     x, y, z, w = quaternion
 
-    # Roll (x-axis rotation)
-    sinr_cosp = 2 * (w * x + y * z)
-    cosr_cosp = 1 - 2 * (x * x + y * y)
-    roll = math.atan2(sinr_cosp, cosr_cosp)
+    r00 = 1 - 2 * (y * y + z * z)
+    r01 = 2 * (x * y - z * w)
+    r02 = 2 * (x * z + y * w)
+    r12 = 2 * (y * z - x * w)
+    r22 = 1 - 2 * (x * x + y * y)
 
-    # Pitch (y-axis rotation)
-    sinp = 2 * (w * y - z * x)
-    if abs(sinp) >= 1:
-        pitch = math.copysign(math.pi / 2, sinp)
+    if abs(r02) < 0.999999:
+        angle_x = math.atan2(-r12, r22)
+        angle_y = math.asin(r02)
+        angle_z = math.atan2(-r01, r00)
     else:
-        pitch = math.asin(sinp)
+        # Looking straight along X: X and Z turn about the same line.
+        # Put the whole of that turn on X.
+        r11 = 1 - 2 * (x * x + z * z)
+        r21 = 2 * (y * z + x * w)
+        angle_x = math.atan2(r21, r11)
+        angle_y = math.copysign(math.pi / 2, r02)
+        angle_z = 0.0
 
-    # Yaw (z-axis rotation)
-    siny_cosp = 2 * (w * z + x * y)
-    cosy_cosp = 1 - 2 * (y * y + z * z)
-    yaw = math.atan2(siny_cosp, cosy_cosp)
-
-    return [math.degrees(roll), math.degrees(pitch), math.degrees(yaw)]
+    return [math.degrees(angle_x), math.degrees(angle_y), math.degrees(angle_z)]
 
 
 def convert_to_o3de_coordinates(unity_transform: Transform
                                  ) -> Tuple[Transform, bool]:
     """Convert a Unity transform (Y-up, LH) to O3DE space (Z-up, RH).
-    Returns ``(converted_transform, scale_was_non_uniform_flag)``."""
+    Returns ``(converted_transform, scale_was_non_uniform_flag)``.
+
+    A Unity point ``(x, y, z)`` is the O3DE point ``(x, z, y)``. That swap
+    is a mirror, and a mirror turns a rotation about an axis into the
+    opposite rotation about the mirrored axis: the quaternion
+    ``(x, y, z, w)`` becomes ``(-x, -z, -y, w)``. Swapping the components
+    without the sign gives the inverse rotation, which is right only for
+    no turn and for a half turn."""
     o3de_pos   = (unity_transform.position[0],
                   unity_transform.position[2],
                   unity_transform.position[1])
     qx, qy, qz, qw = unity_transform.rotation
-    o3de_rot   = (qx, qz, qy, qw)
+    o3de_rot   = (-qx, -qz, -qy, qw)
     o3de_scale = (unity_transform.scale[0],
                   unity_transform.scale[2],
                   unity_transform.scale[1])
     converted = Transform(o3de_pos, o3de_rot, o3de_scale)
     return converted, not converted.is_uniform_scale()
+
+
+def non_uniform_scale_component(component_id: int, scale) -> Dict:
+    """An ``EditorNonUniformScaleComponent`` holding ``scale`` (O3DE axes).
+    The engine reads the scale from ``NonUniformScale``
+    (``EditorNonUniformScaleComponent::Reflect``); under any other key the
+    component loads with a scale of one."""
+    return {
+        "$type": "EditorNonUniformScaleComponent",
+        "Id": component_id,
+        "NonUniformScale": [float(value) for value in scale],
+    }
+
+
+def gradient_gi_component(component_id: int, high, mid, low) -> Dict:
+    """An ``EditorGradientGIComponent``: the level's ambient light as a
+    gradient of three linear colours ``(r, g, b)`` - straight up, at the
+    horizon, straight down.
+
+    The component is the engine's "Gradient GI (IBL)"
+    (``AtomLyIntegration/CommonFeatures/GradientGI``). It writes the colours
+    as they are into a floating-point cubemap, so they are linear light. A
+    level takes one: it shares a service with the Global Skylight (IBL)
+    component and with itself, and the newest one wins."""
+    def colour(rgb) -> List[float]:
+        return [float(rgb[0]), float(rgb[1]), float(rgb[2]), 1.0]
+
+    return {
+        "$type": "{B2C3D4E5-F6A7-8901-BCDE-F12345678901} AZ::Render::EditorGradientGIComponent",
+        "Id": component_id,
+        "Controller": {
+            "Configuration": {
+                "HighColor": colour(high),
+                "MidColor":  colour(mid),
+                "LowColor":  colour(low),
+            }
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +236,7 @@ def create_o3de_prefab(worker, root_go: GameObject, all_game_objects: Dict,
     write_entity_map_sidecar(
         worker, output_path, root_entity, all_game_objects, entity_id_map,
         fbx_material_labels,
+        transform_map=transform_map,
     )
 
 
@@ -190,7 +249,8 @@ def write_entity_map_sidecar(worker,
                               root_go: GameObject,
                               all_game_objects: Dict,
                               entity_id_map: Dict[str, str],
-                              fbx_material_labels: Dict[str, List[str]]) -> None:
+                              fbx_material_labels: Dict[str, List[str]],
+                              transform_map: Optional[Dict[str, str]] = None) -> None:
     """Build the per-prefab entity-map record and stash it on the worker.
 
     Two storage locations:
@@ -241,6 +301,11 @@ def write_entity_map_sidecar(worker,
         "root_entity":          entity_id_map.get(root_go.file_id, ""),
         "container_alias":      "ContainerEntity",
         "entity_aliases":       dict(entity_id_map),
+        # {Unity Transform file id: its GameObject's file id}. An override on
+        # an object's transform names the transform, not the object.
+        "transform_owners":     {str(transform_id): str(owner)
+                                 for transform_id, owner in (transform_map or {}).items()
+                                 if str(owner) in entity_id_map},
         "material_slots":       material_slots,
         "material_slot_labels": material_slot_labels,
         "go_names":             go_names,
@@ -349,7 +414,13 @@ def create_nested_prefab_instance(worker, go: GameObject, prefab_path: Path,
     path to the lowercased asset-hint root, which worked on Windows by
     accident (case-insensitive FS) and broke on Linux/macOS."""
     from integrated_asset_processor import _project_relative_path
-    rel = _project_relative_path(prefab_path)
+    # ``prefab_path`` is the Unity source file. The Source of an instance
+    # names the CONVERTED prefab, where this run writes it. The engine wants
+    # one prefab named by one string wherever it is nested, so this must be
+    # the spelling the scene converter uses for the same file: its path from
+    # the O3DE project root, case kept.
+    converted_prefab = worker.prefabs_dir / prefab_path.name
+    rel = _project_relative_path(converted_prefab)
     source_path = rel if rel else f"{worker.asset_hint_root}/prefabs/{prefab_path.name}"
     o3de_transform, _ = convert_to_o3de_coordinates(go.transform)
     euler             = quaternion_to_euler(o3de_transform.rotation)
@@ -380,9 +451,10 @@ def create_nested_prefab_instance(worker, go: GameObject, prefab_path: Path,
                 "value": axis_val,
             })
 
-    # Scale: uniform → scalar patch; non-uniform → log + skip (would need
-    # EditorNonUniformScaleComponent patch path that may not exist).
+    # Scale: uniform → scalar patch on the container; non-uniform → a
+    # component on the instance's root entity (below, once its alias is known).
     sx, sy, sz = o3de_transform.scale
+    non_uniform = False
     if abs(sx - 1.0) > 0.0001 and abs(sx - sy) < 0.0001 and abs(sy - sz) < 0.0001:
         patches.append({
             "op":    "replace",
@@ -390,13 +462,13 @@ def create_nested_prefab_instance(worker, go: GameObject, prefab_path: Path,
             "value": sx,
         })
     elif (abs(sx - 1.0) > 0.0001 or abs(sy - 1.0) > 0.0001 or abs(sz - 1.0) > 0.0001):
-        worker.coverage.warn(
-            f"Non-uniform scale override on nested instance '{go.name}' "
-            f"({sx}, {sy}, {sz}) not emitted — needs EditorNonUniformScaleComponent."
-        )
+        non_uniform = True
 
     # TIER 2 + TIER 3 — walk modifications by propertyPath.
     sidecar = load_entity_map_sidecar(worker, prefab_path)
+    if non_uniform:
+        patches += instance_non_uniform_scale_patches(
+            (sx, sy, sz), sidecar, generate_component_id(worker), go.name, worker.coverage.warn)
     entity_aliases = (sidecar or {}).get("entity_aliases", {})
     material_slot_labels = (sidecar or {}).get("material_slot_labels", {})
 
@@ -405,6 +477,9 @@ def create_nested_prefab_instance(worker, go: GameObject, prefab_path: Path,
             f"No entity-map sidecar for source prefab '{prefab_path.name}' — "
             f"non-transform overrides on nested instance '{go.name}' cannot be targeted."
         )
+
+    # Transform overrides on objects inside the instance.
+    patches += child_transform_patches(go.prefab_modifications, sidecar, go.name, worker.coverage.warn)
 
     # Material-slot overrides arrive as multiple property entries on the
     # same target. Collect them first to know the slot count per target.
@@ -529,6 +604,96 @@ def create_nested_prefab_instance(worker, go: GameObject, prefab_path: Path,
         "Source":  source_path,
         "Patches": patches,
     }
+
+
+def instance_non_uniform_scale_patches(scale, sidecar: Optional[Dict], component_id: int,
+                                       instance_name: str, warn) -> List[Dict]:
+    """The patch that gives a nested instance a non-uniform scale (O3DE
+    axes): an ``EditorNonUniformScaleComponent`` added to the instance's
+    root entity.
+
+    The container entity cannot carry it: the engine applies a non-uniform
+    scale to an entity's own mesh and shapes and passes nothing down. On the
+    root entity it scales what the root shows, which is the whole of a
+    prefab made of one object. For a prefab with more objects the ones below
+    the root keep their size and place, and that is reported."""
+    root_alias = (sidecar or {}).get("root_entity")
+    if not root_alias:
+        warn(f"Non-uniform scale on nested instance '{instance_name}' {tuple(scale)} not emitted — "
+             f"the source prefab's entity map is not known.")
+        return []
+    if len((sidecar or {}).get("entity_aliases") or {}) > 1:
+        warn(f"Non-uniform scale on nested instance '{instance_name}' {tuple(scale)} is set on its root "
+             f"only: O3DE does not pass a non-uniform scale down, so the objects below the root keep "
+             f"their size and place.")
+    return [{
+        "op":    "add",
+        "path":  f"/Entities/{root_alias}/Components/EditorNonUniformScaleComponent",
+        "value": non_uniform_scale_component(component_id, scale),
+    }]
+
+
+def child_transform_patches(modifications: List[Dict], sidecar: Optional[Dict],
+                            instance_name: str, warn) -> List[Dict]:
+    """The patches for an instance's transform overrides that target an
+    object *inside* it (a door moved in its frame), not the instance itself.
+
+    ``sidecar`` is the source prefab's entity map: it says which entity was
+    made of the object that owns the targeted transform. A position is
+    patched one axis at a time (Unity ``x, y, z`` is O3DE ``x, z, y``); every
+    entity is written with a ``Translate``, so the path exists. A rotation
+    can only be set whole, so it needs all four numbers of the override; a
+    scale is set when it is the same on all three axes. What cannot be
+    placed is reported through ``warn``."""
+    from platforms.unity.prefab import root_override_target
+
+    root_target = root_override_target(modifications)
+    if root_target is None:
+        return []           # nothing tells the instance's overrides from its objects'
+
+    values_of: Dict[str, Dict[str, float]] = {}
+    for mod in modifications:
+        path   = str(mod.get('propertyPath', '') or '')
+        target = str((mod.get('target') or {}).get('fileID', ''))
+        if target != root_target and path.startswith(('m_LocalPosition.', 'm_LocalRotation.', 'm_LocalScale.')):
+            try:
+                values_of.setdefault(target, {})[path] = float(mod.get('value'))
+            except (TypeError, ValueError):
+                continue
+
+    owners  = (sidecar or {}).get("transform_owners", {})
+    aliases = (sidecar or {}).get("entity_aliases", {})
+    patches: List[Dict] = []
+    for target, values in values_of.items():
+        alias = aliases.get(owners.get(target, ""))
+        if not alias:
+            warn(f"Transform override on an object inside nested instance '{instance_name}' "
+                 f"(transform fileID={target}) not emitted — the source prefab's entity map "
+                 f"does not hold that object.")
+            continue
+        base = f"/Entities/{alias}/Components/TransformComponent/Transform Data"
+
+        for axis, index in (("x", 0), ("y", 2), ("z", 1)):
+            if f"m_LocalPosition.{axis}" in values:
+                patches.append({"op": "replace", "path": f"{base}/Translate/{index}",
+                                "value": values[f"m_LocalPosition.{axis}"]})
+
+        rotation = [values.get(f"m_LocalRotation.{axis}") for axis in "xyzw"]
+        if all(value is not None for value in rotation):
+            converted, _ = convert_to_o3de_coordinates(Transform(rotation=tuple(rotation)))
+            patches.append({"op": "add", "path": f"{base}/Rotate",
+                            "value": quaternion_to_euler(converted.rotation)})
+        elif any(value is not None for value in rotation):
+            warn(f"Rotation override on an object inside nested instance '{instance_name}' "
+                 f"holds only part of the rotation — not emitted.")
+
+        scale = [values.get(f"m_LocalScale.{axis}") for axis in "xyz"]
+        if all(value is not None for value in scale) and max(scale) - min(scale) < 0.0001:
+            patches.append({"op": "add", "path": f"{base}/Scale", "value": scale[0]})
+        elif any(value is not None for value in scale):
+            warn(f"Scale override on an object inside nested instance '{instance_name}' "
+                 f"is not one scale for all axes — not emitted.")
+    return patches
 
 
 def make_bare_entity(worker, entity_id: str, name: str,
@@ -680,28 +845,31 @@ def create_entity_recursive(worker, go: GameObject, all_game_objects: Dict,
     euler = quaternion_to_euler(o3de_transform.rotation)
 
     # Add Transform Data only if entity has non-default transform.
-    has_translation = any(abs(v) > 0.0001 for v in o3de_transform.position)
     has_rotation    = any(abs(v) > 0.0001 for v in euler)
     has_scale       = not needs_nonuniform and abs(o3de_transform.scale[0] - 1.0) > 0.0001
 
-    if has_translation or has_rotation or has_scale:
-        transform_data: Dict = {}
-        if has_translation:
-            transform_data["Translate"] = list(o3de_transform.position)
-        if has_rotation:
-            transform_data["Rotate"] = euler
-        if has_scale:
-            transform_data["Scale"] = o3de_transform.scale[0]
-        transform_component["Transform Data"] = transform_data
+    # The position is always written, also when it is zero: a prefab that
+    # nests this one may move the object, and a patch can replace one axis
+    # of a position only where the position exists (`child_transform_patches`).
+    transform_data: Dict = {"Translate": list(o3de_transform.position)}
+    if has_rotation:
+        transform_data["Rotate"] = euler
+    if has_scale:
+        transform_data["Scale"] = o3de_transform.scale[0]
+    transform_component["Transform Data"] = transform_data
 
     entity["Components"]["TransformComponent"] = transform_component
 
     if needs_nonuniform:
-        entity["Components"]["EditorNonUniformScaleComponent"] = {
-            "$type": "EditorNonUniformScaleComponent",
-            "Id": generate_component_id(worker),
-            "Scale": list(o3de_transform.scale),
-        }
+        entity["Components"]["EditorNonUniformScaleComponent"] = non_uniform_scale_component(
+            generate_component_id(worker), o3de_transform.scale)
+        # The engine applies this scale to the entity's own mesh and shapes
+        # only. Unity scales everything below as well.
+        if go.children_ids:
+            worker.coverage.warn(
+                f"'{go.name}' has a non-uniform scale {tuple(o3de_transform.scale)} and "
+                f"{len(go.children_ids)} child object(s): O3DE does not pass a non-uniform "
+                f"scale down, so the children keep their size and place.")
 
     # Component Processors — emit phase (mesh, material, physics, …).
     # Each processor runs in WEIGHT order and may add child entities.

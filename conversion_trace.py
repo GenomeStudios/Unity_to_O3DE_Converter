@@ -38,6 +38,8 @@ import struct
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from fbx_reader import object_name, properties70, read_records
+
 
 # =============================================================================
 # CONSTANTS
@@ -132,7 +134,7 @@ class ConversionTrace:
                 "translate":        _copy(data.get("Translate")),
                 "rotate_euler":     _copy(data.get("Rotate")),
                 "scale":            data.get("Scale"),
-                "nonuniform_scale": _copy(nonuniform.get("Scale")),
+                "nonuniform_scale": _copy(nonuniform.get("NonUniformScale")),
             },
             "unity_components": _unity_components(go),
             "components": [
@@ -174,14 +176,15 @@ class ConversionTrace:
     # -------------------------------------------------------------------------
 
     def record_assetinfo(self, fbx_path: Path, mesh_guid: Optional[str], up_axis: int,
-                         settings: dict, rotation: Optional[list],
-                         node_autocenters: dict, shared_translation: Optional[list],
-                         groups: List[dict], physx_specs: Optional[list]) -> None:
+                         settings: dict, node_translations: dict,
+                         user_translation: Optional[list], groups: List[dict]) -> None:
         """One ``.assetinfo`` write. A file written more than once keeps every
-        write here; the last is what is on disk."""
+        write here; the last is what is on disk.
+
+        ``node_translations`` holds, by node, the translation the file's own
+        geometric transform gave its rule; ``user_translation`` the user's
+        ``default_position`` when one applies."""
         self.fbx_files[Path(fbx_path).name] = Path(fbx_path)
-        aligned = {spec.get("name"): spec.get("translation")
-                   for spec in (physx_specs or []) if spec.get("translation") is not None}
 
         records = []
         for group in groups:
@@ -192,14 +195,11 @@ class ConversionTrace:
                          if r.get("$type") == "CoordinateSystemRule"), {})
             leaf = nodes[0].split(".")[-1] if nodes else ""
 
-            if "translation" not in rule:
-                source = ""
-            elif is_physx and group.get("name") in aligned:
-                source = "collider_alignment"
-            elif shared_translation is not None:
-                source = "user_default_position"
-            else:
-                source = "auto_center"
+            sources = []
+            if leaf in node_translations:
+                sources.append("geometric_transform")
+            if user_translation is not None:
+                sources.append("user_default_position")
 
             records.append({
                 "kind":               "physx" if is_physx else "visual",
@@ -207,8 +207,8 @@ class ConversionTrace:
                 "node_paths":         nodes,
                 "rotation":           _copy(rule.get("rotation")),
                 "translation":        _copy(rule.get("translation")),
-                "translation_source": source,
-                "auto_center_of_node": _copy(node_autocenters.get(leaf)),
+                "translation_source": " + ".join(sources) if "translation" in rule else "",
+                "geometric_translation": _copy(node_translations.get(leaf)),
                 "convex":             group.get("export method") == 1,
             })
 
@@ -218,8 +218,7 @@ class ConversionTrace:
             "written_for":   (self._current or {}).get("source_guid", ""),
             "up_axis":       up_axis,
             "settings":      _copy(settings),
-            "rotation_rule": "y_up_plus_90_x" if (up_axis == 1 and settings.get("auto_rotation", True))
-                             else ("user_default_rotation" if rotation else ""),
+            "rotation_rule": "source_import_rule" if settings.get("auto_rotation", True) else "",
             "groups":        records,
         })
 
@@ -324,7 +323,7 @@ def uncovered_in_prefab(prefab_file: Path, record: dict) -> List[str]:
     for entity_id, entity in data.get("Entities", {}).items():
         components = entity.get("Components", {})
         transform = components.get("TransformComponent", {}).get("Transform Data", {})
-        nonuniform = components.get("EditorNonUniformScaleComponent", {}).get("Scale")
+        nonuniform = components.get("EditorNonUniformScaleComponent", {}).get("NonUniformScale")
         if not transform and nonuniform is None:
             continue
         traced = traced_entities.get(entity_id)
@@ -391,89 +390,6 @@ def uncovered_in_output(trace: ConversionTrace) -> List[str]:
 # What the file itself says, before any importer touches it.
 # =============================================================================
 
-def _read_fbx_records(fbx_path: Path) -> List[dict]:
-    """The record tree of a binary FBX: ``[{name, props, children}, ...]``.
-    Array payloads are skipped. Empty for a file that is not binary FBX."""
-    try:
-        data = Path(fbx_path).read_bytes()
-    except OSError:
-        return []
-    if data[:21] != b"Kaydara FBX Binary  \x00":
-        return []
-
-    large = struct.unpack("<I", data[23:27])[0] >= 7500
-    offset_format, offset_size = ("<Q", 8) if large else ("<I", 4)
-    sentinel = 25 if large else 13
-    scalar_formats = {"Y": ("<h", 2), "I": ("<i", 4), "F": ("<f", 4), "D": ("<d", 8), "L": ("<q", 8)}
-
-    def read_properties(position: int, count: int):
-        properties = []
-        for _ in range(count):
-            kind = chr(data[position]); position += 1
-            if kind in scalar_formats:
-                fmt, size = scalar_formats[kind]
-                properties.append(struct.unpack(fmt, data[position:position + size])[0]); position += size
-            elif kind == "C":
-                properties.append(bool(data[position])); position += 1
-            elif kind in "fdlib":
-                _, _, compressed = struct.unpack("<III", data[position:position + 12])
-                position += 12 + compressed
-                properties.append(None)
-            elif kind in "SR":
-                length = struct.unpack("<I", data[position:position + 4])[0]; position += 4
-                raw = data[position:position + length]; position += length
-                properties.append(raw if kind == "R" else raw.decode("utf-8", "ignore"))
-            else:
-                raise ValueError(f"unknown FBX property type {kind!r}")
-        return properties, position
-
-    def read_record(position: int):
-        end = struct.unpack(offset_format, data[position:position + offset_size])[0]; position += offset_size
-        count = struct.unpack(offset_format, data[position:position + offset_size])[0]; position += offset_size
-        position += offset_size
-        name_length = data[position]; position += 1
-        name = data[position:position + name_length].decode("utf-8", "ignore"); position += name_length
-        if end == 0:
-            return None, position
-        properties, position = read_properties(position, count)
-        children = []
-        while position < end - sentinel:
-            child, position = read_record(position)
-            if child is None:
-                break
-            children.append(child)
-        return {"name": name, "props": properties, "children": children}, end
-
-    records, position = [], 27
-    try:
-        while position < len(data) - sentinel:
-            record, position = read_record(position)
-            if record is None:
-                break
-            records.append(record)
-    except (ValueError, struct.error, IndexError):
-        pass
-    return records
-
-
-def _properties70(record: dict, wanted) -> Dict[str, list]:
-    """The numeric values of the named ``P`` entries of a record."""
-    found: Dict[str, list] = {}
-    for block in (c for c in record["children"] if c["name"] == "Properties70"):
-        for entry in (c for c in block["children"] if c["name"] == "P"):
-            if entry["props"] and entry["props"][0] in wanted:
-                found[entry["props"][0]] = [
-                    value for value in entry["props"][4:]
-                    if isinstance(value, (int, float)) and not isinstance(value, bool)
-                ]
-    return found
-
-
-def _object_name(record: dict) -> str:
-    label = next((p for p in record["props"] if isinstance(p, str)), "")
-    return label.split("\x00\x01")[0].split("::")[0].strip()
-
-
 def read_fbx_facts(fbx_path: Path) -> dict:
     """Raw facts of one binary FBX: version, global axis and unit settings,
     every Model node with its parent and transform properties (FBX units,
@@ -481,7 +397,7 @@ def read_fbx_facts(fbx_path: Path) -> dict:
     belongs to. ``{}`` for a file that cannot be read."""
     from integrated_asset_processor import _read_fbx_geometry_stats
 
-    records = _read_fbx_records(fbx_path)
+    records = read_records(fbx_path)
     if not records:
         return {}
     by_name = {record["name"]: record for record in records}
@@ -489,7 +405,7 @@ def read_fbx_facts(fbx_path: Path) -> dict:
 
     models = [r for r in objects if r["name"] == "Model"]
     geometries = [r for r in objects if r["name"] == "Geometry"]
-    model_name = {r["props"][0]: _object_name(r) for r in models if r["props"]}
+    model_name = {r["props"][0]: object_name(r) for r in models if r["props"]}
 
     # Connections "OO child parent": a model under a model, a geometry under a model.
     parent_of: Dict[int, int] = {}
@@ -500,9 +416,9 @@ def read_fbx_facts(fbx_path: Path) -> dict:
     nodes = {}
     for record in models:
         node_id = record["props"][0] if record["props"] else None
-        nodes[_object_name(record)] = {
+        nodes[object_name(record)] = {
             "parent":     model_name.get(parent_of.get(node_id), ""),
-            "properties": _properties70(record, FBX_NODE_PROPERTIES),
+            "properties": properties70(record, FBX_NODE_PROPERTIES),
         }
 
     try:
@@ -520,7 +436,7 @@ def read_fbx_facts(fbx_path: Path) -> dict:
     header = Path(fbx_path).read_bytes()[23:27]
     return {
         "version":         struct.unpack("<I", header)[0],
-        "global_settings": _properties70(by_name.get("GlobalSettings", {"children": []}), FBX_GLOBAL_SETTINGS),
+        "global_settings": properties70(by_name.get("GlobalSettings", {"children": []}), FBX_GLOBAL_SETTINGS),
         "nodes":           nodes,
         "geometries":      geometry_facts,
     }

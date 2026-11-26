@@ -92,6 +92,11 @@ def run_asset_processor(source_path: str, output_path: str, prefab_files: list, 
 
     log(f"\nProcessing {len(prefab_files)} selected Unity prefab(s)")
 
+    # A prefab is converted after the ones it nests: placing its overrides
+    # needs the nested prefab's entity map.
+    from platforms.unity.prefab import nested_prefabs_first
+    prefab_files = nested_prefabs_first(list(prefab_files), processor.asset_db.path_to_guid)
+
     success_count = 0
     for i, prefab_file in enumerate(prefab_files, 1):
         log(f"\n[{i}/{len(prefab_files)}] {prefab_file.name}")

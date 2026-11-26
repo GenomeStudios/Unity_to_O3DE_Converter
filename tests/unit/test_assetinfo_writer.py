@@ -129,6 +129,23 @@ def test_zero_position_false_suppresses_translation():
             f"zero_position=False should suppress translation: {rule}"
 
 
+def _with_facts(up_axis, geometric_rotation=(-90.0, 0.0, 0.0), geometric_translation=(0.0, 0.0, 0.0)):
+    """Make the writer see a file of the given up axis whose node "Cube"
+    carries the given geometric transform (3ds Max writes -90 about X).
+    Returns the function that puts the real reader back."""
+    import fbx_reader
+    original = fbx_reader.read_import_facts
+    fbx_reader.read_import_facts = lambda _path: {
+        "up_axis": up_axis, "unit_to_metres": 0.01,
+        "nodes": {"Cube": {"geometric_translation": list(geometric_translation),
+                           "geometric_rotation": list(geometric_rotation),
+                           "geometric_scaling": [1.0, 1.0, 1.0]}}}
+
+    def restore():
+        fbx_reader.read_import_facts = original
+    return restore
+
+
 def test_y_up_composes_90x_correction_over_user_rotation():
     """Per-FBX Y-up→Z-up correction (re-introduced 2026-05-28, confirmed via
     the Office Cabinet cook): a Y-up FBX (up_axis=1) composes a +90° X
@@ -141,14 +158,13 @@ def test_y_up_composes_90x_correction_over_user_rotation():
     with tempfile.TemporaryDirectory() as td:
         fbx = Path(td) / "Foo.fbx"
         write_fake_fbx(fbx)
-        original = iap.read_fbx_up_axis
-        iap.read_fbx_up_axis = lambda _p: 1  # type: ignore[assignment]
+        restore = _with_facts(1)
         try:
             write_fbx_assetinfo(fbx, "Foo", {"Cube": "RootNode.Foo.Cube"},
                                  log=lambda *_: None,
                                  mesh_settings=settings, mesh_guid="mesh-x")
         finally:
-            iap.read_fbx_up_axis = original
+            restore()
         rule = _read_coord_rule(Path(str(fbx) + ".assetinfo"))
         expected = _quat_mul(_euler_deg_to_quat([0, 90, 0]),
                              _euler_deg_to_quat([90, 0, 0]))
@@ -164,14 +180,13 @@ def test_z_up_does_not_auto_correct():
     with tempfile.TemporaryDirectory() as td:
         fbx = Path(td) / "Foo.fbx"
         write_fake_fbx(fbx)
-        original = iap.read_fbx_up_axis
-        iap.read_fbx_up_axis = lambda _p: 2  # type: ignore[assignment]
+        restore = _with_facts(2)
         try:
             write_fbx_assetinfo(fbx, "Foo", {"Cube": "RootNode.Foo.Cube"},
                                  log=lambda *_: None,
                                  mesh_settings=settings, mesh_guid="mesh-x")
         finally:
-            iap.read_fbx_up_axis = original
+            restore()
         rule = _read_coord_rule(Path(str(fbx) + ".assetinfo"))
         assert "rotation" not in rule, f"Z-up must not auto-correct: {rule}"
 
@@ -187,14 +202,13 @@ def test_zero_user_rotation_on_y_up_writes_90x():
     with tempfile.TemporaryDirectory() as td:
         fbx = Path(td) / "Foo.fbx"
         write_fake_fbx(fbx)
-        original = iap.read_fbx_up_axis
-        iap.read_fbx_up_axis = lambda _p: 1  # type: ignore[assignment]
+        restore = _with_facts(1)
         try:
             write_fbx_assetinfo(fbx, "Foo", {"Cube": "RootNode.Foo.Cube"},
                                  log=lambda *_: None,
                                  mesh_settings=settings, mesh_guid="mesh-x")
         finally:
-            iap.read_fbx_up_axis = original
+            restore()
         rule = _read_coord_rule(Path(str(fbx) + ".assetinfo"))
         s = math.sin(math.radians(45)); c = math.cos(math.radians(45))
         assert _quat_close(rule["rotation"], [s, 0, 0, c]), \
@@ -202,10 +216,10 @@ def test_zero_user_rotation_on_y_up_writes_90x():
 
 
 def test_auto_center_toggle_gates_translation():
-    """auto_center=False suppresses the single-mesh auto-center; =True applies
-    the derived value. (compute_single_mesh_autocenter monkeypatched.)"""
-    orig = iap.compute_node_autocenters
-    iap.compute_node_autocenters = lambda _p: {"Cube": [0.5, 0.0, 0.0]}
+    """auto_center=False leaves the file's geometric offset out of the rule;
+    =True applies it. The node's offset of -50 cm along X is +0.5 m along X
+    once Unity's negated X is taken into account."""
+    restore = _with_facts(2, geometric_translation=(-50.0, 0.0, 0.0))
     try:
         with tempfile.TemporaryDirectory() as td:
             for flag, expect in ((True, [0.5, 0.0, 0.0]), (False, None)):
@@ -219,7 +233,7 @@ def test_auto_center_toggle_gates_translation():
                 rule = _read_coord_rule(Path(str(fbx) + ".assetinfo"))
                 assert rule.get("translation") == expect, (flag, rule)
     finally:
-        iap.compute_node_autocenters = orig
+        restore()
 
 
 def test_auto_rotation_toggle_gates_rotation():
@@ -321,9 +335,10 @@ def test_collider_node_selection():
         assert "RootNode.Foo.Lid" in sel["unselectedNodes"]
 
 
-def test_collider_identity_omits_rules():
-    """T-5d: with default mesh settings the coordinate rule is identity,
-    so the PhysX group carries no 'rules'."""
+def test_collider_identity_still_carries_its_rule():
+    """A collision group whose rule turns and moves nothing still has to
+    carry it: without an advanced rule the engine bakes the node's place in
+    the file into the collision mesh."""
     with tempfile.TemporaryDirectory() as td:
         fbx = Path(td) / "Foo.fbx"
         write_fake_fbx(fbx)
@@ -331,7 +346,7 @@ def test_collider_identity_omits_rules():
             fbx, "Foo", {"Cube": "RootNode.Foo.Cube"}, log=lambda *_: None,
             physx_specs=[_spec("Foo", "RootNode.Foo.Cube")])
         g = _physx_groups(Path(str(fbx) + ".assetinfo"))[0]
-        assert "rules" not in g
+        assert g["rules"]["rules"] == [{"$type": "CoordinateSystemRule", "useAdvancedData": True}]
 
 
 def test_multiple_physx_specs_emit_distinct_groups():

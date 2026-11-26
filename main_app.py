@@ -4284,8 +4284,8 @@ _MESH_FIELDS = [
     ("default_position", "Default position (X / Y / Z)", "vec3"),
     ("default_rotation", "Default rotation (X / Y / Z)", "vec3"),
     ("physx_mesh",       "Generate PhysX collision mesh", "bool"),
-    ("auto_center",      "Auto-center single-mesh (⚙)",  "bool"),
-    ("auto_rotation",    "Auto Y-up→Z-up rotation (⚙)",  "bool"),
+    ("auto_center",      "Geometric offset from the file (⚙)",  "bool"),
+    ("auto_rotation",    "Axis rule from the file (⚙)",  "bool"),
 ]
 
 
@@ -4697,7 +4697,7 @@ class MeshTab(QWidget):
             if has_override:
                 tip_lines.append("Override applied")
             if auto_center is not None:
-                tip_lines.append(f"⚙ Auto-centered (per-node) → {auto_center}")
+                tip_lines.append(f"⚙ Geometric offset from the file (per node) → {auto_center}")
             if auto_y_up:
                 tip_lines.append("⚙ Y-up FBX → auto +90° X rotation")
             if is_dirty:

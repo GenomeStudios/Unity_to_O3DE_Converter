@@ -85,7 +85,9 @@ def test_to_o3de_coordinates_swizzles_y_z():
                           scale=[1, 2, 3])
     converted, non_uniform = plat.to_o3de_coordinates(t)
     assert converted.translation == [1, 3, 2]
-    assert converted.rotation    == [0.1, 0.3, 0.2, 0.4]
+    # The swap of Y and Z is a mirror: the rotation's sense reverses with it
+    # (see tests/unit/test_rotation_map.py).
+    assert converted.rotation    == [-0.1, -0.3, -0.2, 0.4]
     assert converted.scale       == [1, 3, 2]
     assert non_uniform
 

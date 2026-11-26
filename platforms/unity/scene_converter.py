@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Tuple, Optional, Set
 from platforms.unity.components import load_component_processors, build_dispatch_table
 from platforms.unity.components.base import ProcessingContext
 from integrated_asset_processor import CoverageTracker
+from platforms.unity.prefab import root_override_target, targets_root
 from platforms.unity.types import Transform, GameObject
 
 
@@ -164,6 +165,10 @@ class UnitySceneConverter:
         # Collected component blocks from the scene (anchor -> {type, data})
         self.components_data: Dict[str, Dict] = {}
 
+        # The scene's RenderSettings block: its ambient light (see
+        # `platforms.unity.scene_lighting`). None until a scene is parsed.
+        self.render_settings: Optional[Dict] = None
+
         # =====================================================================
         # Coverage tracker — populated incrementally; reported via to_coverage()
         # =====================================================================
@@ -187,6 +192,7 @@ class UnitySceneConverter:
         self.missing_prefabs.clear()
         self.prefab_instances.clear()
         self.components_data.clear()
+        self.render_settings = None
         
         with open(scene_path, 'r', encoding='utf-8') as f:
             content = f.read()
@@ -228,6 +234,9 @@ class UnitySceneConverter:
                     # those; only m_IsPrefabParent == 0 docs are real placements.
                     if int(doc['Prefab'].get('m_IsPrefabParent', 0) or 0) == 0:
                         self._parse_prefab_instance(doc['Prefab'], anchor)
+                elif 'RenderSettings' in doc and isinstance(doc['RenderSettings'], dict):
+                    self.render_settings = doc['RenderSettings']
+                    self.coverage.record_component('RenderSettings', 'SceneLighting')
                 else:
                     # Collect component blocks for the processor pipeline,
                     # and record every top-level key into coverage so the
@@ -403,17 +412,22 @@ class UnitySceneConverter:
         if parent_id != '0':
             instance_data['parent_fileID'] = parent_id
 
-        # Project transform modifications onto position/rotation/scale.
+        # Project the transform modifications of the instance's own root
+        # onto position/rotation/scale. Those on an object inside the
+        # instance are emitted as patches on that object.
         pos        = [0, 0, 0]
         rot        = [0, 0, 0, 1]
         scale_vals = [1, 1, 1]
         AXIS = {'x': 0, 'y': 1, 'z': 2, 'w': 3}
+        root_target = root_override_target(modifications)
 
         for mod in modifications:
             property_path = (mod.get('propertyPath') or '').strip()
             value         = mod.get('value')
             if property_path == 'm_Name':
                 instance_data['name'] = value
+            elif not targets_root(mod, root_target):
+                continue
             elif property_path.startswith('m_LocalPosition.'):
                 a = property_path.rsplit('.', 1)[-1]
                 if a in AXIS and AXIS[a] < 3 and value is not None:
@@ -592,6 +606,11 @@ class UnitySceneConverter:
                 child_order.append(entity_id)
                 blank_entity_count += 1
         
+        lighting_entity_id = self._add_ambient_light(level_data["Entities"], "Entity_[1000000]")
+        if lighting_entity_id:
+            child_order.append(lighting_entity_id)
+            blank_entity_count += 1
+
         if child_order:
             level_data["ContainerEntity"]["Components"]["EditorEntitySortComponent"]["Child Entity Order"] = child_order
         
@@ -604,6 +623,37 @@ class UnitySceneConverter:
         
         return total_entities + total_instances, total_instances, total_entities
     
+    # -------------------------------------------------------------------------
+    # SCENE LIGHTING
+    # -------------------------------------------------------------------------
+
+    def _add_ambient_light(self, entities: Dict, parent_entity_id: str) -> Optional[str]:
+        """Add the level's one ambient light: an entity with a Gradient GI
+        component that carries the Unity scene's three ambient colours.
+        Returns the entity's id, or None for a scene without ambient
+        colours."""
+        from platforms.unity.scene_lighting import ambient_gradient
+        from targets.o3de.prefab_writer import gradient_gi_component
+
+        ambient = ambient_gradient(self.render_settings)
+        if ambient is None:
+            return None
+
+        entity_id = self._generate_entity_id()
+        entity = self._make_bare_entity(entity_id, "Gradient GI", parent_entity_id)
+        entity["Components"]["EditorGradientGIComponent"] = gradient_gi_component(
+            self._generate_component_id(), ambient["sky"], ambient["equator"], ambient["ground"])
+        entities[entity_id] = entity
+
+        self.log(f"  [Lighting] Gradient GI: sky {ambient['sky']}, equator {ambient['equator']}, "
+                 f"ground {ambient['ground']} (Unity ambient source: {ambient['mode']})")
+        if not ambient["exact"]:
+            self.coverage.warn(
+                f"The scene takes its ambient light from its {ambient['mode'].lower()}, not from "
+                f"its three ambient colours. The level's Gradient GI carries the three colours "
+                f"the scene stores, so its ambient tone will differ from Unity's.")
+        return entity_id
+
     def _create_level_container(self) -> Dict:
         """Create ContainerEntity for level"""
         return {
@@ -730,6 +780,7 @@ class UnitySceneConverter:
                 })
 
         sx, sy, sz = o3de_transform.scale
+        non_uniform = False
         if abs(sx - 1.0) > 0.0001 and abs(sx - sy) < 0.0001 and abs(sy - sz) < 0.0001:
             patches.append({
                 "op":   "replace",
@@ -737,13 +788,15 @@ class UnitySceneConverter:
                 "value": sx,
             })
         elif (abs(sx - 1.0) > 0.0001 or abs(sy - 1.0) > 0.0001 or abs(sz - 1.0) > 0.0001):
-            self.coverage.warn(
-                f"Non-uniform scale override on scene prefab instance '{go.name}' "
-                f"({sx}, {sy}, {sz}) not emitted — needs EditorNonUniformScaleComponent."
-            )
+            non_uniform = True
 
         # ---- Tier 2 + 3: walk modifications by propertyPath ----
         sidecar = self._load_entity_map_sidecar(prefab_path)
+        if non_uniform:
+            # A component on the instance's root entity; see the helper.
+            from targets.o3de.prefab_writer import instance_non_uniform_scale_patches
+            patches += instance_non_uniform_scale_patches(
+                (sx, sy, sz), sidecar, self._generate_component_id(), go.name, self.coverage.warn)
         entity_aliases       = (sidecar or {}).get("entity_aliases", {})
         material_slot_labels = (sidecar or {}).get("material_slot_labels", {})
 
@@ -752,6 +805,10 @@ class UnitySceneConverter:
                 f"No entity-map sidecar for prefab '{prefab_path.name}' — "
                 f"non-transform overrides on scene instance '{go.name}' cannot be targeted."
             )
+
+        # Transform overrides on objects inside the instance.
+        from targets.o3de.prefab_writer import child_transform_patches
+        patches += child_transform_patches(go.prefab_modifications, sidecar, go.name, self.coverage.warn)
 
         material_overrides: Dict[str, Dict[int, str]] = {}
 
@@ -970,25 +1027,11 @@ class UnitySceneConverter:
         }
     
     def _quaternion_to_euler(self, quaternion: Tuple[float, float, float, float]) -> List[float]:
-        """Convert quaternion to Euler angles in degrees"""
-        x, y, z, w = quaternion
-        
-        sinr_cosp = 2 * (w * x + y * z)
-        cosr_cosp = 1 - 2 * (x * x + y * y)
-        roll = math.atan2(sinr_cosp, cosr_cosp)
-        
-        sinp = 2 * (w * y - z * x)
-        if abs(sinp) >= 1:
-            pitch = math.copysign(math.pi / 2, sinp)
-        else:
-            pitch = math.asin(sinp)
-        
-        siny_cosp = 2 * (w * z + x * y)
-        cosy_cosp = 1 - 2 * (y * y + z * z)
-        yaw = math.atan2(siny_cosp, cosy_cosp)
-        
-        return [math.degrees(roll), math.degrees(pitch), math.degrees(yaw)]
-    
+        """Convert quaternion to the Euler angles O3DE reads back as the
+        same rotation. One implementation, the prefab writer's."""
+        from targets.o3de.prefab_writer import quaternion_to_euler
+        return quaternion_to_euler(quaternion)
+
     def _create_entity_recursive(self, go: GameObject, all_game_objects: Dict,
                                  entities_dict: Dict, instances_dict: Dict,
                                  entity_id_map: Dict, output_base: Path,
@@ -1066,11 +1109,9 @@ class UnitySceneConverter:
         entity["Components"]["TransformComponent"] = transform_component
         
         if needs_nonuniform:
-            entity["Components"]["EditorNonUniformScaleComponent"] = {
-                "$type": "EditorNonUniformScaleComponent",
-                "Id": self._generate_component_id(),
-                "Scale": list(o3de_transform.scale)
-            }
+            from targets.o3de.prefab_writer import non_uniform_scale_component
+            entity["Components"]["EditorNonUniformScaleComponent"] = non_uniform_scale_component(
+                self._generate_component_id(), o3de_transform.scale)
 
         # ---------------------------------------------------------------
         # Component Processors — emit phase (physics, mesh, material, ...)

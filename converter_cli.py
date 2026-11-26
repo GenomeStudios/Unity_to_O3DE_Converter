@@ -217,6 +217,7 @@ def command_run(arguments) -> int:
         trace = ConversionTrace()
 
     errors = 0
+    plain_uuid4 = uuid.uuid4
     try:
         for stage_key in stages:
             # Component ids and mesh group ids are random; a seed makes two
@@ -231,6 +232,7 @@ def command_run(arguments) -> int:
             errors += run.errors
             print(f"[run] {stage_key}: {run.summary}")
     finally:
+        uuid.uuid4 = plain_uuid4
         if log_file:
             log_file.close()
 

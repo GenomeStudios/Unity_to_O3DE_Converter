@@ -15,11 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from tests.harness import run_module_tests
-from integrated_asset_processor import (
-    read_fbx_node_transforms, read_fbx_geometry_centroids,
-    read_fbx_geometry_bbox_centers,
-    compute_single_mesh_autocenter, compute_node_autocenters,
-)
+from integrated_asset_processor import read_fbx_node_transforms, read_fbx_geometry_centroids
 
 
 # --- minimal binary-FBX builder (just enough for Objects>Model>Properties70) ---
@@ -171,71 +167,6 @@ def test_geometry_centroid_metres():
         assert len(cs) == 1
         assert abs(cs[0][0] - 1.0) < 1e-6 and abs(cs[0][1] - 2.0) < 1e-6 \
             and abs(cs[0][2] + 0.5) < 1e-6, cs
-    finally:
-        fbx.unlink(missing_ok=True)
-
-
-def test_bbox_center_vs_centroid():
-    """bbox center = (min+max)/2; differs from the vertex centroid for a
-    skewed vertex distribution (the box-vs-detailed-mesh case)."""
-    # 3 verts: heavy on the low end → centroid < bbox center.
-    verts = [-100, 0, 0,  -100, 0, 0,  +100, 0, 0]   # cm; centroidX=-33.3, bboxX=0
-    fbx = _write([_geometry("M", verts)])
-    try:
-        assert abs(read_fbx_geometry_bbox_centers(fbx)[0][0] - 0.0) < 1e-6
-        assert abs(read_fbx_geometry_centroids(fbx)[0][0] + 0.3333) < 1e-3
-    finally:
-        fbx.unlink(missing_ok=True)
-
-
-def test_single_mesh_autocenter_formula():
-    """default_position = (centroid_X, node_Y, -node_Z). Single Model + single
-    Geometry. node T=(2440,-45,76)cm → (-,-0.45,-0.76); centroid X from verts."""
-    verts = [-65, 0, 0,  -55, 0, 0]   # cm; centroid X = -60cm = -0.6m
-    fbx = _write([
-        _model("Drawer", (2440.0, -45.0, 76.0), (90.0, 0.0, 0.0), (1, 1, 1)),
-        _geometry("Drawer", verts),
-    ])
-    try:
-        ac = compute_single_mesh_autocenter(fbx)
-        assert ac is not None
-        assert abs(ac[0] + 0.60) < 1e-3, ac      # centroid_X
-        assert abs(ac[1] + 0.45) < 1e-3, ac      # node_Y
-        assert abs(ac[2] + 0.76) < 1e-3, ac      # -node_Z
-    finally:
-        fbx.unlink(missing_ok=True)
-
-
-def test_multi_mesh_autocenter_is_none():
-    """Multi-mesh FBX (2 Models) → None for the SINGLE-mesh helper."""
-    fbx = _write([
-        _model("A", (0, 0, 0), (0, 0, 0), (1, 1, 1)),
-        _model("B", (0, 0, 0), (0, 0, 0), (1, 1, 1)),
-        _geometry("A", [0, 0, 0, 1, 1, 1]),
-    ])
-    try:
-        assert compute_single_mesh_autocenter(fbx) is None
-    finally:
-        fbx.unlink(missing_ok=True)
-
-
-def test_per_node_autocenters_multi_mesh():
-    """compute_node_autocenters pairs Model↔Geometry by file order and gives a
-    per-node (centroid_X, node_Y, -node_Z). Two nodes → two centers."""
-    fbx = _write([
-        # node Frame: Y/Z tiny; geometry centred → ~0 compensation.
-        _model("Frame", (4900.0, 0.0, 0.0), (90.0, 0.0, 0.0), (1, 1, 1)),
-        _model("Door",  (62.0, 125.0, 22.0), (0.0, 0.0, 0.0), (1, 1, 1)),
-        _geometry("Frame", [-10, 0, 0,  10, 0, 0]),          # centroid X = 0
-        _geometry("Door",  [10, 0, 0,   30, 0, 0]),          # centroid X = 20cm = 0.2m
-    ])
-    try:
-        ac = compute_node_autocenters(fbx)
-        assert set(ac) == {"Frame", "Door"}, ac
-        assert abs(ac["Frame"][0]) < 1e-3, ac                # frame centred
-        assert abs(ac["Door"][0] - 0.20) < 1e-3, ac          # centroid_X
-        assert abs(ac["Door"][1] - 1.25) < 1e-3, ac          # node_Y
-        assert abs(ac["Door"][2] + 0.22) < 1e-3, ac          # -node_Z
     finally:
         fbx.unlink(missing_ok=True)
 

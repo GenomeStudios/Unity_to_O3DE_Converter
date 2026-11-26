@@ -434,8 +434,10 @@ class UnityPlatform(SourcePlatform):
         # matches the legacy converter's (x, z, y) swizzle.
         new_translation = [tx, tz, ty]
 
+        # The swap is a mirror, so the rotation's sense reverses: see
+        # `targets.o3de.prefab_writer.convert_to_o3de_coordinates`.
         qx, qy, qz, qw = transform.rotation
-        new_rotation = [qx, qz, qy, qw]
+        new_rotation = [-qx, -qz, -qy, qw]
 
         sx, sy, sz = transform.scale
         new_scale = [sx, sz, sy]

@@ -17,6 +17,10 @@ Two-stage automated converter: Unity graphical assets/prefabs → O3DE prefabs, 
 - `stage_runner.py` - the two stage runs, shared by the GUI tabs and the command line.
 - `conversion_trace.py` - optional trace of how every emitted transform and coordinate rule was produced (`converter_cli.py run --trace`).
 - `platforms/unity/bridge/` - headless Unity: the truth dump (what Unity holds after import).
+- `fbx_reader.py` - what a binary FBX says, read without an FBX library: up axis, unit, the node tree (parent, path, mesh, transforms, geometric transform) and the materials each mesh uses in slot order. `matrix3.py` - the 3x3 arithmetic beside it.
+- `platforms/unity/model_import.py` - what Unity makes of a model file, from the file and its `.meta`: mesh ids to nodes, the model's object tree with Unity's transforms and ids, material slots. Used to name each renderer's FBX node and to convert instances of a model inside a prefab.
+- `platforms/unity/builtin_meshes.py` - Unity's built-in cube written as an OBJ; `platforms/unity/scene_lighting.py` - a scene's three ambient colours, emitted as one Gradient GI entity per level.
+- What the parity fixes changed and why (rotation map, mesh import rule, node selection, model instances, instance overrides, non-uniform scale, colliders, lighting): `mem:parity_fixes/plan`.
 - `parity/` - parity harness: Unity's truth against the cooked O3DE result, per element, with clusters. Plan, baseline findings on the Office pack and environment facts: `mem:parity_harness/plan`, `mem:parity_harness/environment`.
 - `tools/bake_fbx_transforms.py` — standalone Blender headless tool (out-of-process).
 

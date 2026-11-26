@@ -155,6 +155,154 @@ def test_fit_reports_unmatched_geometry():
 # RESIDUAL SEARCH
 # =============================================================================
 
+def _pencil(count: int = 300, seed: int = 5) -> np.ndarray:
+    """Points of a thin rod along X: 15 cm long, 3 mm thick."""
+    generator = np.random.default_rng(seed)
+    return np.column_stack([generator.uniform(-0.075, 0.075, count),
+                            generator.uniform(-0.0015, 0.0015, count),
+                            generator.uniform(-0.0015, 0.0015, count)])
+
+
+def test_reach_from_an_axis_is_small_along_a_rod_and_large_across_it():
+    rod = _pencil()
+    along = cmp.spread_about_axis(rod, [1.0, 0.0, 0.0])
+    across = cmp.spread_about_axis(rod, [0.0, 0.0, 1.0])
+    assert along < 0.002 < 0.03 < across
+    assert abs(cmp.spread_about_axis(rod, None) - np.sqrt(along ** 2 + rod[:, 0].var())) < 1e-6
+
+
+class _Tolerance:
+    tolerance = {"position_mm": 1.0, "rotation_deg": 0.1, "geometry_mm": 1.0}
+
+
+def test_a_rod_turned_about_its_length_within_its_noise_is_in_place():
+    """The pencil of the Office pack: a fit of a thin mesh turns about its
+    length by a third of a degree on noise of a twentieth of a millimetre."""
+    rod = _pencil()
+    fit = {"matched": 1.0, "offset_mm": 0.02, "rotation_deg": 0.37, "noise_mm": 0.05,
+           "rotation_axis": [1.0, 0.0, 0.0]}
+    assert report.placement_verdict(_Tolerance, fit, rod) == (True, False)
+    # The same turn about an axis across the rod moves its ends by half a millimetre: not noise.
+    across = dict(fit, rotation_axis=[0.0, 0.0, 1.0])
+    assert report.placement_verdict(_Tolerance, across, rod) == (False, False)
+
+
+def test_an_offset_beyond_tolerance_and_noise_is_not_in_place():
+    rod = _pencil()
+    fit = {"matched": 1.0, "offset_mm": 2.5, "rotation_deg": 0.0, "noise_mm": 0.3, "rotation_axis": None}
+    assert report.placement_verdict(_Tolerance, fit, rod) == (False, False)
+    assert report.placement_verdict(_Tolerance, dict(fit, offset_mm=1.2), rod) == (True, False)
+    assert report.placement_verdict(_Tolerance, dict(fit, offset_mm=0.4), rod) == (True, True)
+    assert report.placement_verdict(_Tolerance, dict(fit, offset_mm=0.4, matched=0.5), rod) == (False, False)
+
+
+def test_the_fit_names_the_axis_it_turns_about():
+    expected = _cloud(600)
+    centre = expected.mean(axis=0)
+    turned = (expected - centre) @ _rotation([0, 0, 1], 0.5).T + centre
+    fit = cmp.fit_placement(turned, expected, cmp.noise_gate(expected, TOLERANCE))
+    assert abs(abs(fit["rotation_axis"][2]) - 1.0) < 1e-3, fit
+
+
+# =============================================================================
+# MATERIALS
+# =============================================================================
+
+def _material(name, path):
+    return {"name": name, "guid": "0" * 32, "assetPath": path}
+
+
+def _traced_with(hints):
+    return {"components": [{"emitted": {"materials": [{"assetHint": hint} for hint in hints]}}]}
+
+
+def test_unitys_default_material_is_not_asked_for():
+    """A cube made in the Unity editor carries Unity's own material, which is
+    no asset of the project: nothing can be converted, nothing is missing."""
+    item = {"materials": [_material("Lit", "Packages/com.unity.render-pipelines.universal/Runtime/Materials/Lit.mat")]}
+    element = report.material_element(item, _traced_with([]))
+    assert element["status"] == "pass" and element["unity_not_project_assets"] == ["lit"]
+
+
+def test_a_project_material_that_is_missing_still_fails():
+    item = {"materials": [_material("Wall", "Assets/Pack/Materials/Wall.mat"),
+                          _material("Lit", "Packages/urp/Lit.mat")]}
+    assert report.material_element(item, _traced_with([]))["status"] == "fail"
+    passed = report.material_element(item, _traced_with(["assets/pack/materials/wall.azmaterial"]))
+    assert passed["status"] == "pass"
+
+
+# =============================================================================
+# A LEVEL'S AMBIENT LIGHT
+# =============================================================================
+
+_SCENE_TEXT = """--- !u!104 &2
+RenderSettings:
+  m_AmbientSkyColor: {r: 0.212, g: 0.227, b: 0.259, a: 1}
+  m_AmbientEquatorColor: {r: 0.114, g: 0.125, b: 0.133, a: 1}
+  m_AmbientGroundColor: {r: 0.047, g: 0.043, b: 0.035, a: 1}
+  m_AmbientMode: 0
+"""
+
+
+_SCENE_WITHOUT_AMBIENT = """--- !u!104 &2
+RenderSettings:
+  m_Fog: 0
+"""
+
+
+def _lighting_row(held_components: dict, scene_text: str = _SCENE_TEXT):
+    """Run report.lighting_row on a scene file and a probe's properties.json
+    made up for the test. ``held_components``: {entity id: {path: value}}."""
+    with tempfile.TemporaryDirectory() as folder:
+        root = Path(folder)
+        (root / "Assets").mkdir()
+        (root / "Assets" / "Gallery.unity").write_text(scene_text, encoding="utf-8")
+        (root / "properties.json").write_text(json.dumps(
+            {entity_id: {report.GRADIENT_GI: values} for entity_id, values in held_components.items()}),
+            encoding="utf-8")
+
+        class _Truth:
+            catalog = {"projectPath": str(root)}
+
+        class _Cycle:
+            truth = _Truth()
+
+        return report.lighting_row(_Cycle(), {"assetPath": "Assets/Gallery.unity"}, root)
+
+
+_HELD = {"Controller|Configuration|Gradient Colors|High (Zenith)": "(r=0.2120000,g=0.2270000,b=0.2590000,a=1.0000000)",
+         "Controller|Configuration|Gradient Colors|Mid (Horizon)": "(r=0.1140000,g=0.1250000,b=0.1330000,a=1.0000000)",
+         "Controller|Configuration|Gradient Colors|Low (Nadir)":   "(r=0.0470000,g=0.0430000,b=0.0350000,a=1.0000000)",
+         "Controller|Configuration|Settings|Exposure": "0.0"}
+
+
+def test_the_ambient_colours_are_read_from_the_scene_file():
+    with tempfile.TemporaryDirectory() as folder:
+        scene = Path(folder) / "Gallery.unity"
+        scene.write_text(_SCENE_TEXT, encoding="utf-8")
+        assert report.unity_ambient_colours(scene)["m_AmbientGroundColor"] == [0.047, 0.043, 0.035]
+        scene.write_text(_SCENE_WITHOUT_AMBIENT, encoding="utf-8")
+        assert report.unity_ambient_colours(scene) is None
+
+
+def test_a_level_holding_the_scenes_three_colours_passes_its_lighting():
+    row = _lighting_row({"7": _HELD})
+    assert row["status"] == "pass" and row["source"] == "(scene lighting)"
+
+
+def test_a_wrong_colour_or_a_missing_component_fails_the_lighting():
+    wrong = dict(_HELD, **{"Controller|Configuration|Gradient Colors|Low (Nadir)": "(r=0.5,g=0.5,b=0.5,a=1.0)"})
+    row = _lighting_row({"7": wrong})
+    assert row["status"] == "fail" and "Low is" in row["residual"]
+    assert "0 Gradient GI component(s)" in _lighting_row({})["residual"]
+    assert "2 Gradient GI component(s)" in _lighting_row({"7": _HELD, "8": _HELD})["residual"]
+
+
+def test_a_scene_without_ambient_colours_has_no_lighting_row():
+    assert _lighting_row({"7": _HELD}, scene_text=_SCENE_WITHOUT_AMBIENT) is None
+
+
 def _residual(actual, expected):
     residual = cmp.find_residual(actual, expected, TOLERANCE)
     return residual, cmp.residual_class(residual, TOLERANCE)

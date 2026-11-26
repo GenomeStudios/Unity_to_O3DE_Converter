@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import re
 import shutil
 import time
 from collections import defaultdict
@@ -113,10 +114,14 @@ def resolve_entity(cycle: Cycle, top_alias: str, item: dict):
             return None, None, f"the converter did not process {Path(link['assetPath']).name or link['guid']}"
         if link["instanceFileId"]:
             nested = next((i for i in traced["instances"] if i["go_file_id"] == link["instanceFileId"]), None)
-            if nested is None:
+            if nested is not None:
+                path = f"{path}/{nested['instance_alias']}"
+                continue
+            # An instance of a model file has no prefab of its own: the
+            # converter makes its objects entities of this prefab, under the
+            # ids Unity gives them here.
+            if not any(e["go_file_id"] == link["fileId"] for e in traced["entities"]):
                 return None, None, "its nested instance is not in the trace"
-            path = f"{path}/{nested['instance_alias']}"
-            continue
         traced_entity = next((e for e in traced["entities"] if e["go_file_id"] == link["fileId"]), None)
         if traced_entity is None:
             return None, None, "the object is not in the trace"
@@ -141,6 +146,29 @@ def entity_matrix(entity: dict) -> np.ndarray:
 # =============================================================================
 # VERDICTS
 # =============================================================================
+
+def placement_verdict(cycle: Cycle, fit: dict, expected: np.ndarray) -> Tuple[bool, bool]:
+    """Whether a fitted placement (``compare.fit_placement``) is in place:
+    ``(within the tolerance plus the truth's own noise, within the tolerance
+    alone)``.
+
+    The truth's vertices are noisy, and not independently: Unity's mesh
+    compression moves a whole face at once. An offset smaller than the noise
+    left after the fit cannot be told from that rounding, so the noise is
+    allowed on top of the position tolerance. For the turn the allowance is
+    the angle that noise subtends at the reach of the points *from the axis
+    of the fitted turn*: a pencil can turn about its length by a degree
+    before any vertex moves a tenth of a millimetre, and its fit does."""
+    if fit["matched"] < MATCHED_SHARE:
+        return False, False
+    reach_mm = cmp.spread_about_axis(expected, fit.get("rotation_axis")) * 1000.0
+    noise_deg = float(np.degrees(np.arctan2(fit["noise_mm"], max(reach_mm, 1e-6))))
+    strict = (fit["offset_mm"] <= cycle.tolerance["position_mm"]
+              and fit["rotation_deg"] <= cycle.tolerance["rotation_deg"])
+    allowed = (fit["offset_mm"] <= cycle.tolerance["position_mm"] + fit["noise_mm"]
+               and fit["rotation_deg"] <= cycle.tolerance["rotation_deg"] + noise_deg)
+    return allowed, strict
+
 
 def transform_element(cycle: Cycle, expected: np.ndarray, actual: np.ndarray, traced: dict) -> dict:
     delta = cmp.transform_delta(expected, actual)
@@ -226,13 +254,12 @@ def mesh_element(cycle: Cycle, item: dict, entity: dict, traced: dict, frame_uni
     imported = cycle._import_cache[cache_key]
     element["import"] = {"class": imported["class"], "text": imported["text"]}
 
-    # The verdict is on where the mesh sits (see compare.fit_placement).
-    in_place = (fit["matched"] >= MATCHED_SHARE
-                and fit["offset_mm"] <= cycle.tolerance["position_mm"]
-                and fit["rotation_deg"] <= cycle.tolerance["rotation_deg"]
-                and abs(fit["scale"] - 1.0) <= SCALE_TOLERANCE * 5)
-    if in_place:
+    # The verdict is on where the mesh sits (see placement_verdict).
+    allowed, strict = placement_verdict(cycle, fit, expected)
+    if allowed and abs(fit["scale"] - 1.0) <= SCALE_TOLERANCE * 5:
         element["status"] = "pass"
+        if not strict:
+            element["within_rounding"] = True
         return element
 
     residual = cmp.find_residual(actual, expected, gate)
@@ -398,14 +425,18 @@ def collider_elements(cycle: Cycle, item: dict, entity: dict, traced: dict,
             distance = {"max_mm": float(worst * 1000.0), "measure": "bounds"}
             limit *= CONVEX_SLACK
         elif geometry["kind"] == "Mesh":
-            # Unity's vertices carry compression noise: judge where the mesh sits.
+            # Unity's vertices carry compression noise: judge where the mesh
+            # sits, as for a render mesh (placement_verdict).
             expected = geometry["points"]
             fit = cmp.fit_placement(actual, expected, cmp.noise_gate(expected, cycle.tolerance_m))
-            worst = fit["offset_mm"] if fit["matched"] >= MATCHED_SHARE else float("inf")
-            distance = {"max_mm": float(worst), "measure": "fit", "rotation_deg": fit["rotation_deg"],
-                        "matched": fit["matched"]}
-            if fit["rotation_deg"] > cycle.tolerance["rotation_deg"]:
-                distance["max_mm"] = max(distance["max_mm"], limit * 2)
+            allowed, strict = placement_verdict(cycle, fit, expected)
+            distance = {"max_mm": float(fit["offset_mm"]), "measure": "fit", "rotation_deg": fit["rotation_deg"],
+                        "matched": fit["matched"], "noise_mm": fit["noise_mm"]}
+            if allowed:
+                elements.append({**element, "distance": distance, "status": "pass",
+                                 **({} if strict else {"within_rounding": True})})
+                continue
+            distance["max_mm"] = max(distance["max_mm"], limit * 2)     # not in place: it must not pass below
         else:
             expected = geometry["points"]
             distance = {**cmp.two_way_distance(actual, expected), "measure": "points"}
@@ -437,14 +468,25 @@ def collider_elements(cycle: Cycle, item: dict, entity: dict, traced: dict,
 
 def material_element(item: dict, traced: dict) -> dict:
     """Are the materials on the renderer the ones Unity has, by name? The
-    slot each sits on is not checked."""
-    wanted = sorted({material["name"].lower() for material in item["materials"] if material["name"]})
+    slot each sits on is not checked.
+
+    A material that is no asset of the project (Unity's own default, which a
+    cube made in the editor carries) has nothing to be converted from; a
+    renderer left without a material shows the engine's default, as Unity
+    shows its own. Such materials are listed, not asked for."""
+    in_project = [material for material in item["materials"]
+                  if material["name"] and material.get("assetPath", "").startswith("Assets/")]
+    not_assets = sorted({material["name"].lower() for material in item["materials"]
+                         if material["name"] and material not in in_project})
+    wanted = sorted({material["name"].lower() for material in in_project})
     hints: List[str] = []
     for component in traced.get("components", []):
         _collect_hints(component.get("emitted"), hints)
     emitted = sorted({Path(hint).name.split(".")[0].lower() for hint in hints
                       if ".azmaterial" in hint.lower() or ".material" in hint.lower()})
     element = {"kind": "materials", "unity": wanted, "o3de": emitted}
+    if not_assets:
+        element["unity_not_project_assets"] = not_assets
     if wanted == emitted:
         return {**element, "status": "pass"}
     missing = sorted(set(wanted) - set(emitted))
@@ -553,9 +595,30 @@ def compare_scene(cycle: Cycle, entry: dict) -> Optional[dict]:
                for instance in traced["instances"]}
     objects = cycle.truth.hierarchy(entry)["objects"]
 
+    # Objects of the scene itself (a light, a camera): by their file id.
+    own = {entity["prefab"]["alias"]: entity for entity in record.entities
+           if "/" not in entity["prefab"]["instancePath"] and not entity["prefab"]["isContainer"]}
+    own_aliases = {entity["go_file_id"]: entity["entity_id"] for entity in traced["entities"]}
+
     rows = []
     for item in objects:
         link = item["identity"][0]
+        if not link["instanceFileId"]:
+            row = {"name": item["name"], "path": item["path"], "source": "(scene object)"}
+            entity = own.get(own_aliases.get(link["fileId"], ""))
+            if entity is None:
+                row.update({"status": "unmatched", "signature": "scene: object not in the level",
+                            "residual": "the converter made no entity for it"})
+            else:
+                expected = cmp.unity_matrix_to_o3de(matrix_from_rows(item["matrix"]))
+                element = transform_element(cycle, expected, entity_matrix(entity), {"rule": "scene object"})
+                row.update({key: element[key] for key in ("status", "delta") if key in element})
+                if element["status"] == "fail":
+                    row["signature"] = element["signature"].replace("transform:", "scene:")
+                    row["residual"] = element["residual"]
+            rows.append(row)
+            continue
+
         parent = objects[item["parent"]] if item["parent"] >= 0 else None
         placed = item["isInstanceRoot"] and (
             parent is None or parent["identity"][0]["instanceFileId"] != link["instanceFileId"])
@@ -577,10 +640,64 @@ def compare_scene(cycle: Cycle, entry: dict) -> Optional[dict]:
                 row["residual"] = element["residual"]
         rows.append(row)
 
+    lighting = lighting_row(cycle, entry, folder)
+    if lighting is not None:
+        rows.append(lighting)
+
     statuses = [row["status"] for row in rows]
     return {"name": name, "level_probe": record.done,
             "counts": {status: statuses.count(status) for status in STATUS_ORDER if status in statuses},
             "instances": rows}
+
+
+# ----- The level's ambient light ----------------------------------------------
+
+GRADIENT_GI = "Gradient GI (IBL)"       # the component's name in the Editor
+AMBIENT_COLOURS = (("High", "m_AmbientSkyColor"), ("Mid", "m_AmbientEquatorColor"), ("Low", "m_AmbientGroundColor"))
+COLOUR_TOLERANCE = 0.002
+
+
+def unity_ambient_colours(scene_file: Path) -> Optional[Dict[str, List[float]]]:
+    """The three ambient colours a Unity scene file stores, by their Unity
+    names; None when the file holds none."""
+    try:
+        text = Path(scene_file).read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    colours = {}
+    for _, key in AMBIENT_COLOURS:
+        match = re.search(key + r":\s*\{r:\s*([-\d.e]+),\s*g:\s*([-\d.e]+),\s*b:\s*([-\d.e]+)", text)
+        if match is None:
+            return None
+        colours[key] = [float(value) for value in match.groups()]
+    return colours
+
+
+def lighting_row(cycle: Cycle, entry: dict, folder: Path) -> Optional[dict]:
+    """The level's ambient light: the three colours the Unity scene file
+    stores against the ones the Editor holds in the level's Gradient GI
+    component, read back by the probe session. A row like an instance's;
+    None for a scene without ambient colours."""
+    wanted = unity_ambient_colours(Path(cycle.truth.catalog.get("projectPath", "")) / entry["assetPath"])
+    if wanted is None:
+        return None
+    row = {"name": "Gradient GI", "path": "(level)", "source": "(scene lighting)"}
+
+    properties = _read_json(folder / "properties.json")
+    held = [components[GRADIENT_GI] for components in properties.values() if GRADIENT_GI in components]
+    if len(held) != 1:
+        return {**row, "status": "fail", "signature": "scene: lighting",
+                "residual": f"{len(held)} Gradient GI component(s) in the level, one wanted"}
+
+    misses = []
+    for label, key in AMBIENT_COLOURS:
+        value = next((text for path, text in held[0].items() if label in path.split("|")[-1]), None)
+        numbers = [float(number) for number in re.findall(r"-?\d+\.?\d*(?:e-?\d+)?", value or "")][:3]
+        if len(numbers) < 3 or max(abs(a - b) for a, b in zip(numbers, wanted[key])) > COLOUR_TOLERANCE:
+            misses.append(f"{label} is {numbers or value} for Unity's {wanted[key]}")
+    if misses:
+        return {**row, "status": "fail", "signature": "scene: lighting", "residual": "; ".join(misses)}
+    return {**row, "status": "pass", "colours": wanted}
 
 
 def scene_clusters(scene: dict) -> List[dict]:
@@ -669,6 +786,10 @@ def summarise(prefabs: List[dict]) -> dict:
         "prefabs": {status: sum(1 for p in prefabs if p["status"] == status)
                     for status in STATUS_ORDER if any(p["status"] == status for p in prefabs)},
         "elements": {kind: dict(counts) for kind, counts in sorted(elements.items())},
+        # Meshes that pass only because their offset is inside the noise of
+        # Unity's own vertices (see mesh_element).
+        "within_rounding": sum(1 for prefab in prefabs for record in prefab.get("objects", [])
+                               for element in record["elements"] if element.get("within_rounding")),
     }
 
 
@@ -717,6 +838,8 @@ def render_markdown(report: dict) -> str:
     for kind, counts in summary["elements"].items():
         lines.append(f"| {kind} | " + " | ".join(str(counts.get(status, 0)) for status in STATUS_ORDER) + " |")
 
+    lines += ["", f"Meshes passing within Unity's own vertex rounding (offset inside the noise of the fit): "
+                  f"{summary.get('within_rounding', 0)}."]
     lines += ["", "## Cook", ""]
     if report["cook_failed"]:
         lines += [f"- `{Path(source).name}`: {reasons[0] if reasons else 'no error line'}"
@@ -807,7 +930,11 @@ def run_compare(bed, arguments) -> int:
         "cook_failed":    cycle.cook.get("failed") or {},
         "import_classes": import_classes,
         "imports":        [{**{key: value for key, value in imported.items() if key != "residual"},
-                            "shift": imported["residual"]["shift"]}
+                            "shift": imported["residual"]["shift"],
+                            "turn": imported["residual"]["name"],
+                            "turn_matrix": imported["residual"]["rotation"],
+                            "scale": imported["residual"]["scale"],
+                            "explained": imported["residual"]["found"]}
                            for imported in cycle._import_cache.values()],
         "clusters":       build_clusters(prefabs),
         "prefabs":        prefabs,
@@ -824,6 +951,7 @@ def run_compare(bed, arguments) -> int:
           + ", ".join(f"{count} {status}" for status, count in report["summary"]["prefabs"].items()))
     for kind, counts in report["summary"]["elements"].items():
         print(f"[compare]   {kind:<10} " + ", ".join(f"{count} {status}" for status, count in sorted(counts.items())))
+    print(f"[compare]   meshes passing within Unity's rounding: {report['summary']['within_rounding']}")
     print(f"[compare] {len(report['clusters'])} cluster(s); the largest:")
     for cluster in report["clusters"][:12]:
         print(f"[compare]   {len(cluster['prefabs']):>3} prefab(s) {cluster['elements']:>4} element(s)  {cluster['signature']}")

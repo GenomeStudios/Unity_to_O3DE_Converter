@@ -159,6 +159,21 @@ class BoxColliderProcessor(ComponentProcessor):
 # SHAPE WRITER
 # =============================================================================
 
+# The thinnest box side written, in metres. PhysX takes no side of zero.
+MIN_BOX_SIDE = 0.0001
+
+
+def box_dimensions(size) -> List[float]:
+    """The sides of a box shape for a Unity BoxCollider's ``m_Size``.
+
+    Unity accepts a size that is negative or zero on an axis (a sheet of
+    paper authored with no thickness, a box dragged through itself) and
+    collides with the box of its magnitudes. PhysX in O3DE refuses such a
+    box outright ("Negative or zero values are invalid for box dimensions")
+    and the entity is left with no collider at all. So each side is its
+    magnitude, and a side of zero becomes ``MIN_BOX_SIDE``."""
+    return [max(abs(float(side)), MIN_BOX_SIDE) for side in size]
+
 def _write_box_shape(components: Dict, collider: Dict, go,
                      ctx: ProcessingContext) -> None:
     """Write EditorBoxShapeComponent + EditorShapeColliderComponent."""
@@ -167,7 +182,7 @@ def _write_box_shape(components: Dict, collider: Dict, go,
     has_offset = any(abs(v) > 0.0001 for v in offset)
 
     sx, sy, sz = collider.get('size', (1, 1, 1))
-    dims       = [sx, sz, sy]           # swap Y/Z axes
+    dims       = box_dimensions((sx, sz, sy))   # swap Y/Z axes
 
     box_cfg: Dict = {'IsFilled': False, 'Dimensions': dims}
     if has_offset:

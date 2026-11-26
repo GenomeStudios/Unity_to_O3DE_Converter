@@ -206,8 +206,10 @@ def step_probe(bed: Bed, arguments) -> int:
         if not (bed.o3de_root / "Levels" / level / f"{level}.prefab").is_file():
             continue
         scene_dir = run_dir / f"scene_{level}"
+        # Of a converted level only its lighting is read back, not every component.
         result = o3de_run.editor_session(bed.o3de_root, scene_dir, {
-            "level": level, "out": (scene_dir / "o3de").as_posix(), "scrub": False,
+            "level": level, "out": (scene_dir / "o3de").as_posix(),
+            "scrub": True, "scrub_components": ["Gradient GI (IBL)"],
         })
         _print_session(f"probe {level}", result)
     return EXIT_OK

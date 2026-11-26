@@ -140,6 +140,8 @@ to-o3de_project_converter/
     converter_cli.py                  The converter without its window (describe / run / truth)
     stage_runner.py                   Stage runs shared by the GUI and the command line
     conversion_trace.py               How every emitted value was produced (optional)
+    fbx_reader.py                     What a binary FBX says: axes, unit, node tree, materials
+    matrix3.py                        The small 3x3 rotation arithmetic the converter needs
     converter_settings.json           App-level state (recent projects)
     Projects/                         Per-project .u2oproj.json files
 
@@ -148,6 +150,9 @@ to-o3de_project_converter/
         types.py                      Neutral data shapes
         unity/                        Unity reference plugin
             bridge/                   Headless Unity runs: the truth dump
+            model_import.py           What Unity makes of a model file: ids, objects, materials
+            builtin_meshes.py         Unity's built-in meshes, written out (the cube)
+            scene_lighting.py         A scene's ambient colours
         README.md                     How to add a new platform
 
     targets/                          Output-target writers

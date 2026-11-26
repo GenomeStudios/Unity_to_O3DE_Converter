@@ -77,6 +77,78 @@ def _quat_mul(q1, q2) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Small matrix arithmetic: lives in ``matrix3``. The names below are the ones
+# this module and its tests have always used.
+# ---------------------------------------------------------------------------
+
+from matrix3 import (  # noqa: E402
+    IDENTITY as _IDENTITY,
+    euler_xyz_matrix as _euler_xyz_matrix,
+    is_identity as _is_identity,
+    mat_mul as _mat_mul,
+    mat_vec as _mat_vec,
+    matrix_to_quat as _matrix_to_quat,
+    quat_to_matrix as _quat_to_matrix,
+)
+
+
+# ---------------------------------------------------------------------------
+# The import rule a mesh node needs to match the source engine's import
+# ---------------------------------------------------------------------------
+
+# Unity negates X when it imports an FBX; a Unity point (x, y, z) is the O3DE
+# point (x, z, y). The two together are one turn: (x, y, z) -> (-x, z, y).
+_UNITY_MESH_TO_O3DE = [[-1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]]
+
+# How the file's raw vertices relate to the vertices O3DE's scene pipeline
+# holds before any rule, by the file's up axis (raw = turn * pipeline).
+# Measured on the Office pack, 255 meshes; see mem:parity_fixes/plan D.12.
+_RAW_FROM_PIPELINE = {
+    1: _UNITY_MESH_TO_O3DE,                                         # Y-up file
+    2: [[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]],        # Z-up file: half turn about Z
+}
+
+
+def source_import_rule(facts: dict, node_name: str, *,
+                       axis_rule: bool = True, geometric_offset: bool = True):
+    """The rotation (3x3) and translation (metres) of the coordinate rule
+    that makes O3DE's model of one mesh node equal the mesh Unity imports
+    from the same node.
+
+    Unity's mesh is the node's own geometry with the node's **geometric
+    transform** baked in and X negated. O3DE's scene pipeline, given an
+    advanced coordinate rule, applies only that rule to the node's vertices
+    (``SceneAPI::Utilities::DetermineWorldTransform``): neither the node's
+    place in the file nor its geometric transform enters. So the rule is
+
+        rule = U * G * K
+
+    with ``G`` the geometric transform, ``U`` the turn from Unity's mesh
+    space to O3DE's, and ``K`` the turn from the pipeline's vertices back to
+    the file's raw ones, which depends only on the file's up axis.
+
+    ``facts`` comes from ``fbx_reader.read_import_facts``. With an up axis
+    the table does not know, or a node the file does not have, the rule is
+    the identity. ``axis_rule`` and ``geometric_offset`` switch the rotation
+    and the translation off separately."""
+    node = (facts.get("nodes") or {}).get(node_name)
+    raw_from_pipeline = _RAW_FROM_PIPELINE.get(facts.get("up_axis"))
+    if node is None or raw_from_pipeline is None:
+        return _IDENTITY, [0.0, 0.0, 0.0]
+
+    rotation = _IDENTITY
+    if axis_rule:
+        geometric_rotation = _euler_xyz_matrix(node["geometric_rotation"])
+        rotation = _mat_mul(_mat_mul(_UNITY_MESH_TO_O3DE, geometric_rotation), raw_from_pipeline)
+
+    translation = [0.0, 0.0, 0.0]
+    if geometric_offset:
+        unit = float(facts.get("unit_to_metres") or 0.01)
+        translation = _mat_vec(_UNITY_MESH_TO_O3DE, [value * unit for value in node["geometric_translation"]])
+    return rotation, translation
+
+
+# ---------------------------------------------------------------------------
 # Per-mesh settings resolution (F-9 chain)
 # ---------------------------------------------------------------------------
 
@@ -92,8 +164,10 @@ def _resolve_mesh_settings(mesh_settings: Optional[Dict],
         "default_position": [0.0, 0.0, 0.0],
         "default_rotation": [0.0, 0.0, 0.0],
         "physx_mesh":       False,
-        "auto_center":      True,   # single-mesh FBX auto-center (toggle off to disable)
-        "auto_rotation":    True,   # Y-up→Z-up +90°X auto-correction (toggle off to disable)
+        # The import rule read from the file (see `source_import_rule`). The
+        # two keys keep their names so saved projects load unchanged.
+        "auto_center":      True,   # the node's geometric offset, as the rule's translation
+        "auto_rotation":    True,   # the axis and geometric turn, as the rule's rotation
     }
     if not mesh_settings:
         return defaults
@@ -118,32 +192,27 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
                          *,
                          correction_quat: Optional[list] = None,
                          trace=None) -> None:
-    """Write an O3DE .assetinfo with one named MeshGroup per mesh entity.
+    """Write an O3DE .assetinfo with one named MeshGroup per mesh node shown.
 
-    Group name format: "{fbx_stem}-{entity_name}"  e.g. "Closet_A-Glass_L"
+    ``entity_node_map`` is ``{name: node path}``; the converter keys it by
+    the node's own name, so a group is the same whichever prefab asks for it.
+    Group name format: "{fbx_stem}-{name}"  e.g. "Closet_A-Glass_L"
     O3DE lowercases the output: closet_a-glass_l.fbx.azmodel
 
-    Each group selects exactly its FBX node; all other mesh nodes are
-    unselected. Rules mirror O3DE's auto-generated defaults:
+    Each group selects exactly its FBX node and unselects every other mesh
+    node of the file. A node that a selection does not name follows its
+    parent, so the ones no group shows have to be unselected too.
+    Rules mirror O3DE's auto-generated defaults:
     StaticMeshAdvancedRule (vertex color Col0), MaterialRule,
     CoordinateSystemRule (useAdvancedData=true), and LodRule.
 
-    Rotation/translation are written **directly from mesh_settings**.
-    The earlier behaviour composed the user's rotation with a Y-up→Z-up
-    correction quaternion when the source FBX was Y-up; that legacy
-    auto-correction has been removed (2026-05-27). With per-mesh
-    defaults + overrides now part of the workflow, the user authors
-    whatever rotation they need explicitly: ``default_rotation``
-    [90, 0, 0] writes a 90°-X rotation, full stop. ``correction_quat``
-    is retained as a parameter for plugin authors who want to opt in
-    to a different default composition later but it is **not applied
-    by the writer**.
-
-    ``default_position`` is a metric translation — written into the
-    CoordinateSystemRule only when ``zero_position=True`` (the
-    documented "zero on import, then offset by default_position"
-    behaviour). When ``zero_position=False`` no translation field is
-    emitted, so the source FBX node transform passes through.
+    Each group's CoordinateSystemRule is the rule its node needs to match
+    the source engine's import (``source_import_rule``: the axis turn and
+    the node's geometric transform, read from the file), with the user's
+    ``default_rotation`` and ``default_position`` applied after it.
+    ``auto_rotation`` and ``auto_center`` switch the file-derived rotation
+    and translation off; ``default_position`` is applied when
+    ``zero_position`` is set.
 
     When ``physx_specs`` is provided, one PhysX MeshGroup is written per
     spec into the same ``values[]`` array (the engine supports many PhysX
@@ -159,20 +228,11 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
     import json as _json
     import uuid as _uuid
 
-    # FBX up-axis detection lives in `integrated_asset_processor` for now
-    # (FBX binary parsing, format-specific not platform-specific). Imported
-    # at call time to avoid a circular import during module load.
-    from integrated_asset_processor import (
-        read_fbx_up_axis, compute_node_autocenters,
-    )
+    from fbx_reader import mesh_node_names, read_import_facts
 
-    # Per-FBX up-axis drives the Y-up→Z-up rotation correction. FBX
-    # GlobalSettings UpAxis: 1 = Y-up, 2 = Z-up. O3DE is Z-up, so a Y-up FBX
-    # needs a +90° X correction (confirmed in-engine on the Office Cabinet:
-    # Z-up desk imports upright, Y-up cabinet lands on its face without it).
-    # This is the PER-FBX successor to the old GLOBAL auto-correction that
-    # was removed for overcompensating — Z-up FBX (up_axis=2) gets nothing.
-    up_axis = read_fbx_up_axis(fbx_dest_path)
+    # What the file says: its up axis, its unit, each node's geometric transform.
+    facts = read_import_facts(fbx_dest_path)
+    up_axis = facts["up_axis"]
 
     # F-9 — resolve the per-mesh settings chain (defaults + override).
     eff = _resolve_mesh_settings(mesh_settings, mesh_guid)
@@ -180,52 +240,45 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
     user_pos   = list(eff.get("default_position") or [0.0, 0.0, 0.0])
     zero_pos   = bool(eff.get("zero_position", True))
     has_user_rotation = any(abs(float(v)) > 1e-6 for v in user_rot)
-    has_user_translation = any(abs(float(v)) > 1e-6 for v in user_pos)
+    has_user_translation = zero_pos and any(abs(float(v)) > 1e-6 for v in user_pos)
 
-    auto_rotation = bool(eff.get("auto_rotation", True))
-    auto_center   = bool(eff.get("auto_center", True))
+    axis_rule        = bool(eff.get("auto_rotation", True))
+    geometric_offset = bool(eff.get("auto_center", True))
 
-    # --- Shared rotation (per-FBX) ---
-    # User's Euler degrees → quaternion, composed UNDER the Y-up correction.
-    rot_quat = _euler_deg_to_quat(user_rot) if has_user_rotation else None
-    if up_axis == 1 and auto_rotation:
-        yup_corr = _euler_deg_to_quat([90.0, 0.0, 0.0])
-        rot_quat = _quat_mul(rot_quat, yup_corr) if rot_quat else yup_corr
-        log("    [Mesh] Y-up FBX → +90° X auto-correction applied.")
+    # The user's own rotation and position come after the file's rule.
+    user_matrix = _quat_to_matrix(_euler_deg_to_quat(user_rot)) if has_user_rotation else _IDENTITY
+    user_translation = [float(v) for v in user_pos] if has_user_translation else [0.0, 0.0, 0.0]
 
-    # --- Translation (per-node auto-center) ---
-    # Each mesh node is centred independently so its entity/instance transform
-    # places it — reproducing Unity's node-local import. A single-mesh FBX gets
-    # one center; a multi-mesh FBX (cabinet doors, drawer_C) gets one PER
-    # sub-mesh. A user-authored default_position overrides ALL nodes (shared).
-    # Gated by zero_position + auto_center toggle. Self-limiting: an
-    # already-centred node yields ~0. See `mem:transform_truth/*`.
-    shared_translation = ([float(v) for v in user_pos]
-                          if (zero_pos and has_user_translation) else None)
-    # Per-node auto-center, calibrated for BOTH up-axes (compute_node_autocenters
-    # applies the Z-up / Y-up formula). A user-authored default_position
-    # overrides all nodes (shared). Gated by zero_position + the auto_center
-    # toggle. See `mem:transform_truth/*`.
-    node_autocenters = ({} if (shared_translation is not None
-                               or not (zero_pos and auto_center))
-                        else compute_node_autocenters(fbx_dest_path))
-    if node_autocenters:
-        log(f"    [Mesh] per-node auto-center → {node_autocenters}")
+    # For the conversion trace: the file-derived translation of each node.
+    node_translations: Dict[str, list] = {}
 
     def rule_for(node_path: str) -> dict:
-        """Build this node's CoordinateSystemRule: shared rotation + the node's
-        own auto-center translation (or the shared user override)."""
-        rule = {"$type": "CoordinateSystemRule", "useAdvancedData": True}
-        if rot_quat is not None:
-            rule["rotation"] = rot_quat
+        """Build this node's CoordinateSystemRule: the file's rule for the
+        node, then the user's rotation and position."""
         leaf = node_path.split(".")[-1]
-        tr = (shared_translation if shared_translation is not None
-              else node_autocenters.get(leaf))
-        if tr and any(abs(float(v)) > 1e-6 for v in tr):
-            rule["translation"] = [float(v) for v in tr]
+        rotation, translation = source_import_rule(
+            facts, leaf, axis_rule=axis_rule, geometric_offset=geometric_offset)
+        if any(abs(v) > 1e-6 for v in translation):
+            node_translations[leaf] = [round(v, 6) for v in translation]
+
+        rotation = _mat_mul(user_matrix, rotation)
+        translation = [a + b for a, b in zip(_mat_vec(user_matrix, translation), user_translation)]
+
+        rule = {"$type": "CoordinateSystemRule", "useAdvancedData": True}
+        if not _is_identity(rotation):
+            rule["rotation"] = _matrix_to_quat(rotation)
+        if any(abs(v) > 1e-6 for v in translation):
+            rule["translation"] = [round(float(v), 6) for v in translation]
         return rule
 
-    all_node_paths = list(entity_node_map.values())
+    if up_axis not in _RAW_FROM_PIPELINE and (axis_rule or geometric_offset):
+        log(f"    [Mesh] up axis {up_axis} of {fbx_dest_path.name} is not known to the import rule: "
+            f"no rule written for it.")
+
+    # Every mesh node of the file, and whatever else a group names (a file
+    # this reader cannot read has no nodes of its own to offer).
+    all_node_paths = list(dict.fromkeys(
+        [facts["nodes"][name]["path"] for name in mesh_node_names(facts)] + list(entity_node_map.values())))
     groups = []
 
     # -------------------------------------------------------------------------
@@ -239,7 +292,9 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
             "$type": "{07B356B7-3635-40B5-878A-FAC4EFD5AD86} MeshGroup",
             "name": group_name,
             "nodeSelectionList": {
-                "selectedNodes": ["RootNode", node_path],
+                # The top of the graph, then the node itself. The top is
+                # "RootNode" in an FBX; an OBJ's is named after the file.
+                "selectedNodes": list(dict.fromkeys([node_path.split(".")[0], node_path])),
                 "unselectedNodes": unselected
             },
             "rules": {
@@ -293,19 +348,14 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
             }
             if is_convex:
                 group["export method"] = 1  # MeshExportMethod::Convex
-            # The collision mesh gets the per-node rotation; its translation is
-            # the explicit render-alignment when the producer supplied one
-            # (dedicated _COL FBX), else the node's own auto-center. Identity
-            # rule omitted.
-            phys_rule = rule_for(node_paths[0])
-            spec_tr = spec.get("translation")
-            if spec_tr is not None:
-                if any(abs(float(v)) > 1e-6 for v in spec_tr):
-                    phys_rule["translation"] = [float(v) for v in spec_tr]
-                else:
-                    phys_rule.pop("translation", None)
-            if "rotation" in phys_rule or "translation" in phys_rule:
-                group["rules"] = {"rules": [phys_rule]}
+            # A collision mesh is imported like a render mesh: its own node's
+            # rule. Unity places it by the object's transform, as the entity's
+            # transform does here. The rule is written also when it turns and
+            # moves nothing: a group without an advanced rule gets the node's
+            # place in the file baked into its vertices, and a collision file
+            # keeps its node wherever the artist left it (20 m off, in the
+            # Office pack).
+            group["rules"] = {"rules": [rule_for(node_paths[0])]}
 
             groups.append(group)
 
@@ -322,6 +372,6 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
     # Conversion trace: which rule each group got, and from what.
     if trace is not None:
         trace.record_assetinfo(
-            fbx_dest_path, mesh_guid, up_axis, eff, rot_quat,
-            node_autocenters, shared_translation, groups, physx_specs,
+            fbx_dest_path, mesh_guid, up_axis, eff,
+            node_translations, user_translation if has_user_translation else None, groups,
         )

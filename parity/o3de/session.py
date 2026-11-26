@@ -29,6 +29,7 @@ SCRUBBED_COMPONENTS = [
     "PhysX Primitive Collider", "PhysX Mesh Collider", "PhysX Shape Collider",
     "Box Shape", "Sphere Shape", "Capsule Shape",
     "Directional Light", "Light",
+    "Gradient GI (IBL)",
 ]
 
 
@@ -110,7 +111,8 @@ def main():
         # ----- Component properties ------------------------------------------
         if config.get("scrub", True):
             progress("scrub")
-            result["steps"]["scrub"] = scrub_components(out_dir, result["errors"])
+            result["steps"]["scrub"] = scrub_components(
+                out_dir, result["errors"], config.get("scrub_components") or SCRUBBED_COMPONENTS)
 
         result["status"] = "ok"
     except Exception:
@@ -122,17 +124,18 @@ def main():
             general.exit_no_prompt()
 
 
-def scrub_components(out_dir, errors):
-    """Read every property of the scrubbed components of every probed entity
-    into <out>/properties.json: ``{entity id: {component: {path: value}}}``."""
+def scrub_components(out_dir, errors, component_names):
+    """Read every property of the named components of every probed entity
+    into <out>/properties.json: ``{entity id: {component: {path: value}}}``.
+    The names are the ones the Editor shows."""
     import azlmbr.bus as bus
     import azlmbr.editor as editor
     import azlmbr.entity as entity
 
     record = read_json(os.path.join(out_dir, "record.json"))
     type_ids = editor.EditorComponentAPIBus(
-        bus.Broadcast, "FindComponentTypeIdsByEntityType", SCRUBBED_COMPONENTS, entity.EntityType().Game)
-    known = [(name, type_id) for name, type_id in zip(SCRUBBED_COMPONENTS, type_ids)]
+        bus.Broadcast, "FindComponentTypeIdsByEntityType", component_names, entity.EntityType().Game)
+    known = [(name, type_id) for name, type_id in zip(component_names, type_ids)]
 
     # Entity ids as the Editor hands them out, by their number: the record
     # holds the numbers, the component calls want the Editor's own objects.

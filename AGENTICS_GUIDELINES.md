@@ -302,6 +302,9 @@ text (memos, READMEs, code comments), use these terms consistently:
 | **Unity bridge** | The Unity plugin's headless side (`platforms/unity/bridge/`): finds the Editor of the project's version, installs its Editor script, runs it. |
 | **Trace** | The converter's own account of how each emitted value was produced (`conversion_trace.py`, `converter_cli.py run --trace`). |
 | **Parity cycle** | Truth, convert, bake, cook, probe, compare: one run of the harness in `parity/`, ending in a report of verdicts and clusters. |
+| **Import facts** | What a model file itself says (`fbx_reader.read_import_facts`): up axis, unit, node tree, each node's transforms and materials. The mesh import rule and the node selection are built from them, never from a prefab's names. |
+| **Import rule** | The coordinate rule written into a model's `.assetinfo` so that O3DE's model of a mesh node equals the mesh the source engine imports from it (`assetinfo_writer.source_import_rule`). |
+| **Model instance** | A model file instanced directly in a prefab or scene. It has no prefab to point at: the converter makes its objects plain entities (`platforms/unity/model_import.py`, `prefab.add_model_instance`). |
 
 ---
 

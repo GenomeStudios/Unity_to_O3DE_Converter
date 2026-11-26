@@ -166,13 +166,10 @@ class LightComponentProcessor(ComponentProcessor):
 
     def _emit_directional(self, data: Dict, entity: Dict, go,
                            ctx: ProcessingContext) -> None:
-        """Emit EditorDirectionalLightComponent with a 180° pitch flip."""
-        tc  = entity['Components'].get('TransformComponent', {})
-        td  = tc.setdefault('Transform Data', {})
-        rot = list(td.get('Rotate', [0.0, 0.0, 0.0]))
-        rot[0] = ((rot[0] + 180.0 + 180.0) % 360.0) - 180.0   # add 180°, normalize to [-180, 180]
-        td['Rotate'] = rot
-
+        """Emit EditorDirectionalLightComponent. The entity's transform is
+        left as the writer made it: a Unity light shines along its local +Z,
+        an O3DE light along its local +Y, and the axis swap of the transform
+        conversion carries one onto the other."""
         entity['Components']['AZ::Render::EditorDirectionalLightComponent'] = {
             '$type': 'AZ::Render::EditorDirectionalLightComponent',
             'Id':    ctx.generate_component_id(),
@@ -186,8 +183,7 @@ class LightComponentProcessor(ComponentProcessor):
         }
         ctx.log(
             f"  [Light] ✓ DirectionalLight — "
-            f"intensity={data['intensity']}, shadows={data['shadows']}, "
-            f"pitch flipped to {rot[0]:.2f}°"
+            f"intensity={data['intensity']}, shadows={data['shadows']}"
         )
 
     def _emit_point(self, data: Dict, entity: Dict, go,

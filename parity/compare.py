@@ -270,9 +270,10 @@ def fit_placement(actual: np.ndarray, expected: np.ndarray, gate_m: float, limit
     ``scale``         size of ``expected`` over size of ``actual``;
     ``matched``       share of vertices, of either set, with a partner inside
                       the gate (the smaller of the two directions);
-    ``noise_mm``      what is left per vertex once the fit is taken out."""
+    ``noise_mm``      what is left per vertex once the fit is taken out;
+    ``rotation_axis`` the axis the fit turns about, None for no turn."""
     empty = {"offset_mm": float("inf"), "rotation_deg": float("inf"), "scale": 1.0,
-             "matched": 0.0, "noise_mm": float("inf")}
+             "matched": 0.0, "noise_mm": float("inf"), "rotation_axis": None}
     if len(actual) < 3 or len(expected) < 3:
         return empty
 
@@ -297,7 +298,10 @@ def fit_placement(actual: np.ndarray, expected: np.ndarray, gate_m: float, limit
     centre = actual.mean(axis=0)
     fitted = source @ rotation.T + shift
     size_s = float(np.sqrt((spread_s ** 2).sum()))
+    axis = np.array([rotation[2, 1] - rotation[1, 2], rotation[0, 2] - rotation[2, 0],
+                     rotation[1, 0] - rotation[0, 1]])
     return {
+        "rotation_axis": [float(v) for v in axis / np.linalg.norm(axis)] if np.linalg.norm(axis) > 1e-12 else None,
         "offset_mm":    float(np.linalg.norm(rotation @ centre + shift - centre) * 1000.0),
         "offset":       [float(v) for v in (rotation @ centre + shift - centre)],
         "rotation_deg": rotation_angle_deg(np.identity(3), rotation),
@@ -305,6 +309,17 @@ def fit_placement(actual: np.ndarray, expected: np.ndarray, gate_m: float, limit
         "matched":      matched,
         "noise_mm":     float(np.sqrt(((fitted - target) ** 2).sum(axis=1).mean()) * 1000.0),
     }
+
+
+def spread_about_axis(points: np.ndarray, axis) -> float:
+    """How far a point set reaches from a line through its centre: the
+    root-mean-square distance from the line along ``axis``. With no axis,
+    from the centre itself."""
+    centred = points - points.mean(axis=0)
+    if axis is not None:
+        direction = np.asarray(axis, dtype=float)
+        centred = centred - np.outer(centred @ direction, direction)
+    return float(np.sqrt((centred ** 2).sum(axis=1).mean()))
 
 
 def box_center(points: np.ndarray) -> np.ndarray:

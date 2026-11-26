@@ -150,7 +150,8 @@ def test_root_entity_records_the_discarded_transform():
         root = _entity(trace.prefabs[PREFAB_GUID], "Crate")
         assert root["rule"] == "root_discarded"
         assert root["unity"]["position"] == [5.0, 6.0, 7.0]
-        assert root["emitted"]["translate"] is None
+        # A position is always written, so a nesting prefab can patch one axis of it.
+        assert root["emitted"]["translate"] == [0.0, 0.0, 0.0]
         assert root["parent_entity_id"] == "ContainerEntity"
 
 
