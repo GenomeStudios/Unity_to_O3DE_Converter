@@ -4027,12 +4027,17 @@ class SceneConverterTab(QWidget):
         UnitySceneConverter, output goes into <output>/<SceneName>/."""
         # The run itself lives in `stage_runner`, shared with
         # `converter_cli.py`; this tab only stores its bookkeeping.
-        from stage_runner import run_scene_converter, store_run
+        from stage_runner import asset_stage_arguments, run_scene_converter, store_run
 
         pm = project_manager()
         proj = pm.current()
         ap_outputs = (proj.outputs.get("asset_processor", {}) if proj else {})
-        run = run_scene_converter(scenes, output_dir, prefab_dirs, ap_outputs, log)
+        # A scene's own objects get their models and materials converted the
+        # way Stage 1 converts a prefab's.
+        asset_stage = (asset_stage_arguments(proj, get_config()["convert_smoothness_to_roughness"])
+                       if proj else None)
+        run = run_scene_converter(scenes, output_dir, prefab_dirs, ap_outputs, log,
+                                  asset_stage=asset_stage)
         store_run(pm, pm.current(), run, input_hash_for(self.STAGE_KEY, pm.current()))
         self._last_run_totals = run.totals
         return run.summary

@@ -32,8 +32,9 @@ from typing import Any, Dict, List, Tuple, Optional, Set
 from platforms.unity.components import load_component_processors, build_dispatch_table
 from platforms.unity.components.base import ProcessingContext
 from integrated_asset_processor import CoverageTracker
-from platforms.unity.prefab import root_override_target, targets_root
+from platforms.unity.prefab import add_model_instance, root_override_target, targets_root
 from platforms.unity.types import Transform, GameObject
+from targets.o3de.prefab_writer import UNIFORM_SCALE
 
 
 class PrefabDatabase:
@@ -127,8 +128,17 @@ class UnitySceneConverter:
     def __init__(self, prefab_db: PrefabDatabase, log_callback=None, *,
                  entity_maps_by_stem: Optional[Dict[str, Dict]] = None,
                  asset_index: Optional[Dict] = None,
-                 trace=None):
+                 trace=None,
+                 asset_processor=None):
         """
+        `asset_processor` is the Stage 1 worker (an
+        `IntegratedAssetProcessor` on the same output folder). With it a
+        scene's own objects - the ones that are not prefab instances - get
+        what they show converted like the objects of a prefab: materials,
+        models, collision meshes, and a model file instanced straight in the
+        scene becomes entities. Without it such objects are placed with
+        their transforms, lights and primitive colliders only.
+
         `entity_maps_by_stem` and `asset_index` are sourced from the
         project file's `outputs.asset_processor` section by the tab
         worker. They replace the old sidecar files
@@ -139,6 +149,10 @@ class UnitySceneConverter:
         """
         self.prefab_db = prefab_db
         self.log = log_callback or print
+        self.asset_processor = asset_processor
+        # What the scene's own objects show, converted (see
+        # `IntegratedAssetProcessor.convert_assets_of`). Filled per level.
+        self._scene_assets: Dict[str, Any] = {}
         # Optional `conversion_trace.ConversionTrace`; None changes nothing.
         self.trace = trace
         self.scene_path = ""
@@ -387,6 +401,14 @@ class UnitySceneConverter:
         if not prefab_guid:
             return
 
+        # An instance of a model file has no converted prefab to point at:
+        # it becomes the objects Unity makes of the model, as in a prefab.
+        model = self.asset_processor.model_objects_for(prefab_guid) if self.asset_processor else None
+        if model:
+            add_model_instance(self.log, prefab_data, anchor, prefab_guid, model,
+                               self.game_objects, self.transform_to_gameobject)
+            return
+
         modification          = prefab_data.get('m_Modification', {}) or {}
         modifications         = modification.get('m_Modifications', []) or []
         added_components      = modification.get('m_AddedComponents', []) or []
@@ -465,6 +487,8 @@ class UnitySceneConverter:
             go.children_ids = resolved_children
         
         for file_id, go in self.game_objects.items():
+            # The objects of a model instance know their children by object id.
+            go.children_ids += [child for child in go.model_children if child not in go.children_ids]
             for child_id in go.children_ids:
                 if child_id in self.game_objects:
                     self.game_objects[child_id].parent_id = file_id
@@ -577,6 +601,15 @@ class UnitySceneConverter:
         entity_id_map = {}
         child_order = []
         
+        # What the scene's own objects show: their materials, models and
+        # collision meshes, converted beside the prefabs' ones.
+        self._scene_assets = {}
+        if self.asset_processor is not None:
+            own_objects = {file_id: go for file_id, go in self.game_objects.items()
+                           if not go.is_prefab_instance}
+            self._scene_assets = self.asset_processor.convert_assets_of(
+                own_objects, Path(self.scene_path).name)
+
         prefab_ref_count = 0
         blank_entity_count = 0
         
@@ -784,7 +817,7 @@ class UnitySceneConverter:
         if abs(sx - 1.0) > 0.0001 and abs(sx - sy) < 0.0001 and abs(sy - sz) < 0.0001:
             patches.append({
                 "op":   "replace",
-                "path": "/ContainerEntity/Components/TransformComponent/Transform Data/Scale",
+                "path": f"/ContainerEntity/Components/TransformComponent/Transform Data/{UNIFORM_SCALE}",
                 "value": sx,
             })
         elif (abs(sx - 1.0) > 0.0001 or abs(sy - 1.0) > 0.0001 or abs(sz - 1.0) > 0.0001):
@@ -1103,7 +1136,7 @@ class UnitySceneConverter:
             if has_rotation:
                 transform_data["Rotate"] = euler
             if has_scale:
-                transform_data["Scale"] = o3de_transform.scale[0]
+                transform_data[UNIFORM_SCALE] = o3de_transform.scale[0]
             transform_component["Transform Data"] = transform_data
         
         entity["Components"]["TransformComponent"] = transform_component
@@ -1117,10 +1150,10 @@ class UnitySceneConverter:
         # Component Processors — emit phase (physics, mesh, material, ...)
         # ---------------------------------------------------------------
         ctx = ProcessingContext(
-            material_mapping      = {},
-            mesh_mapping          = {},
-            fbx_material_labels   = {},   # scene converter has no FBX access; material emit gracefully degrades
-            collider_pxmesh_mapping = {},
+            material_mapping      = self._scene_assets.get("materials", {}),
+            mesh_mapping          = self._scene_assets.get("meshes", {}),
+            fbx_material_labels   = self._scene_assets.get("material_labels", {}),
+            collider_pxmesh_mapping = self._scene_assets.get("collision_meshes", {}),
             entities_dict         = entities_dict,
             entity_id_map         = entity_id_map,
             generate_component_id = self._generate_component_id,

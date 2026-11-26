@@ -71,7 +71,11 @@ class Bed:
             raise Refused(f"The conversion project names no O3DE project root that exists: "
                           f"{self.project.o3de_project_root}")
         self.o3de_root: Path = self.project.o3de_project_root
-        self.work: Path = self.o3de_root / "user" / "Parity"
+        # Each bed keeps its runs in a folder of its own under the project's
+        # user folder: "work" in the config, "Parity" when it names none. Two
+        # beds on one O3DE project must not write over each other's truth,
+        # trace and report.
+        self.work: Path = self.o3de_root / "user" / self.config.get("work", "Parity")
         self.level: str = self.config["level"]
         self.output: Path = Path(self.project.stage_settings("asset_processor")["output_path"])
 

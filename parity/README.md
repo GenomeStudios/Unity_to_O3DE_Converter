@@ -13,11 +13,25 @@ python parity/parity.py compare parity/configs/office.json --only "Desk_*"
 ```
 
 Before a cycle: close the Unity project, the O3DE Editor and the Asset Processor. A cycle on the Office pack takes
-a few minutes once the project's assets have been cooked the first time.
+a few minutes once the project's assets have been cooked the first time. A cycle never closes an Editor or an Asset
+Processor it did not start: with one open on the project it stops and says so.
+
+## Test beds
+
+A bed is a config in `parity/configs/` and the conversion project it names. Several beds can share one O3DE project:
+
+| Bed | Source | Converted into | Run folder |
+|---|---|---|---|
+| `office.json` | `Assets/OfficeAndPoliceStation` | `Assets/OfficePack`, level `Bench_Parity_Office` | `user/Parity` |
+| `tirgames.json` | `Assets/TirgamesAssets` | `Assets/TirgamesPack`, level `Bench_Parity_Tirgames` | `user/Parity_Tirgames` |
+
+A config's `work` names the bed's run folder under the O3DE project's `user/` (`Parity` when it names none). Give
+every bed its own: the run folder holds the truth dump, the trace and the report, and two beds on one would write
+over each other.
 
 ## The steps
 
-| Step | What it does | Writes (under `<O3DE project>/user/Parity/`) |
+| Step | What it does | Writes (under the bed's run folder) |
 |---|---|---|
 | `setup` | Registers the probe gem in the O3DE project. Build target `ParityProbe.Editor` after a configure. | - |
 | `truth` | Unity truth dump, through `converter_cli.py truth`. Cached until a file of the scope changes. | `truth/<fingerprint>/` |

@@ -154,8 +154,8 @@ Carried, each with its reason (for T.11):
 | T.7 | Cycle: no "emitted no model", no "not produced", no unmatched object beyond the listed ones; cook: no failed prefab job. Ran: holds | I.4 |
 | T.8 | Cycle: the seven objects pass their transform with their scale. Ran: holds, and the `Showcase` cube | I.5 |
 | T.9 | Cycle: collider clusters closed or listed. Ran: all closed; one collider unmeasured | I.6 |
-| T.10 | The person opens the converted `Showcase` level and the Unity scene side by side: light direction and ambient tone agree. Ran so far: the Editor holds one Gradient GI component with Unity's three colours (read back by the probe), the light's direction is 0.000 degrees off | I.7 |
-| T.11 | The person reads the final report against the baseline and accepts what is carried | P |
+| T.10 | The person opens the converted `Showcase` level and the Unity scene side by side: light direction and ambient tone agree. Ran so far: the Editor holds one Gradient GI component with Unity's three colours (read back by the probe), the light's direction is 0.000 degrees off. Verified by the person on 2026-11-25: side by side, lighting and light direction very close, a pass | I.7 |
+| T.11 | The person reads the final report against the baseline and accepts what is carried. Verified by the person on 2026-11-25 (the Desk Metal sheet reviewed, everything in place); scene objects with their own mesh go to `mem:second_pack/plan` | P |
 | T.12 | Offline, against the truth dump's model hierarchies: `platforms.unity.model_import` gives every model's objects, transforms, ids, mesh nodes and material slots as Unity has them. Ran: 232 models, 277 objects, 276 meshes, 351 material slots, 0 misses (249 object ids known, 28 not) | I.4 |
 
 ## Project

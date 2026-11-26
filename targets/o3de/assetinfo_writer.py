@@ -110,10 +110,11 @@ _RAW_FROM_PIPELINE = {
 
 
 def source_import_rule(facts: dict, node_name: str, *,
-                       axis_rule: bool = True, geometric_offset: bool = True):
+                       axis_rule: bool = True, geometric_offset: bool = True,
+                       import_scale: float = 1.0):
     """The rotation (3x3) and translation (metres) of the coordinate rule
     that makes O3DE's model of one mesh node equal the mesh Unity imports
-    from the same node.
+    from the same node. Its scale is ``source_import_scale``.
 
     Unity's mesh is the node's own geometry with the node's **geometric
     transform** baked in and X negated. O3DE's scene pipeline, given an
@@ -130,7 +131,9 @@ def source_import_rule(facts: dict, node_name: str, *,
     ``facts`` comes from ``fbx_reader.read_import_facts``. With an up axis
     the table does not know, or a node the file does not have, the rule is
     the identity. ``axis_rule`` and ``geometric_offset`` switch the rotation
-    and the translation off separately."""
+    and the translation off separately. ``import_scale`` is the source
+    importer's own scale factor (Unity's ``globalScale``), which scales the
+    translation with everything else."""
     node = (facts.get("nodes") or {}).get(node_name)
     raw_from_pipeline = _RAW_FROM_PIPELINE.get(facts.get("up_axis"))
     if node is None or raw_from_pipeline is None:
@@ -143,9 +146,31 @@ def source_import_rule(facts: dict, node_name: str, *,
 
     translation = [0.0, 0.0, 0.0]
     if geometric_offset:
-        unit = float(facts.get("unit_to_metres") or 0.01)
+        unit = float(facts.get("unit_to_metres") or 0.01) * import_scale
         translation = _mat_vec(_UNITY_MESH_TO_O3DE, [value * unit for value in node["geometric_translation"]])
     return rotation, translation
+
+
+def source_import_scale(facts: dict, node_name: str, import_scale: float = 1.0) -> Optional[float]:
+    """The scale of the coordinate rule for one mesh node: the node's
+    geometric scaling times the source importer's scale factor.
+
+    A node's geometric transform scales its geometry as well as moving and
+    turning it (3ds Max writes one for an object scaled about its pivot), and
+    Unity bakes all of it into the mesh. The engine's rule holds one scale
+    for all axes, applied to the vertices before the rule's rotation, so a
+    geometric scaling that is the same on all three axes goes into it whole.
+    One that differs by axis cannot be written into the rule: None.
+
+    The file's unit is not part of it: the engine's scene pipeline brings
+    the file to metres itself."""
+    node = (facts.get("nodes") or {}).get(node_name)
+    if node is None:
+        return import_scale
+    scaling = [float(value) for value in node["geometric_scaling"]]
+    if max(scaling) - min(scaling) > 1e-4 * max(abs(value) for value in scaling):
+        return None
+    return scaling[0] * import_scale
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +216,7 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
                          mesh_guid: Optional[str] = None,
                          *,
                          correction_quat: Optional[list] = None,
+                         import_scale: float = 1.0,
                          trace=None) -> None:
     """Write an O3DE .assetinfo with one named MeshGroup per mesh node shown.
 
@@ -207,12 +233,13 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
     CoordinateSystemRule (useAdvancedData=true), and LodRule.
 
     Each group's CoordinateSystemRule is the rule its node needs to match
-    the source engine's import (``source_import_rule``: the axis turn and
-    the node's geometric transform, read from the file), with the user's
-    ``default_rotation`` and ``default_position`` applied after it.
-    ``auto_rotation`` and ``auto_center`` switch the file-derived rotation
-    and translation off; ``default_position`` is applied when
-    ``zero_position`` is set.
+    the source engine's import (``source_import_rule`` and
+    ``source_import_scale``: the axis turn and the node's geometric
+    transform, read from the file, with ``import_scale``, the source
+    importer's own scale factor), with the user's ``default_rotation`` and
+    ``default_position`` applied after it. ``auto_rotation`` switches the
+    file-derived rotation and scale off, ``auto_center`` the translation;
+    ``default_position`` is applied when ``zero_position`` is set.
 
     When ``physx_specs`` is provided, one PhysX MeshGroup is written per
     spec into the same ``values[]`` array (the engine supports many PhysX
@@ -251,15 +278,27 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
 
     # For the conversion trace: the file-derived translation of each node.
     node_translations: Dict[str, list] = {}
+    # Nodes whose geometric scaling the rule cannot hold, each reported once.
+    unscaled_nodes = set()
 
     def rule_for(node_path: str) -> dict:
         """Build this node's CoordinateSystemRule: the file's rule for the
         node, then the user's rotation and position."""
         leaf = node_path.split(".")[-1]
         rotation, translation = source_import_rule(
-            facts, leaf, axis_rule=axis_rule, geometric_offset=geometric_offset)
+            facts, leaf, axis_rule=axis_rule, geometric_offset=geometric_offset,
+            import_scale=import_scale)
         if any(abs(v) > 1e-6 for v in translation):
             node_translations[leaf] = [round(v, 6) for v in translation]
+
+        scale = source_import_scale(facts, leaf, import_scale) if axis_rule else 1.0
+        if scale is None:
+            scale = import_scale
+            if leaf not in unscaled_nodes:
+                unscaled_nodes.add(leaf)
+                log(f"    [Mesh] ⚠ '{leaf}' of {fbx_dest_path.name} has a geometric scaling that "
+                    f"differs by axis {facts['nodes'][leaf]['geometric_scaling']}: the import rule "
+                    f"holds one scale for all axes, so the model comes out unscaled.")
 
         rotation = _mat_mul(user_matrix, rotation)
         translation = [a + b for a, b in zip(_mat_vec(user_matrix, translation), user_translation)]
@@ -269,6 +308,8 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
             rule["rotation"] = _matrix_to_quat(rotation)
         if any(abs(v) > 1e-6 for v in translation):
             rule["translation"] = [round(float(v), 6) for v in translation]
+        if abs(scale - 1.0) > 1e-9:
+            rule["scale"] = round(float(scale), 9)
         return rule
 
     if up_axis not in _RAW_FROM_PIPELINE and (axis_rule or geometric_offset):

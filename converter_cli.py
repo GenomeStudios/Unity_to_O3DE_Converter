@@ -302,8 +302,10 @@ def _run_stage_2(project, arguments, log: Callable, trace, _unused, run_scene_co
         prefab_dirs.append(str(Path(stage_1_output) / "Prefabs"))
     prefab_dirs += [d for d in settings.get("prefab_dirs", []) if d and d not in prefab_dirs]
 
-    return run_scene_converter(scenes, output, prefab_dirs,
-                               project.outputs.get("asset_processor", {}), log, trace)
+    from stage_runner import asset_stage_arguments
+    return run_scene_converter(
+        scenes, output, prefab_dirs, project.outputs.get("asset_processor", {}), log, trace,
+        asset_stage=asset_stage_arguments(project, global_config()["convert_smoothness_to_roughness"]))
 
 
 # =============================================================================

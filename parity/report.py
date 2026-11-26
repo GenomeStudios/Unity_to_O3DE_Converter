@@ -147,10 +147,34 @@ def entity_matrix(entity: dict) -> np.ndarray:
 # VERDICTS
 # =============================================================================
 
-def placement_verdict(cycle: Cycle, fit: dict, expected: np.ndarray) -> Tuple[bool, bool]:
+# The bits Unity's mesh compression keeps of a vertex position, by importer
+# setting. Measured for "High" (flat panels of 3.5, 7 and 14 m come out of
+# Unity up to one step of size / 1023 off on each axis, whatever the file
+# says); the other settings are not measured and get no allowance.
+POSITION_BITS = {"High": 10}
+
+
+def truth_quantum_mm(cycle: Cycle, mesh_key: str, unity_local: np.ndarray, frame_unity: np.ndarray) -> float:
+    """How far a vertex of Unity's own mesh can stand from where the file
+    has it, in millimetres. Unity's mesh compression stores a position in a
+    fixed number of bits over the mesh's largest extent, so each axis is off
+    by up to one step of it; this is the length of one step on all three
+    axes, at the object's scale. Zero where the compression is off or its
+    bits are not known."""
+    bits = POSITION_BITS.get(cycle.truth.mesh_compression(mesh_key))
+    if not bits or len(unity_local) == 0:
+        return 0.0
+    largest = float(np.ptp(unity_local, axis=0).max())
+    scale = float(np.linalg.norm(frame_unity[:3, :3], axis=0).max())
+    return largest * scale / (2 ** bits - 1) * float(np.sqrt(3.0)) * 1000.0
+
+
+def placement_verdict(cycle: Cycle, fit: dict, expected: np.ndarray, quantum_mm: float = 0.0) -> Tuple[bool, bool]:
     """Whether a fitted placement (``compare.fit_placement``) is in place:
     ``(within the tolerance plus the truth's own noise, within the tolerance
-    alone)``.
+    alone)``. ``quantum_mm`` is ``truth_quantum_mm``: on a mesh of a few
+    vertices the noise left after the fit says too little, because the fit
+    takes most of a shift that is the same for all of them.
 
     The truth's vertices are noisy, and not independently: Unity's mesh
     compression moves a whole face at once. An offset smaller than the noise
@@ -162,10 +186,11 @@ def placement_verdict(cycle: Cycle, fit: dict, expected: np.ndarray) -> Tuple[bo
     if fit["matched"] < MATCHED_SHARE:
         return False, False
     reach_mm = cmp.spread_about_axis(expected, fit.get("rotation_axis")) * 1000.0
-    noise_deg = float(np.degrees(np.arctan2(fit["noise_mm"], max(reach_mm, 1e-6))))
+    noise_mm = max(fit["noise_mm"], quantum_mm)
+    noise_deg = float(np.degrees(np.arctan2(noise_mm, max(reach_mm, 1e-6))))
     strict = (fit["offset_mm"] <= cycle.tolerance["position_mm"]
               and fit["rotation_deg"] <= cycle.tolerance["rotation_deg"])
-    allowed = (fit["offset_mm"] <= cycle.tolerance["position_mm"] + fit["noise_mm"]
+    allowed = (fit["offset_mm"] <= cycle.tolerance["position_mm"] + noise_mm
                and fit["rotation_deg"] <= cycle.tolerance["rotation_deg"] + noise_deg)
     return allowed, strict
 
@@ -255,7 +280,8 @@ def mesh_element(cycle: Cycle, item: dict, entity: dict, traced: dict, frame_uni
     element["import"] = {"class": imported["class"], "text": imported["text"]}
 
     # The verdict is on where the mesh sits (see placement_verdict).
-    allowed, strict = placement_verdict(cycle, fit, expected)
+    element["truth_quantum_mm"] = truth_quantum_mm(cycle, truth_key, unity_local, frame_unity)
+    allowed, strict = placement_verdict(cycle, fit, expected, element["truth_quantum_mm"])
     if allowed and abs(fit["scale"] - 1.0) <= SCALE_TOLERANCE * 5:
         element["status"] = "pass"
         if not strict:
@@ -361,9 +387,11 @@ def unity_collider_geometry(cycle: Cycle, collider: dict, frame_unity: np.ndarra
 
     if kind == "Mesh" and collider["hasMesh"]:
         key = cycle.truth.mesh_key(collider["mesh"])
-        points = cmp.unity_points_to_o3de(transform_points(frame_unity, cycle.truth.mesh_positions(key)))
+        local = cycle.truth.mesh_positions(key)
+        points = cmp.unity_points_to_o3de(transform_points(frame_unity, local))
         cycle.draw("unity", "collider", points, views.triangle_edges(cycle.truth.mesh_indices(key)))
-        return {"kind": "Convex" if collider["convex"] else "Mesh", "points": points}
+        return {"kind": "Convex" if collider["convex"] else "Mesh", "points": points,
+                "quantum_mm": truth_quantum_mm(cycle, key, local, frame_unity)}
     return None
 
 
@@ -423,13 +451,13 @@ def collider_elements(cycle: Cycle, item: dict, entity: dict, traced: dict,
             worst = max(np.abs(actual.min(axis=0) - expected.min(axis=0)).max(),
                         np.abs(actual.max(axis=0) - expected.max(axis=0)).max())
             distance = {"max_mm": float(worst * 1000.0), "measure": "bounds"}
-            limit *= CONVEX_SLACK
+            limit = limit * CONVEX_SLACK + geometry["quantum_mm"]
         elif geometry["kind"] == "Mesh":
             # Unity's vertices carry compression noise: judge where the mesh
             # sits, as for a render mesh (placement_verdict).
             expected = geometry["points"]
             fit = cmp.fit_placement(actual, expected, cmp.noise_gate(expected, cycle.tolerance_m))
-            allowed, strict = placement_verdict(cycle, fit, expected)
+            allowed, strict = placement_verdict(cycle, fit, expected, geometry["quantum_mm"])
             distance = {"max_mm": float(fit["offset_mm"]), "measure": "fit", "rotation_deg": fit["rotation_deg"],
                         "matched": fit["matched"], "noise_mm": fit["noise_mm"]}
             if allowed:
@@ -591,6 +619,7 @@ def compare_scene(cycle: Cycle, entry: dict) -> Optional[dict]:
     record = O3deRecord(folder)
     containers = {"/".join(entity["prefab"]["instancePath"].split("/")[1:]): entity
                   for entity in record.entities if entity["prefab"]["isContainer"]}
+    roots = instance_roots(record, containers)
     aliases = {instance.get("unity_instance_file_id", instance["go_file_id"]): instance["instance_alias"]
                for instance in traced["instances"]}
     objects = cycle.truth.hierarchy(entry)["objects"]
@@ -633,7 +662,10 @@ def compare_scene(cycle: Cycle, entry: dict) -> Optional[dict]:
                                     else "its instance is not in the level"})
         else:
             expected = cmp.unity_matrix_to_o3de(matrix_from_rows(item["matrix"]))
-            element = transform_element(cycle, expected, entity_matrix(container), {"rule": "scene instance"})
+            # Measured at the placed prefab's own root, which carries a
+            # non-uniform scale of the placement (see instance_roots).
+            placed = roots.get(alias, container)
+            element = transform_element(cycle, expected, entity_matrix(placed), {"rule": "scene instance"})
             row.update({key: element[key] for key in ("status", "delta") if key in element})
             if element["status"] == "fail":
                 row["signature"] = element["signature"].replace("transform:", "scene:")
@@ -650,6 +682,29 @@ def compare_scene(cycle: Cycle, entry: dict) -> Optional[dict]:
             "instances": rows}
 
 
+def instance_roots(record, containers: Dict[str, dict]) -> Dict[str, dict]:
+    """For each placed prefab, by the same key as its container: the
+    prefab's own root entity, where there is exactly one entity under the
+    container.
+
+    Unity's instance root is both things at once. In O3DE the container
+    places the instance, and the root entity under it stands at the same
+    spot - but a placement's non-uniform scale can only sit on the root
+    entity, since a container passes none down. So a placement is measured
+    at its root entity."""
+    under: Dict[str, List[dict]] = defaultdict(list)
+    for entity in record.entities:
+        if not entity["prefab"]["isContainer"]:
+            under[entity["parent"]].append(entity)
+    roots = {}
+    for key, container in containers.items():
+        inside = [entity for entity in under.get(container["id"], [])
+                  if entity["prefab"]["instancePath"] == container["prefab"]["instancePath"]]
+        if len(inside) == 1:
+            roots[key] = inside[0]
+    return roots
+
+
 # ----- The level's ambient light ----------------------------------------------
 
 GRADIENT_GI = "Gradient GI (IBL)"       # the component's name in the Editor
@@ -658,8 +713,10 @@ COLOUR_TOLERANCE = 0.002
 
 
 def unity_ambient_colours(scene_file: Path) -> Optional[Dict[str, List[float]]]:
-    """The three ambient colours a Unity scene file stores, by their Unity
-    names; None when the file holds none."""
+    """The three ambient colours a Unity scene lights with, by their Unity
+    names; None when the file holds none. In Unity's one-colour ambient mode
+    (``m_AmbientMode: 3``) that colour, stored as the sky's, counts for all
+    three: the other two are stored but not used."""
     try:
         text = Path(scene_file).read_text(encoding="utf-8", errors="ignore")
     except OSError:
@@ -670,6 +727,9 @@ def unity_ambient_colours(scene_file: Path) -> Optional[Dict[str, List[float]]]:
         if match is None:
             return None
         colours[key] = [float(value) for value in match.groups()]
+    mode = re.search(r"m_AmbientMode:\s*(\d+)", text)
+    if mode is not None and mode.group(1) == "3":
+        colours = {key: list(colours["m_AmbientSkyColor"]) for key in colours}
     return colours
 
 

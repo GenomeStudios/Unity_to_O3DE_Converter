@@ -920,6 +920,266 @@ class IntegratedAssetProcessor:
                 self.log("  [Config] Smoothness→Roughness texture conversion REQUESTED "
                          "but Pillow is not installed. Install with: pip install Pillow")
     
+    def convert_assets_of(self, game_objects: Dict, owner_name: str) -> Dict[str, Any]:
+        """Convert everything a set of parsed objects shows - the objects of
+        one prefab, or a scene's own objects - and say where each object
+        finds it:
+
+            {"materials":        {material guid: material hint},
+             "meshes":           {object file id: model hint},
+             "material_labels":  {object file id: [slot label, ...]},
+             "collision_meshes": {(mesh guid, mesh file id): collision mesh hint},
+             "material_guids":   every material guid referenced,
+             "mesh_guids":       every mesh guid referenced}
+
+        Materials and their textures are converted, model files copied, and
+        each model file's ``.assetinfo`` written with the groups these
+        objects need beside the ones other owners needed before.
+        ``owner_name`` names the prefab or scene in what is reported."""
+        # Materials and meshes these objects reference
+        all_material_guids = set()
+        all_mesh_guids = set()
+        for go in game_objects.values():
+            all_material_guids.update(go.material_guids)
+            if go.mesh_guid:
+                all_mesh_guids.add(go.mesh_guid)
+
+        # Colliders and rigidbodies among them
+        prefab_collider_count = sum(len(go.colliders) for go in game_objects.values())
+        prefab_rigidbody_count = sum(1 for go in game_objects.values() if go.has_rigidbody)
+
+        self.log(f"  Found {len(all_material_guids)} unique material references")
+        self.log(f"  Found {len(all_mesh_guids)} unique mesh references")
+        self.log(f"  Found {prefab_collider_count} colliders, {prefab_rigidbody_count} rigidbodies")
+
+        material_mapping = {}
+        for mat_guid in all_material_guids:
+            if mat_guid:
+                o3de_mat_path = self._process_material(mat_guid)
+                if o3de_mat_path:
+                    material_mapping[mat_guid] = o3de_mat_path
+
+        # --- Copy FBX files to output ---
+        fbx_output_paths = {}   # {mesh_guid: Path}
+        for mesh_guid in all_mesh_guids:
+            if mesh_guid and mesh_guid != BUILTIN_MESH_GUID:
+                out_path = self._process_mesh(mesh_guid)
+                if out_path:
+                    fbx_output_paths[mesh_guid] = out_path
+
+        # --- Build per-entity mesh hints + write .assetinfo ---
+        # mesh_mapping keyed by entity file_id (not guid) so each entity
+        # gets its own named sub-mesh rather than the combined FBX model.
+        mesh_mapping = {}   # {entity_file_id: assetHint}
+
+        # FBX-internal material names per entity, in submesh order.
+        # SceneAPI extracts these from the FBX as MaterialAsset::m_name,
+        # and ModelMaterialSlot::m_displayName is set from that. The
+        # O3DE MaterialComponent label resolver matches against exactly
+        # these strings — they are the only valid keys for the
+        # `materialsByLabel` map. Pair ordinally with go.material_guids.
+        fbx_material_labels = {}   # {entity_file_id: [fbx_name_0, ...]}
+
+        from collections import defaultdict
+        entities_by_guid = defaultdict(list)
+        for go in game_objects.values():
+            if go.mesh_guid and go.mesh_guid in fbx_output_paths:
+                entities_by_guid[go.mesh_guid].append(go)
+
+        # --- Unity's built-in meshes (a cube made in the editor) ---
+        # No file to copy: the converter writes the mesh itself.
+        for go in game_objects.values():
+            if go.mesh_guid == BUILTIN_MESH_GUID:
+                hint = self._builtin_mesh_hint(go.mesh_file_id, owner_name, go.name)
+                if hint:
+                    mesh_mapping[go.file_id] = hint
+                    if go.material_guids:
+                        fbx_material_labels[go.file_id] = [BUILTIN_MATERIAL_LABEL]
+
+        # --- Collect MeshCollider collision-mesh references ---
+        # A collider's geometry is the sub-mesh m_Mesh = {guid, fileID}
+        # (see `mem:asset_packs/import_catalogue`). The guid may be a
+        # dedicated _COL FBX or the GO's own render FBX; fileID picks the
+        # sub-mesh. Fall back to the GO's render mesh when m_Mesh has no
+        # guid of its own.
+        # Each ref also carries the colliding entity's RENDER mesh
+        # (render_guid, go_name, render_fileID) so a dedicated _COL FBX can
+        # be aligned to the render mesh it collides for (bbox-center match).
+        collider_refs = []
+        for go in game_objects.values():
+            for c in go.colliders:
+                if c.get('type') != 'MeshCollider':
+                    continue
+                cg = c.get('mesh_guid') or go.mesh_guid
+                if cg:
+                    collider_refs.append(
+                        (cg, str(c.get('mesh_file_id', '') or ''),
+                         bool(c.get('convex')),
+                         go.mesh_guid or '', go.name, str(go.mesh_file_id or ''))
+                    )
+
+        # Axis A — scrape dedicated collision FBXs not already copied as
+        # render meshes, so they get an output file + assetinfo to cook.
+        for ref in collider_refs:
+            cg = ref[0]
+            if cg not in fbx_output_paths and cg != BUILTIN_MESH_GUID:
+                cpath = self._process_mesh(cg)
+                if cpath:
+                    fbx_output_paths[cg] = cpath
+
+        collider_refs_by_guid = defaultdict(list)
+        for cg, cf, cx, rg, rname, rfid in collider_refs:
+            if cg in fbx_output_paths:
+                collider_refs_by_guid[cg].append((cf, cx, rg, rname, rfid))
+
+        # (guid, fileID) -> .pxmesh assetHint, consumed by the collider
+        # component to point at the exact per-sub-mesh physics asset.
+        collider_pxmesh_mapping = {}
+
+        # Every FBX needing an assetinfo: render meshes ∪ collision meshes.
+        assetinfo_guids = set(entities_by_guid) | set(collider_refs_by_guid)
+
+        for mesh_guid in assetinfo_guids:
+            entity_list = entities_by_guid.get(mesh_guid, [])
+            fbx_path = fbx_output_paths[mesh_guid]
+            fbx_stem = fbx_path.name.rsplit('.', 1)[0]  # "Closet_A.FBX" → "Closet_A"
+
+            # What the file holds and how Unity ids its meshes.
+            facts = self._model_facts(mesh_guid, fbx_path)
+            meta = self._model_meta(mesh_guid)
+            mesh_nodes = mesh_node_names(facts)
+            self.log(f"    [Mesh] FBX mesh nodes: {mesh_nodes}")
+
+            def path_of(node: str) -> str:
+                known = facts["nodes"].get(node)
+                return known["path"] if known else f"RootNode.{node}"
+
+            # Each renderer's node in the file, from its mesh reference
+            # (never from the object's place in the prefab: the names and
+            # the nesting of a prefab are its author's, not the file's).
+            # A file this reader cannot read (an ASCII FBX) has no nodes
+            # to offer; the object's own name is the best guess then.
+            node_of_entity = {}
+            for go in entity_list:
+                node = (node_for_mesh(go.mesh_file_id, meta, facts, go.name)
+                        or (go.name if not mesh_nodes else None))
+                if node is None:
+                    self.coverage.warn(
+                        f"{owner_name}: '{go.name}' references mesh "
+                        f"{go.mesh_file_id} of {fbx_path.name}, which names "
+                        f"none of its nodes {mesh_nodes}; no model emitted.")
+                    self.log(f"    [Mesh] ⚠ '{go.name}': mesh {go.mesh_file_id} "
+                             f"names no node of {fbx_path.name}")
+                    continue
+                node_of_entity[go.file_id] = node
+
+            # The file's groups are named by node and kept across prefabs.
+            groups = self._mesh_groups_for(mesh_guid, facts)
+            for node in node_of_entity.values():
+                groups["nodes"][node] = path_of(node)
+
+            # Axis B — one PhysX group per distinct collision sub-mesh of
+            # this FBX. Two colliders on the same sub-mesh share one group
+            # (and one pxmesh). A collider that names no mesh of its own
+            # collides with its object's render mesh.
+            for cf, cx, rg, rname, rfid in collider_refs_by_guid.get(mesh_guid, []):
+                own_render_mesh = (rg == mesh_guid)
+                node = (node_for_mesh(cf or (rfid if own_render_mesh else ""), meta, facts,
+                                      rname if own_render_mesh else "")
+                        or (rname if not mesh_nodes else None))
+                if not node:
+                    self.log(f"    [Physics] ⚠ could not resolve collision "
+                             f"node (fileID {cf}) in {fbx_path.name}")
+                    continue
+                gname = physx_group_name(fbx_stem, path_of(node), mesh_nodes)
+                collider_pxmesh_mapping[(mesh_guid, cf)] = (
+                    f"{self.asset_hint_root}/meshes/{gname}.fbx.pxmesh")
+                # The collision mesh needs no alignment of its own: the
+                # assetinfo writer gives its node the same file-derived
+                # rule a render mesh gets.
+                groups["physx"].setdefault(
+                    gname, {"name": gname, "node_paths": [path_of(node)], "convex": cx})
+
+            # F-5 `physx_mesh` override — force-generate a whole-mesh
+            # ("everything") collision pxmesh for this FBX even when no
+            # Unity MeshCollider references it. One triangle group over the
+            # nodes shown (or all the FBX's mesh nodes), named after the stem.
+            if _resolve_mesh_settings(self._mesh_settings, mesh_guid).get("physx_mesh"):
+                all_nodes = (list(groups["nodes"].values())
+                             or [path_of(n) for n in mesh_nodes])
+                if all_nodes and fbx_stem not in groups["physx"]:
+                    groups["physx"][fbx_stem] = {
+                        "name": fbx_stem, "node_paths": all_nodes, "convex": False}
+                    self.log(f"    [Physics] physx_mesh override → whole-mesh "
+                             f"collision for {fbx_path.name}")
+
+            entity_node_map = dict(groups["nodes"])
+            physx_specs = list(groups["physx"].values())
+
+            # Pass the platform's source-axis correction quaternion
+            # (follow-up: item 5). Unity supplies its Y-up→Z-up quat;
+            # other plugins ship their own constant via
+            # `platforms.<name>.coordinates`.
+            correction_quat = getattr(
+                self.platform, "correction_quat", None,
+            )
+            write_fbx_assetinfo(
+                fbx_path, fbx_stem, entity_node_map, self.log,
+                physx_specs=physx_specs or None,
+                mesh_settings=self._mesh_settings,
+                mesh_guid=mesh_guid,
+                correction_quat=correction_quat,
+                import_scale=meta.global_scale,
+                trace=self.trace,
+            )
+            # F-9.I.4 — record mesh fingerprint AFTER the assetinfo
+            # exists on disk so the recorded output_files list includes
+            # both the .fbx copy and the .assetinfo sidecar. The cached
+            # entity_node_map + physx_specs + fbx_stem are what the Patch
+            # worker replays at re-emit time without re-parsing prefabs
+            # (see `mem:mesh_patch_worker/mesh_patch_worker_plan` §I.1).
+            source_mesh_path = self.asset_db.resolve_guid(mesh_guid)
+            if source_mesh_path is not None:
+                self._record_mesh_state(
+                    mesh_guid, source_mesh_path, fbx_path,
+                    fbx_stem=fbx_stem,
+                    entity_node_map=entity_node_map,
+                    physx_specs=physx_specs,
+                )
+
+            for go in entity_list:
+                node = node_of_entity.get(go.file_id)
+                if node is None:
+                    continue
+                mesh_mapping[go.file_id] = (
+                    f"{self.asset_hint_root}/meshes/{fbx_stem}-{node}.fbx.azmodel"
+                )
+                # Per-entity material label list: the FBX-internal names
+                # of the materials the node's mesh uses, in the order of
+                # its sub-meshes. SceneAPI exposes exactly these names as
+                # the model's material slots, and Unity's MeshRenderer
+                # lists its materials in the same order, so the two pair
+                # ordinally; truncate to whichever is shorter. A file the
+                # reader cannot read falls back to its file-wide list.
+                node_materials = (facts["nodes"][node]["materials"] if node in facts["nodes"]
+                                  else read_fbx_material_names(fbx_path))
+                if go.material_guids and node_materials:
+                    slot_count = min(len(go.material_guids), len(node_materials))
+                    fbx_material_labels[go.file_id] = list(node_materials[:slot_count])
+                elif go.material_guids:
+                    self.log(f"    [Mesh] ⚠ No material names read for '{node}' "
+                             f"of {fbx_path.name} — materialsByLabel will be "
+                             f"empty for '{go.name}'.")
+
+        return {
+            "materials":        material_mapping,
+            "meshes":           mesh_mapping,
+            "material_labels":  fbx_material_labels,
+            "collision_meshes": collider_pxmesh_mapping,
+            "material_guids":   all_material_guids,
+            "mesh_guids":       all_mesh_guids,
+        }
+
     def process_prefab(self, prefab_path: Path) -> bool:
         """Process a single Unity prefab"""
         self.log(f"\n{'='*60}")
@@ -954,240 +1214,16 @@ class IntegratedAssetProcessor:
                     self.prefabs_dir / f"{prefab_path.stem}.prefab",
                 )
 
-            # Process materials referenced by this prefab
-            all_material_guids = set()
-            all_mesh_guids = set()
-            for go in game_objects.values():
-                all_material_guids.update(go.material_guids)
-                if go.mesh_guid:
-                    all_mesh_guids.add(go.mesh_guid)
-            
-            # Count colliders and rigidbodies in this prefab
-            prefab_collider_count = sum(len(go.colliders) for go in game_objects.values())
-            prefab_rigidbody_count = sum(1 for go in game_objects.values() if go.has_rigidbody)
+            # Everything the prefab's objects show: materials, models,
+            # collision meshes.
+            assets = self.convert_assets_of(game_objects, prefab_path.name)
+            material_mapping        = assets["materials"]
+            mesh_mapping            = assets["meshes"]
+            fbx_material_labels     = assets["material_labels"]
+            collider_pxmesh_mapping = assets["collision_meshes"]
+            all_material_guids      = assets["material_guids"]
+            all_mesh_guids          = assets["mesh_guids"]
 
-            self.log(f"  Found {len(all_material_guids)} unique material references")
-            self.log(f"  Found {len(all_mesh_guids)} unique mesh references")
-            self.log(f"  Found {prefab_collider_count} colliders, {prefab_rigidbody_count} rigidbodies")
-            
-            material_mapping = {}
-            for mat_guid in all_material_guids:
-                if mat_guid:
-                    o3de_mat_path = self._process_material(mat_guid)
-                    if o3de_mat_path:
-                        material_mapping[mat_guid] = o3de_mat_path
-            
-            # --- Copy FBX files to output ---
-            fbx_output_paths = {}   # {mesh_guid: Path}
-            for mesh_guid in all_mesh_guids:
-                if mesh_guid and mesh_guid != BUILTIN_MESH_GUID:
-                    out_path = self._process_mesh(mesh_guid)
-                    if out_path:
-                        fbx_output_paths[mesh_guid] = out_path
-
-            # --- Build per-entity mesh hints + write .assetinfo ---
-            # mesh_mapping keyed by entity file_id (not guid) so each entity
-            # gets its own named sub-mesh rather than the combined FBX model.
-            mesh_mapping = {}   # {entity_file_id: assetHint}
-
-            # FBX-internal material names per entity, in submesh order.
-            # SceneAPI extracts these from the FBX as MaterialAsset::m_name,
-            # and ModelMaterialSlot::m_displayName is set from that. The
-            # O3DE MaterialComponent label resolver matches against exactly
-            # these strings — they are the only valid keys for the
-            # `materialsByLabel` map. Pair ordinally with go.material_guids.
-            fbx_material_labels = {}   # {entity_file_id: [fbx_name_0, ...]}
-
-            from collections import defaultdict
-            entities_by_guid = defaultdict(list)
-            for go in game_objects.values():
-                if go.mesh_guid and go.mesh_guid in fbx_output_paths:
-                    entities_by_guid[go.mesh_guid].append(go)
-
-            # --- Unity's built-in meshes (a cube made in the editor) ---
-            # No file to copy: the converter writes the mesh itself.
-            for go in game_objects.values():
-                if go.mesh_guid == BUILTIN_MESH_GUID:
-                    hint = self._builtin_mesh_hint(go.mesh_file_id, prefab_path.name, go.name)
-                    if hint:
-                        mesh_mapping[go.file_id] = hint
-                        if go.material_guids:
-                            fbx_material_labels[go.file_id] = [BUILTIN_MATERIAL_LABEL]
-
-            # --- Collect MeshCollider collision-mesh references ---
-            # A collider's geometry is the sub-mesh m_Mesh = {guid, fileID}
-            # (see `mem:asset_packs/import_catalogue`). The guid may be a
-            # dedicated _COL FBX or the GO's own render FBX; fileID picks the
-            # sub-mesh. Fall back to the GO's render mesh when m_Mesh has no
-            # guid of its own.
-            # Each ref also carries the colliding entity's RENDER mesh
-            # (render_guid, go_name, render_fileID) so a dedicated _COL FBX can
-            # be aligned to the render mesh it collides for (bbox-center match).
-            collider_refs = []
-            for go in game_objects.values():
-                for c in go.colliders:
-                    if c.get('type') != 'MeshCollider':
-                        continue
-                    cg = c.get('mesh_guid') or go.mesh_guid
-                    if cg:
-                        collider_refs.append(
-                            (cg, str(c.get('mesh_file_id', '') or ''),
-                             bool(c.get('convex')),
-                             go.mesh_guid or '', go.name, str(go.mesh_file_id or ''))
-                        )
-
-            # Axis A — scrape dedicated collision FBXs not already copied as
-            # render meshes, so they get an output file + assetinfo to cook.
-            for ref in collider_refs:
-                cg = ref[0]
-                if cg not in fbx_output_paths and cg != BUILTIN_MESH_GUID:
-                    cpath = self._process_mesh(cg)
-                    if cpath:
-                        fbx_output_paths[cg] = cpath
-
-            collider_refs_by_guid = defaultdict(list)
-            for cg, cf, cx, rg, rname, rfid in collider_refs:
-                if cg in fbx_output_paths:
-                    collider_refs_by_guid[cg].append((cf, cx, rg, rname, rfid))
-
-            # (guid, fileID) -> .pxmesh assetHint, consumed by the collider
-            # component to point at the exact per-sub-mesh physics asset.
-            collider_pxmesh_mapping = {}
-
-            # Every FBX needing an assetinfo: render meshes ∪ collision meshes.
-            assetinfo_guids = set(entities_by_guid) | set(collider_refs_by_guid)
-
-            for mesh_guid in assetinfo_guids:
-                entity_list = entities_by_guid.get(mesh_guid, [])
-                fbx_path = fbx_output_paths[mesh_guid]
-                fbx_stem = fbx_path.name.rsplit('.', 1)[0]  # "Closet_A.FBX" → "Closet_A"
-
-                # What the file holds and how Unity ids its meshes.
-                facts = self._model_facts(mesh_guid, fbx_path)
-                meta = self._model_meta(mesh_guid)
-                mesh_nodes = mesh_node_names(facts)
-                self.log(f"    [Mesh] FBX mesh nodes: {mesh_nodes}")
-
-                def path_of(node: str) -> str:
-                    known = facts["nodes"].get(node)
-                    return known["path"] if known else f"RootNode.{node}"
-
-                # Each renderer's node in the file, from its mesh reference
-                # (never from the object's place in the prefab: the names and
-                # the nesting of a prefab are its author's, not the file's).
-                # A file this reader cannot read (an ASCII FBX) has no nodes
-                # to offer; the object's own name is the best guess then.
-                node_of_entity = {}
-                for go in entity_list:
-                    node = (node_for_mesh(go.mesh_file_id, meta, facts, go.name)
-                            or (go.name if not mesh_nodes else None))
-                    if node is None:
-                        self.coverage.warn(
-                            f"{prefab_path.name}: '{go.name}' references mesh "
-                            f"{go.mesh_file_id} of {fbx_path.name}, which names "
-                            f"none of its nodes {mesh_nodes}; no model emitted.")
-                        self.log(f"    [Mesh] ⚠ '{go.name}': mesh {go.mesh_file_id} "
-                                 f"names no node of {fbx_path.name}")
-                        continue
-                    node_of_entity[go.file_id] = node
-
-                # The file's groups are named by node and kept across prefabs.
-                groups = self._mesh_groups_for(mesh_guid, facts)
-                for node in node_of_entity.values():
-                    groups["nodes"][node] = path_of(node)
-
-                # Axis B — one PhysX group per distinct collision sub-mesh of
-                # this FBX. Two colliders on the same sub-mesh share one group
-                # (and one pxmesh). A collider that names no mesh of its own
-                # collides with its object's render mesh.
-                for cf, cx, rg, rname, rfid in collider_refs_by_guid.get(mesh_guid, []):
-                    own_render_mesh = (rg == mesh_guid)
-                    node = (node_for_mesh(cf or (rfid if own_render_mesh else ""), meta, facts,
-                                          rname if own_render_mesh else "")
-                            or (rname if not mesh_nodes else None))
-                    if not node:
-                        self.log(f"    [Physics] ⚠ could not resolve collision "
-                                 f"node (fileID {cf}) in {fbx_path.name}")
-                        continue
-                    gname = physx_group_name(fbx_stem, path_of(node), mesh_nodes)
-                    collider_pxmesh_mapping[(mesh_guid, cf)] = (
-                        f"{self.asset_hint_root}/meshes/{gname}.fbx.pxmesh")
-                    # The collision mesh needs no alignment of its own: the
-                    # assetinfo writer gives its node the same file-derived
-                    # rule a render mesh gets.
-                    groups["physx"].setdefault(
-                        gname, {"name": gname, "node_paths": [path_of(node)], "convex": cx})
-
-                # F-5 `physx_mesh` override — force-generate a whole-mesh
-                # ("everything") collision pxmesh for this FBX even when no
-                # Unity MeshCollider references it. One triangle group over the
-                # nodes shown (or all the FBX's mesh nodes), named after the stem.
-                if _resolve_mesh_settings(self._mesh_settings, mesh_guid).get("physx_mesh"):
-                    all_nodes = (list(groups["nodes"].values())
-                                 or [path_of(n) for n in mesh_nodes])
-                    if all_nodes and fbx_stem not in groups["physx"]:
-                        groups["physx"][fbx_stem] = {
-                            "name": fbx_stem, "node_paths": all_nodes, "convex": False}
-                        self.log(f"    [Physics] physx_mesh override → whole-mesh "
-                                 f"collision for {fbx_path.name}")
-
-                entity_node_map = dict(groups["nodes"])
-                physx_specs = list(groups["physx"].values())
-
-                # Pass the platform's source-axis correction quaternion
-                # (follow-up: item 5). Unity supplies its Y-up→Z-up quat;
-                # other plugins ship their own constant via
-                # `platforms.<name>.coordinates`.
-                correction_quat = getattr(
-                    self.platform, "correction_quat", None,
-                )
-                write_fbx_assetinfo(
-                    fbx_path, fbx_stem, entity_node_map, self.log,
-                    physx_specs=physx_specs or None,
-                    mesh_settings=self._mesh_settings,
-                    mesh_guid=mesh_guid,
-                    correction_quat=correction_quat,
-                    trace=self.trace,
-                )
-                # F-9.I.4 — record mesh fingerprint AFTER the assetinfo
-                # exists on disk so the recorded output_files list includes
-                # both the .fbx copy and the .assetinfo sidecar. The cached
-                # entity_node_map + physx_specs + fbx_stem are what the Patch
-                # worker replays at re-emit time without re-parsing prefabs
-                # (see `mem:mesh_patch_worker/mesh_patch_worker_plan` §I.1).
-                source_mesh_path = self.asset_db.resolve_guid(mesh_guid)
-                if source_mesh_path is not None:
-                    self._record_mesh_state(
-                        mesh_guid, source_mesh_path, fbx_path,
-                        fbx_stem=fbx_stem,
-                        entity_node_map=entity_node_map,
-                        physx_specs=physx_specs,
-                    )
-
-                for go in entity_list:
-                    node = node_of_entity.get(go.file_id)
-                    if node is None:
-                        continue
-                    mesh_mapping[go.file_id] = (
-                        f"{self.asset_hint_root}/meshes/{fbx_stem}-{node}.fbx.azmodel"
-                    )
-                    # Per-entity material label list: the FBX-internal names
-                    # of the materials the node's mesh uses, in the order of
-                    # its sub-meshes. SceneAPI exposes exactly these names as
-                    # the model's material slots, and Unity's MeshRenderer
-                    # lists its materials in the same order, so the two pair
-                    # ordinally; truncate to whichever is shorter. A file the
-                    # reader cannot read falls back to its file-wide list.
-                    node_materials = (facts["nodes"][node]["materials"] if node in facts["nodes"]
-                                      else read_fbx_material_names(fbx_path))
-                    if go.material_guids and node_materials:
-                        slot_count = min(len(go.material_guids), len(node_materials))
-                        fbx_material_labels[go.file_id] = list(node_materials[:slot_count])
-                    elif go.material_guids:
-                        self.log(f"    [Mesh] ⚠ No material names read for '{node}' "
-                                 f"of {fbx_path.name} — materialsByLabel will be "
-                                 f"empty for '{go.name}'.")
-            
             # Create O3DE prefab
             output_name = prefab_path.stem
             output_path = self.prefabs_dir / f"{output_name}.prefab"
@@ -1474,6 +1510,7 @@ class IntegratedAssetProcessor:
                     mesh_settings=self._mesh_settings,
                     mesh_guid=guid,
                     correction_quat=platform_correction,
+                    import_scale=self._model_meta(guid).global_scale,
                 )
             except Exception as exc:
                 self.log(
@@ -1606,7 +1643,7 @@ class IntegratedAssetProcessor:
             coverage=self.coverage,
             component_dispatch=self.component_dispatch,
             strip_lods=self._strip_lods,
-            model_objects=self._model_objects_for,
+            model_objects=self.model_objects_for,
         )
 
     # -------------------------------------------------------------------------
@@ -1629,7 +1666,7 @@ class IntegratedAssetProcessor:
                 Path(str(source) + ".meta") if source else Path(""))
         return self._model_meta_cache[guid]
 
-    def _model_objects_for(self, guid: str) -> Optional[list]:
+    def model_objects_for(self, guid: str) -> Optional[list]:
         """The objects Unity makes of the model file with this guid, or None
         when the guid is not a model file this converter can read. The
         prefab parser asks this for every PrefabInstance it meets."""

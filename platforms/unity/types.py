@@ -84,6 +84,10 @@ class GameObject:
     has_rigidbody: bool = False
     rigidbody_data: Optional[Dict] = None
     colliders:     List[Dict] = field(default_factory=list)
+    # Children known by their object id, not by a Transform id: the objects
+    # of a model instance below this one. The hierarchy pass folds them into
+    # ``children_ids`` once Transform ids are resolved.
+    model_children: List[str] = field(default_factory=list)
     is_prefab_instance:  bool = False
     prefab_source_guid:  Optional[str] = None
     prefab_name:         Optional[str] = None

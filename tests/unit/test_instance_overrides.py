@@ -161,6 +161,15 @@ def test_a_whole_rotation_inside_is_set_and_a_partial_one_is_reported():
     assert any("only part of the rotation" in line for line in warnings)
 
 
+def test_a_uniform_scale_inside_is_set_under_the_engines_field_name():
+    """The engine reads an entity's one scale from `UniformScale`. `Scale`
+    is its legacy three-axis field, and a number written there is lost."""
+    scaled = _door_overrides() + [_mod(MESH, f"m_LocalScale.{axis}", 0.796) for axis in "xyz"]
+    patches = child_transform_patches(scaled, SIDECAR, "Door_Cell", lambda line: None)
+    scale = next(p for p in patches if "Scale" in p["path"])
+    assert scale["path"].endswith("/Transform Data/UniformScale") and scale["value"] == 0.796
+
+
 def test_an_object_the_entity_map_does_not_hold_is_reported_not_patched():
     warnings = []
     assert child_transform_patches(_door_overrides(), {}, "Door_Cell", warnings.append) == []

@@ -96,6 +96,18 @@ class Truth:
             record["key"]: record for record in _load_json(self.dump_dir / "meshes.json")["meshes"]
         }
         self._hierarchies: Dict[str, dict] = {}
+        self._compression: Optional[Dict[str, str]] = None
+
+    def mesh_compression(self, key: str) -> str:
+        """The mesh compression Unity's importer applied to the model a mesh
+        comes from ("Off", "Low", "Medium", "High"); "" when the dump does
+        not say."""
+        if self._compression is None:
+            self._compression = {}
+            for model in self.catalog.get("models", []):
+                importer = self.hierarchy(model).get("importer") or {}
+                self._compression[model["guid"]] = str(importer.get("meshCompression", ""))
+        return self._compression.get(key.split("_")[0], "")
 
     def prefab_entries(self) -> List[dict]:
         return self.catalog["prefabs"]

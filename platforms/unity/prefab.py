@@ -310,7 +310,7 @@ def parse_prefab_instance_in_prefab(ctx: UnityParseContext,
     # converted prefab to point at. It becomes the objects Unity makes of it.
     model = ctx.model_objects(prefab_guid) if ctx.model_objects else None
     if model:
-        add_model_instance(ctx, instance_data, anchor, prefab_guid, model,
+        add_model_instance(ctx.log, instance_data, anchor, prefab_guid, model,
                            game_objects, transform_map)
         return
 
@@ -476,7 +476,7 @@ _AXIS = {'x': 0, 'y': 1, 'z': 2, 'w': 3}
 _OVERRIDES_WITHOUT_EFFECT = ('m_RootOrder', 'm_LocalEulerAnglesHint.')
 
 
-def add_model_instance(ctx: UnityParseContext,
+def add_model_instance(log: Callable[[str], None],
                        instance_data: Dict, anchor: str, model_guid: str,
                        model: list,
                        game_objects: Dict, transform_map: Dict) -> None:
@@ -490,8 +490,9 @@ def add_model_instance(ctx: UnityParseContext,
     adds to it attach by id like to any other object. An object whose id in
     the model is not known gets a made-up id; nothing can be added to it.
 
-    ``model`` comes from ``ctx.model_objects`` (root first, parents before
-    children)."""
+    ``model`` is what ``model_import.model_objects`` gives (root first,
+    parents before children). Used by the prefab parser and by the scene
+    converter alike."""
     modification = instance_data.get('m_Modification', {}) or {}
     parent_transform_id = str((modification.get('m_TransformParent') or {}).get('fileID', ''))
 
@@ -512,6 +513,7 @@ def add_model_instance(ctx: UnityParseContext,
             go.material_guids = list(source.material_guids)
         if source.parent >= 0:
             go.parent_id = made[source.parent].file_id
+            made[source.parent].model_children.append(file_id)
         elif parent_transform_id and parent_transform_id != '0':
             go.parent_id = parent_transform_id
 
@@ -534,7 +536,7 @@ def add_model_instance(ctx: UnityParseContext,
         if target is None or not _apply_model_override(target, mod):
             skipped += 1
 
-    ctx.log(
+    log(
         f"  [ModelInstance] '{made[0].name}' src={model_guid[:8]}… "
         f"objects={len(made)}, overrides={len(modifications)} "
         f"({skipped} not applied)"
@@ -596,6 +598,9 @@ def build_hierarchy(ctx: UnityParseContext,
         for child_id in go.children_ids:
             if child_id in game_objects:
                 game_objects[child_id].parent_id = file_id
+
+        # The objects of a model instance know their children by object id.
+        go.children_ids += [child for child in go.model_children if child not in go.children_ids]
 
         # Reverse: child -> parent (add child to parent's children_ids
         # if not already there).

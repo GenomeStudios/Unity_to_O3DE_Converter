@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from platforms.unity.components.base import ProcessingContext
+from platforms.unity.components.box_collider import refuses_non_uniform_scale
 from platforms.unity.types import GameObject, Transform
 
 
@@ -133,6 +134,12 @@ def convert_to_o3de_coordinates(unity_transform: Transform
                   unity_transform.scale[1])
     converted = Transform(o3de_pos, o3de_rot, o3de_scale)
     return converted, not converted.is_uniform_scale()
+
+
+# The key of an entity's one scale for all axes in its transform data. The
+# engine also knows a "Scale" there: its legacy three-axis field, which a
+# number written to is not read from (`EditorTransform::Reflect`).
+UNIFORM_SCALE = "UniformScale"
 
 
 def non_uniform_scale_component(component_id: int, scale) -> Dict:
@@ -303,6 +310,10 @@ def write_entity_map_sidecar(worker,
         "entity_aliases":       dict(entity_id_map),
         # {Unity Transform file id: its GameObject's file id}. An override on
         # an object's transform names the transform, not the object.
+        # True when the root entity carries a capsule or a sphere itself: the
+        # engine refuses a non-uniform scale beside them, so a prefab that
+        # nests this one stretched cannot hand it one.
+        "root_refuses_non_uniform_scale": refuses_non_uniform_scale(root_go),
         "transform_owners":     {str(transform_id): str(owner)
                                  for transform_id, owner in (transform_map or {}).items()
                                  if str(owner) in entity_id_map},
@@ -458,7 +469,7 @@ def create_nested_prefab_instance(worker, go: GameObject, prefab_path: Path,
     if abs(sx - 1.0) > 0.0001 and abs(sx - sy) < 0.0001 and abs(sy - sz) < 0.0001:
         patches.append({
             "op":    "replace",
-            "path":  "/ContainerEntity/Components/TransformComponent/Transform Data/Scale",
+            "path":  f"/ContainerEntity/Components/TransformComponent/Transform Data/{UNIFORM_SCALE}",
             "value": sx,
         })
     elif (abs(sx - 1.0) > 0.0001 or abs(sy - 1.0) > 0.0001 or abs(sz - 1.0) > 0.0001):
@@ -622,6 +633,11 @@ def instance_non_uniform_scale_patches(scale, sidecar: Optional[Dict], component
         warn(f"Non-uniform scale on nested instance '{instance_name}' {tuple(scale)} not emitted — "
              f"the source prefab's entity map is not known.")
         return []
+    if (sidecar or {}).get("root_refuses_non_uniform_scale"):
+        warn(f"Non-uniform scale on nested instance '{instance_name}' {tuple(scale)} not emitted — "
+             f"its root carries a capsule or sphere collider, which the engine does not allow "
+             f"beside a non-uniform scale.")
+        return []
     if len((sidecar or {}).get("entity_aliases") or {}) > 1:
         warn(f"Non-uniform scale on nested instance '{instance_name}' {tuple(scale)} is set on its root "
              f"only: O3DE does not pass a non-uniform scale down, so the objects below the root keep "
@@ -689,7 +705,7 @@ def child_transform_patches(modifications: List[Dict], sidecar: Optional[Dict],
 
         scale = [values.get(f"m_LocalScale.{axis}") for axis in "xyz"]
         if all(value is not None for value in scale) and max(scale) - min(scale) < 0.0001:
-            patches.append({"op": "add", "path": f"{base}/Scale", "value": scale[0]})
+            patches.append({"op": "add", "path": f"{base}/{UNIFORM_SCALE}", "value": scale[0]})
         elif any(value is not None for value in scale):
             warn(f"Scale override on an object inside nested instance '{instance_name}' "
                  f"is not one scale for all axes — not emitted.")
@@ -855,7 +871,7 @@ def create_entity_recursive(worker, go: GameObject, all_game_objects: Dict,
     if has_rotation:
         transform_data["Rotate"] = euler
     if has_scale:
-        transform_data["Scale"] = o3de_transform.scale[0]
+        transform_data[UNIFORM_SCALE] = o3de_transform.scale[0]
     transform_component["Transform Data"] = transform_data
 
     entity["Components"]["TransformComponent"] = transform_component

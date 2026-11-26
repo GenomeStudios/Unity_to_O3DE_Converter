@@ -10,7 +10,9 @@ Emits:    EditorSphereShapeComponent + EditorShapeColliderComponent
 from typing import Callable, Dict, List
 
 from .base import ComponentProcessor, ProcessingContext
-from .box_collider import _resolve_target, _apply_collision_config
+from .box_collider import (
+    _apply_collision_config, _resolve_target, needs_own_entity, own_entity_placement,
+)
 
 
 class SphereColliderProcessor(ComponentProcessor):
@@ -65,7 +67,14 @@ class SphereColliderProcessor(ComponentProcessor):
         child_ids: List[str] = []
         for collider in my_colliders:
             global_idx = collider['global_index']
-            target_comps, child_id = _resolve_target(global_idx, go, entity, ctx)
+            # A sphere on a stretched object gets an entity of its own (see
+            # needs_own_entity).
+            stretched = 'EditorNonUniformScaleComponent' in entity['Components']
+            own_entity = needs_own_entity(collider, stretched)
+            target_comps, child_id = _resolve_target(global_idx, go, entity, ctx, own_entity)
+            if own_entity:
+                transform_data, collider = own_entity_placement(collider, go.transform.scale, stretched)
+                target_comps['TransformComponent']['Transform Data'] = transform_data
             if child_id:
                 child_ids.append(child_id)
 

@@ -25,7 +25,7 @@ from tests.harness import run_module_tests
 from fbx_reader import read_import_facts
 from targets.o3de.assetinfo_writer import (
     _euler_xyz_matrix, _mat_mul, _mat_vec, _matrix_to_quat, _quat_to_matrix,
-    _RAW_FROM_PIPELINE, source_import_rule, write_fbx_assetinfo,
+    _RAW_FROM_PIPELINE, source_import_rule, source_import_scale, write_fbx_assetinfo,
 )
 
 
@@ -118,6 +118,54 @@ def test_unknown_axis_or_node_gives_no_rule():
         rotation, translation = source_import_rule(facts, node)
         assert rotation == [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
         assert translation == [0.0, 0.0, 0.0]
+
+
+# =============================================================================
+# THE RULE'S SCALE
+# A node's geometric scaling, and the source importer's own scale factor.
+# =============================================================================
+
+def _scaled_facts(scaling, translation=(0.0, 0.0, 0.0)):
+    facts = _facts(1, (-90, 0, 0), translation)
+    facts["nodes"]["Part"]["geometric_scaling"] = list(scaling)
+    return facts
+
+
+def test_a_geometric_scaling_that_is_one_on_all_axes_is_the_rules_scale():
+    """The bar stool rope of the Tirgames pack: geometric scaling 4.0116."""
+    assert abs(source_import_scale(_scaled_facts((4.0116, 4.0116, 4.0116)), "Part") - 4.0116) < 1e-12
+    assert source_import_scale(_facts(1), "Part") == 1.0
+
+
+def test_the_importers_scale_factor_multiplies_scale_and_translation():
+    """The same file with Unity's Scale Factor at 1.1: the mesh is 4.413
+    times the file's, and its geometric offset is scaled with it."""
+    facts = _scaled_facts((4.0116, 4.0116, 4.0116), translation=(10.0, 0.0, 0.0))
+    assert abs(source_import_scale(facts, "Part", import_scale=1.1) - 4.41276) < 1e-9
+    _, plain = source_import_rule(facts, "Part")
+    _, scaled = source_import_rule(facts, "Part", import_scale=1.1)
+    assert max(abs(s - 1.1 * p) for s, p in zip(scaled, plain)) < 1e-12 and abs(plain[0] + 0.1) < 1e-12
+
+
+def test_a_scaling_that_differs_by_axis_cannot_be_written_into_the_rule():
+    assert source_import_scale(_scaled_facts((0.3657, 0.3657, 1.0)), "Part") is None
+
+
+def test_a_node_the_file_does_not_have_keeps_the_importers_scale():
+    assert source_import_scale(_facts(1), "Missing", import_scale=1.5) == 1.5
+
+
+def test_the_writer_puts_the_scale_into_the_rule_of_render_and_collision_groups():
+    import json
+    with tempfile.TemporaryDirectory() as tmp:
+        fbx = Path(tmp) / "Thing.fbx"
+        fbx.write_bytes(b"FBX-stub\x00\x00")
+        write_fbx_assetinfo(fbx, "Thing", {"Thing": "RootNode.Thing"}, log=lambda line: None,
+                            physx_specs=[{"name": "Thing", "node_paths": ["RootNode.Thing"], "convex": True}],
+                            import_scale=1.5)
+        groups = json.loads((Path(tmp) / "Thing.fbx.assetinfo").read_text(encoding="utf-8"))["values"]
+        rules = [next(r for r in group["rules"]["rules"] if r["$type"] == "CoordinateSystemRule") for group in groups]
+        assert [rule.get("scale") for rule in rules] == [1.5, 1.5], rules
 
 
 # =============================================================================

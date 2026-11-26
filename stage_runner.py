@@ -154,15 +154,45 @@ def run_asset_processor(source_path: str, output_path: str, prefab_files: list, 
 # STAGE 2 - SCENE CONVERTER
 # =============================================================================
 
+def asset_stage_arguments(project, convert_smoothness_to_roughness: bool) -> Optional[dict]:
+    """What Stage 1 runs with, read off a conversion project, for
+    ``run_scene_converter``: a scene's own objects have their materials and
+    models converted the way a prefab's are, into the same output folder.
+    None when the project names no source or no Stage 1 output."""
+    import copy
+
+    settings = project.stage_settings("asset_processor")
+    source = project.effective_source("asset_processor")
+    output = (settings.get("output_path") or "").strip()
+    if not source or not Path(source).is_dir() or not output:
+        return None
+    return {
+        "source_path":        source,
+        "output_path":        output,
+        "material_settings":  copy.deepcopy(project.stage_settings("material_processor")),
+        "mesh_settings":      copy.deepcopy(project.stage_settings("mesh_processor")),
+        "collision_settings": copy.deepcopy(project.stage_settings("collision_processor")),
+        "strip_lods":         bool(settings.get("strip_lods", True)),
+        "convert_smoothness_to_roughness": convert_smoothness_to_roughness,
+        "state_index":        copy.deepcopy(project.outputs.get("state_index") or {}),
+    }
+
+
 def run_scene_converter(scenes: list, output_dir: str, prefab_dirs: list,
                         asset_processor_outputs: dict,
                         log: Callable[[str], None],
-                        trace=None) -> StageRun:
+                        trace=None,
+                        asset_stage: Optional[dict] = None) -> StageRun:
     """Serial multi-scene conversion. Each scene gets its own
     UnitySceneConverter, output goes into <output>/<SceneName>/.
 
     ``asset_processor_outputs`` is the project's Stage 1 outputs section: the
-    per-scene converters resolve entity maps and asset hints from it."""
+    per-scene converters resolve entity maps and asset hints from it.
+
+    ``asset_stage`` is ``asset_stage_arguments(project, ...)``. With it the
+    scenes' own objects (the ones that are not prefab instances) get their
+    materials and models converted by one Stage 1 worker shared by the run;
+    without it they are placed without them."""
     from platforms.unity.scene_converter import PrefabDatabase, UnitySceneConverter
 
     log("\n" + "=" * 60)
@@ -184,6 +214,28 @@ def run_scene_converter(scenes: list, output_dir: str, prefab_dirs: list,
         stem = Path(record.get("output_path", "")).stem
         if stem:
             entity_maps_by_stem[stem] = record
+        # A placed prefab is found by the guid the scene names it by. The
+        # name of an instance is only what the scene's author called it: a
+        # renamed instance would be missed, or take another prefab's place.
+        if stem and record.get("source_guid"):
+            prefab_db.add_guid_mapping(record["source_guid"], stem)
+
+    # One Stage 1 worker for the run, for what the scenes' own objects show.
+    asset_processor = None
+    if asset_stage:
+        from integrated_asset_processor import IntegratedAssetProcessor
+        asset_processor = IntegratedAssetProcessor(
+            Path(asset_stage["source_path"]),
+            Path(asset_stage["output_path"]),
+            log_callback=log,
+            convert_smoothness_to_roughness=asset_stage.get("convert_smoothness_to_roughness", False),
+            material_settings=asset_stage.get("material_settings"),
+            mesh_settings=asset_stage.get("mesh_settings"),
+            collision_settings=asset_stage.get("collision_settings"),
+            strip_lods=asset_stage.get("strip_lods", True),
+            state_index=asset_stage.get("state_index"),
+            trace=trace,
+        )
     asset_index_for_scene = {
         "materials": dict(ap_outputs.get("materials", {})),
         "meshes":    dict(ap_outputs.get("meshes",    {})),
@@ -216,6 +268,7 @@ def run_scene_converter(scenes: list, output_dir: str, prefab_dirs: list,
                 entity_maps_by_stem=entity_maps_by_stem,
                 asset_index=asset_index_for_scene,
                 trace=trace,
+                asset_processor=asset_processor,
             )
             conv.parse_unity_scene(str(scene_path))
             log(f"  Parsed {len(conv.game_objects)} GameObject(s)")
@@ -293,6 +346,9 @@ def run_scene_converter(scenes: list, output_dir: str, prefab_dirs: list,
             "total_prefab_references": totals["total_prefab_refs"],
             "total_missing_prefabs":   totals["total_missing_prefabs"],
         },
+        # The models and materials the scenes' own objects brought in: merged
+        # onto the project's index, so a later run keeps their mesh groups.
+        state_index=asset_processor.state_index() if asset_processor is not None else {},
         totals=totals,
     )
 

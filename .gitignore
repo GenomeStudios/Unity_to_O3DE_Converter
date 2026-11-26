@@ -1,8 +1,8 @@
 Gems/*
 TestObjects/*
 .vscode/*
-__pycache__/*
+__pycache__/
+*.py[cod]
 converter_settings.json
 .claude/*
 EvaluationAssets/*
-*/__pycache__/*

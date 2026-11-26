@@ -133,7 +133,7 @@ class ConversionTrace:
             "emitted": {
                 "translate":        _copy(data.get("Translate")),
                 "rotate_euler":     _copy(data.get("Rotate")),
-                "scale":            data.get("Scale"),
+                "scale":            data.get("UniformScale"),
                 "nonuniform_scale": _copy(nonuniform.get("NonUniformScale")),
             },
             "unity_components": _unity_components(go),
@@ -207,6 +207,7 @@ class ConversionTrace:
                 "node_paths":         nodes,
                 "rotation":           _copy(rule.get("rotation")),
                 "translation":        _copy(rule.get("translation")),
+                "scale":              rule.get("scale"),
                 "translation_source": " + ".join(sources) if "translation" in rule else "",
                 "geometric_translation": _copy(node_translations.get(leaf)),
                 "convex":             group.get("export method") == 1,
@@ -295,7 +296,7 @@ def transform_from_patches(patches: List[dict]) -> dict:
         if not path.startswith(TRANSFORM_PATCH_PREFIX):
             continue
         field = path[len(TRANSFORM_PATCH_PREFIX):]
-        if field == "Scale":
+        if field == "UniformScale":
             emitted["scale"] = patch.get("value")
             continue
         name, _, axis = field.partition("/")
@@ -338,7 +339,7 @@ def uncovered_in_prefab(prefab_file: Path, record: dict) -> List[str]:
         emitted = traced["emitted"]
         if (emitted["translate"] != transform.get("Translate")
                 or emitted["rotate_euler"] != transform.get("Rotate")
-                or emitted["scale"] != transform.get("Scale")
+                or emitted["scale"] != transform.get("UniformScale")
                 or emitted["nonuniform_scale"] != nonuniform):
             problems.append(f"{Path(prefab_file).name}: entity {entity_id} was traced with other values")
 
@@ -367,7 +368,8 @@ def uncovered_in_assetinfo(assetinfo_file: Path, writes: List[dict]) -> List[str
         record = traced.get(group.get("name"))
         if record is None:
             problems.append(f"{Path(assetinfo_file).name}: group {group.get('name')} has no trace record")
-        elif record["rotation"] != rule.get("rotation") or record["translation"] != rule.get("translation"):
+        elif (record["rotation"] != rule.get("rotation") or record["translation"] != rule.get("translation")
+              or record.get("scale") != rule.get("scale")):
             problems.append(f"{Path(assetinfo_file).name}: group {group.get('name')} was traced with another rule")
     return problems
 

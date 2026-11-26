@@ -1,0 +1,21 @@
+{
+    "schema_version": 2,
+    "name": "Parity - Tirgames Pack",
+    "source_engine": "unity",
+    "active_platform": "unity",
+    "notes": "Second test bed of the parity harness. Source: the Tirgames assets (Gentlemen's Club) of the Del Lago Layover Unity project. Target: the ConverterTest O3DE project, beside the Office pack. Runs work on a copy of this file, so it stays as written.",
+    "scope_root": "D:/OffLocalDev/dellagolayover/Assets/TirgamesAssets",
+    "o3de_project_root": "D:/OffLocalDev/xxxxxDelete/ConverterTest",
+    "stages_by_platform": {
+        "unity": {
+            "asset_processor": {
+                "selected_prefabs": [],
+                "output_path": "D:/OffLocalDev/xxxxxDelete/ConverterTest/Assets/TirgamesPack"
+            },
+            "scene_converter": {
+                "selected_scenes": ["NightClubs/GentlemensClub/Scenes/GentlemensClubScene.unity"],
+                "output_path": "D:/OffLocalDev/xxxxxDelete/ConverterTest/Levels"
+            }
+        }
+    }
+}

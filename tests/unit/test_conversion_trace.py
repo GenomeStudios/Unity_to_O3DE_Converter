@@ -140,7 +140,9 @@ def test_child_entity_records_unity_values_and_emitted_values():
         data = emitted["Entities"][lid["entity_id"]]["Components"]["TransformComponent"]["Transform Data"]
         assert lid["emitted"]["translate"] == data["Translate"] == [1.0, 3.0, 2.0]
         assert lid["emitted"]["rotate_euler"] == data["Rotate"]
-        assert lid["emitted"]["scale"] == data["Scale"] == 2.0
+        # One scale for all axes: the engine reads it from "UniformScale".
+        assert lid["emitted"]["scale"] == data["UniformScale"] == 2.0
+        assert "Scale" not in data
         assert lid["go_file_id"] == "101"
 
 
@@ -249,7 +251,7 @@ def test_transform_from_patches_reads_only_transform_patches():
         {"op": "replace", "path": prefix + "Transform Data/Translate/0", "value": 1.5},
         {"op": "replace", "path": prefix + "Transform Data/Translate/2", "value": -2.0},
         {"op": "replace", "path": prefix + "Transform Data/Rotate/1", "value": 90.0},
-        {"op": "replace", "path": prefix + "Transform Data/Scale", "value": 3.0},
+        {"op": "replace", "path": prefix + "Transform Data/UniformScale", "value": 3.0},
         {"op": "replace", "path": "/Entities/Entity_[2]/Components/X/assetHint", "value": "a"},
     ])
     assert emitted == {"translate": [1.5, 0.0, -2.0], "rotate_euler": [0.0, 90.0, 0.0], "scale": 3.0}

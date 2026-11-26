@@ -196,6 +196,50 @@ def test_an_offset_beyond_tolerance_and_noise_is_not_in_place():
     assert report.placement_verdict(_Tolerance, dict(fit, offset_mm=0.4, matched=0.5), rod) == (False, False)
 
 
+class _CompressedTruth:
+    """A truth dump whose models were imported with one compression setting."""
+
+    def __init__(self, setting):
+        self.setting = setting
+
+    def mesh_compression(self, key):
+        return self.setting
+
+
+class _CycleWith(_Tolerance):
+    def __init__(self, setting):
+        self.truth = _CompressedTruth(setting)
+
+
+def _floor(size: float) -> np.ndarray:
+    """The four corners of a flat square panel, one corner on the origin."""
+    return np.array([[0.0, 0.0, 0.0], [size, 0.0, 0.0], [size, 0.0, size], [0.0, 0.0, size]])
+
+
+def test_the_truths_quantum_is_one_step_of_unitys_compression_on_each_axis():
+    """A 14 m floor imported with High compression: 10 bits over 14 m is a
+    step of 13.7 mm, and one step on each of three axes is 23.7 mm long."""
+    quantum = report.truth_quantum_mm(_CycleWith("High"), "guid_1", _floor(14.0), np.identity(4))
+    assert abs(quantum - 14000.0 / 1023.0 * np.sqrt(3.0)) < 1e-6
+    # It grows with the object's scale, and is nothing where the bits are not known.
+    doubled = report.truth_quantum_mm(_CycleWith("High"), "guid_1", _floor(14.0), np.diag([2.0, 2.0, 2.0, 1.0]))
+    assert abs(doubled - 2.0 * quantum) < 1e-6
+    assert report.truth_quantum_mm(_CycleWith("Off"), "guid_1", _floor(14.0), np.identity(4)) == 0.0
+    assert report.truth_quantum_mm(_CycleWith(""), "guid_1", _floor(14.0), np.identity(4)) == 0.0
+
+
+def test_a_floor_off_by_less_than_its_quantum_is_in_place_and_marked():
+    """The Tirgames 14 m floor: four vertices, 16.8 mm off, 9.7 mm of noise
+    left after the fit. The noise alone does not cover it; the step does."""
+    fit = {"matched": 1.0, "offset_mm": 16.8, "rotation_deg": 0.0, "noise_mm": 9.7, "rotation_axis": None}
+    floor = _floor(14.0)
+    assert report.placement_verdict(_Tolerance, fit, floor) == (False, False)
+    quantum = report.truth_quantum_mm(_CycleWith("High"), "guid_1", floor, np.identity(4))
+    assert report.placement_verdict(_Tolerance, fit, floor, quantum) == (True, False)
+    # A real miss of 5 cm on the same floor still fails.
+    assert report.placement_verdict(_Tolerance, dict(fit, offset_mm=50.0), floor, quantum) == (False, False)
+
+
 def test_the_fit_names_the_axis_it_turns_about():
     expected = _cloud(600)
     centre = expected.mean(axis=0)
@@ -284,6 +328,16 @@ def test_the_ambient_colours_are_read_from_the_scene_file():
         assert report.unity_ambient_colours(scene)["m_AmbientGroundColor"] == [0.047, 0.043, 0.035]
         scene.write_text(_SCENE_WITHOUT_AMBIENT, encoding="utf-8")
         assert report.unity_ambient_colours(scene) is None
+
+
+def test_in_the_one_colour_mode_the_sky_colour_counts_for_all_three():
+    """The club level of the Tirgames pack: ambient mode Color, black, with
+    Unity's default equator and ground colours still stored beside it."""
+    with tempfile.TemporaryDirectory() as folder:
+        scene = Path(folder) / "Club.unity"
+        scene.write_text(_SCENE_TEXT.replace("m_AmbientMode: 0", "m_AmbientMode: 3"), encoding="utf-8")
+        colours = report.unity_ambient_colours(scene)
+        assert colours["m_AmbientEquatorColor"] == colours["m_AmbientGroundColor"] == [0.212, 0.227, 0.259]
 
 
 def test_a_level_holding_the_scenes_three_colours_passes_its_lighting():

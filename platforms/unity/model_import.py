@@ -35,8 +35,9 @@ Unity's object tree
 - One object per node of the file. A file with one top node: that node is the
   model's root. Otherwise Unity makes a root of its own. Either way the root
   is named after the file.
-- Unity negates X. A node's position is ``(-x, y, z)`` times the file's unit,
-  its rotation ``pre * local * post^-1`` with X negated, its scale as stated.
+- Unity negates X. A node's position is ``(-x, y, z)`` times the file's unit
+  and the importer's scale factor, its rotation ``pre * local * post^-1``
+  with X negated, its scale as stated.
 - In a Z-up file the nodes at the top are also turned to Y-up.
 """
 
@@ -87,7 +88,11 @@ class ModelMeta:
     # False when the importer takes no materials from the file: Unity then
     # shows its default material, which is no asset of the project.
     import_materials: bool = True
-    # Importer switches this module's rules do not cover, when they are on.
+    # The importer's "Scale Factor" (``globalScale``): Unity multiplies the
+    # model by it - the vertices of every mesh and the place of every node.
+    global_scale: float = 1.0
+    # Importer switches this module's rules do not cover, when they are set
+    # away from their default.
     unsupported: List[str] = field(default_factory=list)
 
 
@@ -123,9 +128,17 @@ def read_model_meta(meta_path: Path) -> ModelMeta:
     meta.import_materials = str(material_settings.get("materialImportMode", "1")) != "0"
 
     meshes = importer.get("meshes") if isinstance(importer.get("meshes"), dict) else {}
+    try:
+        meta.global_scale = float(meshes.get("globalScale", 1.0))
+    except (TypeError, ValueError):
+        meta.global_scale = 1.0
     for switch in ("bakeAxisConversion", "preserveHierarchy"):
         if str(meshes.get(switch, importer.get(switch, "0"))) == "1":
             meta.unsupported.append(switch)
+    # With the file's unit switched off Unity reads the file's numbers as
+    # centimetres, whatever the file says.
+    if str(meshes.get("useFileScale", "1")) == "0":
+        meta.unsupported.append("useFileScale off")
     return meta
 
 
@@ -265,7 +278,7 @@ def model_objects(facts: dict, file_stem: str, meta: ModelMeta) -> List[ModelObj
 
     def object_for(name: str, parent: int, is_root: bool) -> ModelObject:
         node = nodes[name]
-        position, rotation = _unity_node_transform(facts, node)
+        position, rotation = _unity_node_transform(facts, node, meta.global_scale)
         game_object_id, transform_id = ids_for(ROOT_NAME if is_root else name, is_root)
         return ModelObject(
             name=file_stem if is_root else name, node=name, parent=parent,
@@ -297,10 +310,10 @@ def model_objects(facts: dict, file_stem: str, meta: ModelMeta) -> List[ModelObj
     return objects
 
 
-def _unity_node_transform(facts: dict, node: dict) -> tuple:
+def _unity_node_transform(facts: dict, node: dict, global_scale: float = 1.0) -> tuple:
     """A node's local position (metres) and rotation (quaternion) as Unity
-    imports them."""
-    unit = float(facts.get("unit_to_metres") or 0.01)
+    imports them. ``global_scale`` is the importer's scale factor."""
+    unit = float(facts.get("unit_to_metres") or 0.01) * global_scale
     translation = [value * unit for value in node["local_translation"]]
     rotation = mat_mul(mat_mul(euler_xyz_matrix(node["pre_rotation"]), euler_xyz_matrix(node["local_rotation"])),
                        transpose(euler_xyz_matrix(node["post_rotation"])))
