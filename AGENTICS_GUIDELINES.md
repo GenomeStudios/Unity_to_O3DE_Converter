@@ -160,7 +160,13 @@ Plan / working-doc pairs live in **per-feature folders** under
     ui_reorganization/           UX-1 — banner + dashboard + tab order
     window_chrome/               UX-2 — frameless window
     project/                     Pre-system converter notes
+    parity_harness/              Unity-truth parity test bed (bridge, CLI, trace, harness)
 ```
+
+Features started after 2026-11 name their files `plan.md` and
+`working_doc.md`, with a `record.md` once concluded; `parity_harness/` is
+the first. The older `<feature>_plan.md` / `working_documentation.md`
+pairs stay as they are.
 
 Add a new folder when starting a new feature. The folder name is
 short, lower-case, snake-case, and matches the feature's working
@@ -292,6 +298,10 @@ text (memos, READMEs, code comments), use these terms consistently:
 | **Mission Command** | The Dashboard surface. Hosts the Pre-flight panel + Pipeline Status cards + Activity Log. |
 | **Pre-flight** | Per-stage check pass producing a `PreflightReport` (green / yellow with Acknowledge / red blocking). |
 | **Source platform** | A plugin under `platforms/<engine>/` that teaches the converter how to read one source engine. |
+| **Truth dump** | What the source engine itself holds after import, written by a headless run of it (`converter_cli.py truth`). The converter's output is compared with it. |
+| **Unity bridge** | The Unity plugin's headless side (`platforms/unity/bridge/`): finds the Editor of the project's version, installs its Editor script, runs it. |
+| **Trace** | The converter's own account of how each emitted value was produced (`conversion_trace.py`, `converter_cli.py run --trace`). |
+| **Parity cycle** | Truth, convert, bake, cook, probe, compare: one run of the harness in `parity/`, ending in a report of verdicts and clusters. |
 
 ---
 
@@ -319,6 +329,15 @@ Spawn subagents for parallelizable independent queries, or for
 context-heavy log analysis. Don't spawn for trivial work — the
 round-trip cost outweighs the benefit. See the user's
 `~/.claude/CLAUDE.md` for project-level preferences if they're set.
+
+### Headless runs
+
+- `python converter_cli.py describe|run|truth <project.u2oproj.json>` runs
+  the converter without its window, through the same stage functions as
+  the GUI (`stage_runner.py`).
+- `python parity/parity.py cycle parity/configs/office.json` measures the
+  converted result against Unity and writes a report with the difference
+  from the previous run. See [`parity/README.md`](parity/README.md).
 
 ### Test discipline
 

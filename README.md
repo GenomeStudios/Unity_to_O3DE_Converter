@@ -90,6 +90,20 @@ CLI tab override:
 python main_app.py --tab=prefab    # dashboard / scenes / prefabs / meshes / materials / terrain
 ```
 
+### Without the window
+
+```bash
+python converter_cli.py describe <project.u2oproj.json>                 # settings, component processors, last coverage
+python converter_cli.py run      <project.u2oproj.json>                 # the stage runs of the Process buttons
+python converter_cli.py truth    <project.u2oproj.json> --out <folder>  # Unity writes what it holds after import
+```
+
+`run` takes `--stage`, `--only`, `--set stage.key=value` (for that run only), `--trace <folder>` (how every
+emitted value was produced) and `--seed`. `truth` needs the Unity Editor of the project's own version: see
+[`platforms/unity/bridge/README.md`](platforms/unity/bridge/README.md). No command writes to the project file.
+
+To measure a conversion against Unity itself, see [`parity/README.md`](parity/README.md).
+
 ---
 
 ## Workflow at a glance
@@ -123,6 +137,9 @@ to-o3de_project_converter/
     unity_scene_converter_gui.py      Stage 2 — scene to level conversion
     terrain_material_processor.py     Terrain materials
     preflight.py                      Pre-flight check registry
+    converter_cli.py                  The converter without its window (describe / run / truth)
+    stage_runner.py                   Stage runs shared by the GUI and the command line
+    conversion_trace.py               How every emitted value was produced (optional)
     converter_settings.json           App-level state (recent projects)
     Projects/                         Per-project .u2oproj.json files
 
@@ -130,6 +147,7 @@ to-o3de_project_converter/
         base.py                       SourcePlatform ABC (the contract)
         types.py                      Neutral data shapes
         unity/                        Unity reference plugin
+            bridge/                   Headless Unity runs: the truth dump
         README.md                     How to add a new platform
 
     targets/                          Output-target writers
@@ -147,6 +165,10 @@ to-o3de_project_converter/
 
     tools/                            Standalone helper scripts
         bake_fbx_transforms.py        Blender headless companion
+
+    parity/                           Parity harness: Unity's truth against the O3DE result
+        parity.py                     One command per cycle
+        README.md
 
     .serena/memories/                 Design memory (P/I/T methodology)
         <feature>/<feature>_plan.md
@@ -255,6 +277,7 @@ described in [`AGENTICS_GUIDELINES.md`](AGENTICS_GUIDELINES.md) §3.
 | Concern | Memory cluster |
 |---|---|
 | Conversion Project base | `.serena/memories/project_system/` |
+| Parity harness, Unity bridge, command line, trace | `.serena/memories/parity_harness/` |
 | Project scope + per-stage source override (F-2) | `.serena/memories/project_scope/` |
 | Multi-scene marking + nested level output (F-3) | `.serena/memories/scene_marking/` |
 | Scrubbed prefab marking (F-4) | `.serena/memories/prefab_marking/` |

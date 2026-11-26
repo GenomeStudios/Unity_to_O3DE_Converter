@@ -14,6 +14,47 @@ Report words: verified (the person ran it and confirmed), ran (executed with log
 
 Log, newest first.
 
+## 2026-11-25 - Concluded
+
+### Verification
+- T.16 verified. The person: Desk_metal's sheet is there and shows drawer C forward of and above its slot; Cabinet_A's is there and looks right as far as the wireframe tells, while the report reads 1 fail.
+- That one fail, looked up: Cabinet_A's frame mesh sits 4.3 mm off (minus the rule's auto-centre translation); both doors are within 0.2 mm and all nine colliders pass. On a sheet 2.4 m wide that is under a pixel.
+- T.19 verified. The person read the baseline report.
+- T.15 verified as D.36.
+- Every stage is ticked and every proof is verified or ran as its row in the plan says.
+
+### Decisions taken from the person
+- Unity may be part of the conversion process where necessary (D.35).
+
+### What landed
+- `record.md`: the record of the harness as built.
+- The plan's final state: stages ticked, proof results, D.35, D.36.
+
+### Open follow-ups
+- Fix plans, each proven by a cycle. By the baseline's evidence: the auto-centre translation (79 models), the inverted rotation (D.17), the two prefab source spellings (the converted level does not cook), models never emitted or not produced, non-uniform scale lost.
+- A sheet does not mark which element fails or how small an offset is; a label per failing element would have answered the person's question on Cabinet_A.
+- Not built: rendered pictures from the two engines (D.31).
+
+## 2026-11-25 - The person's checks: I.1 to I.3 verified
+
+### Verification
+- T.3 verified. Inspector values of `Desk_metal.prefab`: drawer C position (-0.0140185542, 0.808071554, 0.450153798), its box collider centre (0.0142202824, 0.0033603888, -0.437496692), left drawer A position (-0.601999998, 0.75999999, 0.448000014). Largest difference from the truth dump: 5e-10.
+- T.8 verified. The person ran the Prefabs stage of `Police Office 2.u2oproj.json` from the GUI: "works fine".
+- T.11 verified. In `Bench_Parity_Office` the person read the prefab wrappers at (228, -570, 0), (-684, -456, 0) and (342, -684, 0): the recipe's cells for Desk_metal, Door_Metal_Gray and Carpet_round.
+- T.15, T.16, T.19 open: the sheets against both editors and the baseline report are "not looked at yet" (the person).
+
+### Decisions taken from the person
+- After the conclusion the plan and the working doc are kept (the plan's Project section).
+- The root README, the guidelines and `mem:project/converter_working_status` get short additions for the CLI, the bridge and the harness.
+
+### What landed
+- `README.md`: "Without the window" (the three commands), five lines in the architecture tree, one row in the design table. Its working copy was brought back to LF, as the index has it.
+- `AGENTICS_GUIDELINES.md`: `parity_harness/` in the memory folder list with its file names, four vocabulary rows, a "Headless runs" note under tooling.
+- `mem:project/converter_working_status`: the new entry points among the active scripts.
+
+### Open follow-ups
+- The plan is open on I.4, I.5 and I.6 for T.15, T.16 and T.19 only. `/pit-conclude` once they hold.
+
 ## 2026-11-25 - Conclusion asked for; not concluded
 
 ### State

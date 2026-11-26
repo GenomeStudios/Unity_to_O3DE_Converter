@@ -5,6 +5,8 @@ metadata:
   type: plan
 ---
 
+Concluded. Record: `.serena/memories/parity_harness/record.md`.
+
 Feature: `parity_harness`. Working doc: `.serena/memories/parity_harness/working_doc.md`. IDs: P plan, D decision, Q open question, H suspect (a finding the baseline must confirm or clear), I stage (increments I.na), T proof, F fix.
 
 Environment facts (paths, versions, counts): `mem:parity_harness/environment`. Earlier work on the same problem: `mem:transform_truth/transform_truth_plan`, `mem:transform_truth/working_documentation`.
@@ -121,10 +123,12 @@ The truth dump and the O3DE record share one schema. Values are metres in each e
 - D.32 Q.2 is carried into the fix plans (the person, 2026-11-25): whether Unity is a required stage of conversion is answered while the auto-centre and rotation clusters are fixed, where the evidence is produced anyway. The baseline no longer has to answer it.
 - D.33 A model that the entity does not show is told apart three ways: the converter named none (fail), the model it named was not produced (uncooked, checked against the product cache), the model exists and is not shown (fail). An FBX whose own job failed is uncooked whatever the Editor still shows.
 - D.34 In the difference between two runs, a pass that becomes failing, uncooked or unmatched is a regression, and the reverse is fixed.
+- D.35 Unity may be part of the conversion process where it is necessary (the person, 2026-11-25, after reading the baseline). This settles Q.2 as a matter of policy; where it is in fact needed is shown by the fix plans (D.32).
+- D.36 T.15 counts as done on two prefabs checked in depth (Desk_metal, Cabinet_A) and the placement of three in the level (the person, 2026-11-25).
 
 ## Q - Open questions
 - Q.1 (resolved, D.21) How much of the stage run logic can leave `main_app.py` without a change in behaviour, and what is the shared module called - blocks I.2.
-- Q.2 (carried into the fix plans, D.32) Is Unity in the loop a required stage of conversion, or only the verifier? It is required if any of the 232 FBX cannot be explained from its file alone (H.2). Answered by the baseline; blocks the conclusion and the follow-up plan for a GUI surface.
+- Q.2 (settled as policy by D.35; the evidence comes with the fix plans, D.32) Is Unity in the loop a required stage of conversion, or only the verifier? It is required if any of the 232 FBX cannot be explained from its file alone (H.2). Answered by the baseline; blocks the conclusion and the follow-up plan for a GUI surface.
 - Q.3 (resolved, D.29) Can an external gem link `Gem::Atom_RPI.Public` and `AZ::AzToolsFramework` against the installed SDK, and which calls give model positions and the prefab alias of an entity - blocks I.3.
 - Q.4 (resolved, D.29) Are the shapes of `EditorColliderComponent`, `EditorShapeColliderComponent` and `EditorMeshColliderComponent` in the Editor's physics scene in edit mode, readable through `Physics::Shape::GetGeometry`, and in which frame? If not, colliders are read in game mode - blocks I.3.
 - Q.5 (resolved, D.29) The patch paths a level needs to place a nested instance (container transform alias, parent link) - blocks I.3; read from the scene converter's level writer.
@@ -133,7 +137,7 @@ The truth dump and the O3DE record share one schema. Values are metres in each e
 - Q.8 (resolved, D.25) Convex colliders: PhysX hull cooking moves vertices, so which measure and tolerance are fair - blocks the collider verdicts of I.4.
 
 ## I - Stages
-- [ ] I.1 Unity bridge: truth dump (ran; open for the person: T.3's Inspector check) - Done when:
+- [x] I.1 Unity bridge: truth dump (verified) - Done when:
   - `python converter_cli.py truth <config>` finds the Unity Editor of the project's version, installs the bridge script, runs Unity headless, exits 0 and keeps the Editor log.
   - It refuses with a message that names what is missing: the Editor version, a project open in Unity, no write access.
   - The dump covers all 222 prefabs, all 232 FBX and the scenes of the config, in the schema of Design / Records.
@@ -142,7 +146,7 @@ The truth dump and the O3DE record share one schema. Values are metres in each e
   - [x] I.1a Headless start: Unity 2021.3.14f1 opens the full project in batch mode, compiles the bridge script and counts the assets (`--check`). Ran: 30 s, exit 0, Unity Hub closed.
   - [x] I.1b Prefab, model, scene and mesh dump with identity chains. Ran: 222 prefabs, 232 models, 1 scene, 1053 objects, 277 meshes, 123702 vertices, 0 matrix mismatches, 16 s.
   - [x] I.1c Cache, refusals, unit tests, README. Ran: second run cached; 20 unit tests pass.
-- [ ] I.2 Converter CLI and trace (ran; open for the person: T.8's GUI run) - Done when:
+- [x] I.2 Converter CLI and trace (verified) - Done when:
   - `python converter_cli.py run <config> [--stage ...] [--only <glob>] [--set key=value]` runs the same stage functions as the GUI with no display, and its exit code says whether errors occurred.
   - The GUI and the CLI call one set of stage run functions, in a module that imports no widgets.
   - `--set` alters one run and writes nothing back to the project file.
@@ -151,7 +155,7 @@ The truth dump and the O3DE record share one schema. Values are metres in each e
   - [x] I.2a Trace collector and hooks (`conversion_trace.py`), FBX facts reader. Ran: 0 emitted values uncovered on the full pack.
   - [x] I.2b `stage_runner.py`; GUI tabs call it. Ran: CLI output equals the GUI's own pre-lift output, 916 files, 0 differences.
   - [x] I.2c CLI `run` (`--stage`, `--only`, `--set`, `--trace`, `--project-out`, `--seed`, `--log`, `--quiet`) and `describe`. Ran: 21 unit tests pass.
-- [ ] I.3 O3DE bake, cook and probe (ran) - Done when:
+- [x] I.3 O3DE bake, cook and probe (verified) - Done when:
   - `python parity/parity.py setup <config>` registers the probe gem in the O3DE project and it builds.
   - `bake` writes `Levels/Bench_Parity_Office` with its recipe; `cook` runs the Asset Processor in batch and lists every failed job by source asset.
   - `probe` starts the Editor unattended on the baked level, writes the O3DE record in the schema of Design / Records plus a scrub of every property of every component, exits 0, and closes the Asset Processor it started.
@@ -159,7 +163,7 @@ The truth dump and the O3DE record share one schema. Values are metres in each e
   - [x] I.3a Probe gem `ParityProbe` (console command `parity_dump`). Built first try; ran in the Editor.
   - [x] I.3b Baked level with recipe (`level_bake.py`), cook with failed-job list, Editor session and launcher (`o3de_run.py`, `o3de/session.py`). Ran: probe 42 s, 1045 entities, 356 meshes all loaded, 667 collider shapes, exit 0.
   - [x] I.3c Component property scrub in the Editor. Ran: `properties.json` for 693 entities; some property reads raise in the Editor's Python and are counted as failures.
-- [ ] I.4 Compare and report (ran; open for the person: T.15's spot check) - Done when:
+- [x] I.4 Compare and report (verified) - Done when:
   - `compare` joins truth, trace and O3DE record by identity keys and lists what is unmatched on either side.
   - Every element has a status: pass, fail, uncooked, unmatched or unmeasured, at the tolerances of the config.
   - Every failing element has its residual, its signature and a link to its trace record.
@@ -167,13 +171,13 @@ The truth dump and the O3DE record share one schema. Values are metres in each e
   - [x] I.4a Math (`compare.py`): frames, distances, placement fit, residual search over the 48 axis permutations. 31 unit tests.
   - [x] I.4b Join, verdicts, clusters, import table, report (`report.py`). Ran on the whole pack in 35 s.
   - [x] I.4c Shift explained against the trace ("= minus the rule's auto_center translation").
-- [ ] I.5 Views (ran, as changed by D.31; open for the person: T.16) - Done when:
+- [x] I.5 Views (verified, as changed by D.31) - Done when:
   - The truth dump and the probe each write front, top and left pictures per prefab from the shared camera spec.
   - `compare` builds one sheet per prefab: three views by three columns (Unity, O3DE, overlay of both records with colliders).
   - The report links every sheet.
   - [x] I.5a Sheets drawn from the records, one per prefab, linked from the report (D.30).
   - I.5b Rendered pictures from Unity and from the Editor: dropped (D.31).
-- [ ] I.6 Cycle and baseline (ran; open for the person: T.19) - Done when:
+- [x] I.6 Cycle and baseline (verified, as changed by D.32) - Done when:
   - `python parity/parity.py cycle <config> [--only <glob>]` runs truth (cached), convert, bake check, cook, probe and compare unattended, and prints the result with its difference from the previous run: clusters closed, clusters opened, regressions.
   - The converted `Showcase` level is probed and every instance placement is compared with the scene truth.
   - The baseline report on the whole pack exists, with a verdict on H.1 to H.3 and the answer to Q.2.
@@ -218,27 +222,27 @@ Verdicts on the suspects:
 Q.2 is not closed and is carried into the fix plans (D.32). For 61 per cent of the models no mirror and no turn is needed, so the file alone may be enough there; whether the remaining shifts and turns follow from the FBX facts has not been tested. The truth dump is what would show it: each model's residual is in `report.json` beside the file's node transforms in `fbx_facts.json`.
 
 ## T - Proofs
-| ID | Proof | Stage |
-|---|---|---|
-| T.1 | Headless Unity run exits 0 and writes the dump; `git status` of the Unity project is unchanged (ran, log kept) | I.1 |
-| T.2 | The dump's prefab and FBX counts equal the file counts on disk (222, 232) | I.1 |
-| T.3 | Desk_metal: the four drawer instances sit where transform_truth recorded them (Drawer A left at Unity local -0.602, 0.76, 0.448). The person compares three values of their choice with the Unity Inspector | I.1 |
-| T.4 | Unit tests: Editor discovery by project version, cache hash, each refusal message. Suite green | I.1 |
-| T.5 | `converter_cli.py run` on the Office config with no display exits 0, and its output equals the output captured from the GUI's own run function before the lift (file list and content hash) | I.2 |
-| T.6 | Trace completeness: a unit test on a synthetic prefab, and a check over the whole Office output that no emitted transform or coordinate rule lacks a record | I.2 |
-| T.7 | Unit test: `--set` changes the run and leaves the project file byte-identical | I.2 |
-| T.8 | Suite green. The person starts the GUI and runs the asset processor stage once | I.2 |
-| T.9 | The probe gem builds through the O3DE MCP and the Editor starts with it | I.3 |
-| T.10 | Unit tests on the baker: level and recipe written; an altered recipe is refused; a level without a recipe is not touched | I.3 |
-| T.11 | Probe run exits 0 with every instance of the level in the record; one entity's position read back equals its prefab JSON; one mesh's vertex count and box agree with a hand check | I.3 |
-| T.12 | A deliberately broken assetinfo shows its prefabs as `uncooked` | I.3 |
-| T.13 | Unit tests on the compare math: equal sets pass; a 2 mm shift fails with that shift as residual; yaw 180, mirror X and an inverted rotation are each named | I.4 |
-| T.14 | Join: Desk_metal's nested drawers, and one prefab with repeated child names, match one to one with none unmatched | I.4 |
-| T.15 | The person spot-checks three prefabs of the report against both editors | I.4 |
-| T.16 | A sheet exists for every prefab; the person confirms that Desk_metal's and Cabinet_A's show what the two editors show | I.5 |
-| T.17 | One `cycle` command runs start to finish unattended; a second cycle reports no change | I.6 |
-| T.18 | A mesh override injected with `--set` appears as a regression for that mesh's prefabs and nowhere else | I.6 |
-| T.19 | The person reads the baseline: clusters, counts, the H verdicts, the answer to Q.2 | I.6 |
+| ID | Proof | Stage | Result |
+|---|---|---|---|
+| T.1 | Headless Unity run exits 0 and writes the dump; `git status` of the Unity project is unchanged (ran, log kept) | I.1 | ran |
+| T.2 | The dump's prefab and FBX counts equal the file counts on disk (222, 232) | I.1 | ran |
+| T.3 | Desk_metal: the four drawer instances sit where transform_truth recorded them (Drawer A left at Unity local -0.602, 0.76, 0.448). The person compares three values of their choice with the Unity Inspector | I.1 | verified: the person read drawer C's position, its box centre and the left drawer A's position in the Inspector; each equals the dump to nine digits |
+| T.4 | Unit tests: Editor discovery by project version, cache hash, each refusal message. Suite green | I.1 | ran (20 tests) |
+| T.5 | `converter_cli.py run` on the Office config with no display exits 0, and its output equals the output captured from the GUI's own run function before the lift (file list and content hash) | I.2 | ran (916 files, 0 differences) |
+| T.6 | Trace completeness: a unit test on a synthetic prefab, and a check over the whole Office output that no emitted transform or coordinate rule lacks a record | I.2 | ran (0 uncovered on the pack) |
+| T.7 | Unit test: `--set` changes the run and leaves the project file byte-identical | I.2 | ran |
+| T.8 | Suite green. The person starts the GUI and runs the asset processor stage once | I.2 | verified: the person ran the Prefabs stage of `Police Office 2.u2oproj.json` from the GUI |
+| T.9 | The probe gem builds through the O3DE MCP and the Editor starts with it | I.3 | ran |
+| T.10 | Unit tests on the baker: level and recipe written; an altered recipe is refused; a level without a recipe is not touched | I.3 | ran |
+| T.11 | Probe run exits 0 with every instance of the level in the record; one entity's position read back equals its prefab JSON; one mesh's vertex count and box agree with a hand check | I.3 | verified: the person read the wrappers of Desk_metal, Door_Metal_Gray and Carpet_round at their recipe cells in the Editor |
+| T.12 | A deliberately broken assetinfo shows its prefabs as `uncooked` | I.3 | ran (failed first; holds after D.33) |
+| T.13 | Unit tests on the compare math: equal sets pass; a 2 mm shift fails with that shift as residual; yaw 180, mirror X and an inverted rotation are each named | I.4 | ran (33 tests) |
+| T.14 | Join: Desk_metal's nested drawers, and one prefab with repeated child names, match one to one with none unmatched | I.4 | ran |
+| T.15 | The person spot-checks three prefabs of the report against both editors | I.4 | verified, as D.36: Desk_metal and Cabinet_A in depth, three placements in the level |
+| T.16 | A sheet exists for every prefab; the person confirms that Desk_metal's and Cabinet_A's show what the two editors show | I.5 | verified: the person saw Desk_metal's sheet show drawer C forward of and above its slot, and Cabinet_A's look right (its one fail is a 4.3 mm frame offset, under a pixel of the sheet) |
+| T.17 | One `cycle` command runs start to finish unattended; a second cycle reports no change | I.6 | ran |
+| T.18 | A mesh override injected with `--set` appears as a regression for that mesh's prefabs and nowhere else | I.6 | ran |
+| T.19 | The person reads the baseline: clusters, counts, the H verdicts, the answer to Q.2 | I.6 | verified: the person read the baseline report |
 
 ## Project
 - Rules read: `AGENTICS_GUIDELINES.md` (root), `tests/README.md`, the memories named at the top, the global CLAUDE.md. No CLAUDE.md or AGENTS.md in the repo.
@@ -250,4 +254,4 @@ Q.2 is not closed and is carried into the fix plans (D.32). For 61 per cent of t
   - Never commit or push in either repo; never write to GitHub. Claude proposes commits.
 - Proof commands: `QT_QPA_PLATFORM=offscreen python tests/run_all.py`; one module with `python tests/unit/test_<name>.py`; GUI smoke with `python main_app.py`; gem configure and build through the O3DE MCP (`o3de_configure`, `o3de_build`).
 - Record: `.serena/memories/parity_harness/record.md`
-- Wipe: ask at conclusion.
+- Wipe: nothing. The plan and the working doc are kept after the conclusion (the person, 2026-11-25).

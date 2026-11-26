@@ -13,6 +13,11 @@ Two-stage automated converter: Unity graphical assets/prefabs → O3DE prefabs, 
 - `project_manager.py` — Project schema (`.u2oproj.json`), `SourceEngine` enum, `Project` dataclass, materialtype resolver, externally-modified detection.
 - `preflight.py` — F-8 preflight + Mission Command checks.
 - `converter_settings.json` — recent-projects + global config (gitignored).
+- `converter_cli.py` - the converter without its window (added 2026-11-25): `describe`, `run` (the same stage functions as the GUI), `truth` (Unity truth dump). Writes nothing to the project file.
+- `stage_runner.py` - the two stage runs, shared by the GUI tabs and the command line.
+- `conversion_trace.py` - optional trace of how every emitted transform and coordinate rule was produced (`converter_cli.py run --trace`).
+- `platforms/unity/bridge/` - headless Unity: the truth dump (what Unity holds after import).
+- `parity/` - parity harness: Unity's truth against the cooked O3DE result, per element, with clusters. Plan, baseline findings on the Office pack and environment facts: `mem:parity_harness/plan`, `mem:parity_harness/environment`.
 - `tools/bake_fbx_transforms.py` — standalone Blender headless tool (out-of-process).
 
 Component processors live in `platforms/unity/components/`; auto-discovery is rooted there. The root-level `components/` shim package was deleted in Pass-2 I.3.
