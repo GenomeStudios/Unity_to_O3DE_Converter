@@ -49,6 +49,7 @@ from records import (O3deRecord, Trace, box_corners, latest_truth, matrix_from_r
 STATUS_ORDER = ["fail", "unmatched", "uncooked", "unmeasured", "lod_stripped", "pass"]
 SCALE_TOLERANCE = 1e-3          # relative
 MATCHED_SHARE = 0.97            # share of a mesh's vertices that must find their partner
+LOST = ("fail", "uncooked", "unmatched")   # verdicts that are a loss against a pass
 CONVEX_SLACK = 5.0              # a cooked hull is an approximation: this many times the tolerance
 
 
@@ -163,16 +164,37 @@ def transform_element(cycle: Cycle, expected: np.ndarray, actual: np.ndarray, tr
     return element
 
 
-def mesh_element(cycle: Cycle, item: dict, entity: dict, frame_unity: np.ndarray,
+def mesh_element(cycle: Cycle, item: dict, entity: dict, traced: dict, frame_unity: np.ndarray,
                  frame_o3de: np.ndarray) -> dict:
     truth_key = cycle.truth.mesh_key(item["mesh"])
     element = {"kind": "mesh", "mesh": item["mesh"]["name"], "fbx": Path(item["mesh"]["assetPath"]).name}
     facts = _fbx_context(cycle, element["fbx"], item["mesh"]["name"])
     element["fbx_facts"] = facts
 
+    # A file whose job failed in the Asset Processor did not cook, whatever
+    # the Editor still shows for it: an older model can linger in the cache.
+    cook_errors = cycle.failed_sources.get(element["fbx"].lower())
+    if cook_errors is not None:
+        return {**element, "status": "uncooked",
+                "residual": "its FBX job failed: " + (cook_errors[0] if cook_errors else "no error line")}
+
     mesh = entity.get("mesh")
     if mesh is None:
-        return {**element, "status": "fail", "signature": "mesh: no mesh component in O3DE",
+        # The entity shows no model. Either the converter named none, or the
+        # model it named was never produced, or it exists and is not shown.
+        hints: List[str] = []
+        for component in traced.get("components", []):
+            _collect_hints(component.get("emitted"), hints)
+        models = [hint for hint in hints if hint.lower().endswith(".azmodel")]
+        if not models:
+            return {**element, "status": "fail", "signature": "mesh: the converter emitted no model",
+                    "residual": "the entity has no mesh component"}
+        element["model"] = models[0]
+        if not (cycle.bed.o3de_root / "Cache" / "pc" / models[0]).is_file():
+            return {**element, "status": "uncooked",
+                    "residual": f"the model the prefab names was not produced: {models[0]}",
+                    "signature": "mesh: the model the prefab names was not produced"}
+        return {**element, "status": "fail", "signature": "mesh: model produced and not shown",
                 "residual": "the entity shows no model"}
     if not mesh["ready"]:
         return {**element, "status": "uncooked", "model": mesh["asset"]}
@@ -498,7 +520,7 @@ def compare_prefab(cycle: Cycle, entry: dict) -> dict:
         record["entity"] = entity["prefab"]["alias"]
         record["elements"].append(transform_element(cycle, cmp.unity_matrix_to_o3de(frame_unity), frame_o3de, traced))
         if item["hasMesh"] and item["hasRenderer"]:
-            record["elements"].append(mesh_element(cycle, item, entity, frame_unity, frame_o3de))
+            record["elements"].append(mesh_element(cycle, item, entity, traced, frame_unity, frame_o3de))
             record["elements"].append(material_element(item, traced))
         if item["colliders"]:
             record["elements"] += collider_elements(cycle, item, entity, traced, frame_unity, container_inverse)
@@ -583,8 +605,8 @@ def scene_clusters(scene: dict) -> List[dict]:
 
 def difference(previous: dict, current: dict) -> dict:
     """What changed between two reports: clusters that closed or opened, and
-    the elements that passed before and fail now (regressions) or the
-    reverse (fixed)."""
+    the elements that passed before and do not now (regressions: failing,
+    uncooked or unmatched) or the reverse (fixed)."""
     def element_statuses(report: dict) -> Dict[str, str]:
         found = {}
         for prefab in report.get("prefabs", []):
@@ -605,9 +627,9 @@ def difference(previous: dict, current: dict) -> dict:
         "clusters_closed": sorted(signatures_before - signatures_after),
         "clusters_opened": sorted(signatures_after - signatures_before),
         "regressions":     sorted(key for key, status in after.items()
-                                  if status == "fail" and before.get(key) == "pass"),
+                                  if status in LOST and before.get(key) == "pass"),
         "fixed":           sorted(key for key, status in after.items()
-                                  if status == "pass" and before.get(key) == "fail"),
+                                  if status == "pass" and before.get(key) in LOST),
     }
 
 
@@ -622,7 +644,7 @@ def build_clusters(prefabs: List[dict]) -> List[dict]:
         for record in prefab.get("objects", []):
             for element in record["elements"]:
                 signature = element.get("signature")
-                if not signature or element["status"] not in ("fail", "unmatched"):
+                if not signature or element["status"] not in ("fail", "unmatched", "uncooked"):
                     continue
                 cluster = clusters.setdefault(signature, {
                     "signature": signature, "kind": element["kind"], "elements": 0,

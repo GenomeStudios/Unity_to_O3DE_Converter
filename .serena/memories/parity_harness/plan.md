@@ -13,7 +13,7 @@ Environment facts (paths, versions, counts): `mem:parity_harness/environment`. E
 One command that runs a full parity cycle on the Office pack and ends in a report the person can act on.
 - Unity is the truth. Every prefab of `Assets/OfficeAndPoliceStation` (222 prefabs, 232 FBX) is measured in Unity itself, converted, cooked, measured again in O3DE, and compared element by element: child objects, render meshes, colliders, material slots.
 - Each element gets a verdict at the agreed tolerance (D.4). Failures are grouped into clusters by what is wrong with them. Every failing element links to the converter's own account of how it produced the value (the trace) and to the raw facts of its FBX.
-- Front, top and left pictures of every prefab from both engines, side by side, with an overlay of the two measurements.
+- Front, top and left drawings of every prefab, made from the two measurements laid over each other. (Was: pictures rendered by both engines, side by side with an overlay. Changed by D.31.)
 - The placement of every instance in `Scenes/Showcase.unity` is compared the same way.
 
 For: the person and Claude, to drive converter fix cycles and prove each fix.
@@ -117,15 +117,19 @@ The truth dump and the O3DE record share one schema. Values are metres in each e
 - D.28 `converter_cli.py run --seed` also fixes the random mesh group ids of the assetinfo files (a seeded `uuid4` in the CLI process only). Without it every cycle changed every assetinfo and the Asset Processor cooked every mesh again.
 - D.29 Resolved Q.3, Q.4, Q.5, Q.6: the probe gem links `Gem::Atom_RPI.Public` and `Gem::AtomLyIntegration_CommonFeatures.Public` against the SDK; editor colliders are read in edit mode through `SimulatedBodyComponentRequestsBus` (geometry in the shape's own space, composed with its local pose and the body's transform); a level places an instance with the converter's own patch paths; a Unity object joins the trace by `identity[k].fileId` for an own object and by `identity[k].instanceFileId` (the PrefabInstance's fileID) for a nested one.
 - D.30 The sheets of views are drawn from the two records by one piece of code (`parity/views.py`). Rendered pictures from the two engines are not taken in this plan's run: see Q.7.
+- D.31 Rendered pictures from the two engines are dropped from this plan (the person, 2026-11-25). The sheets drawn from the measured geometry are the deliverable; rendered pictures become a follow-up only if wanted. Supersedes the third bullet of P as first written, increment I.5b and Q.7.
+- D.32 Q.2 is carried into the fix plans (the person, 2026-11-25): whether Unity is a required stage of conversion is answered while the auto-centre and rotation clusters are fixed, where the evidence is produced anyway. The baseline no longer has to answer it.
+- D.33 A model that the entity does not show is told apart three ways: the converter named none (fail), the model it named was not produced (uncooked, checked against the product cache), the model exists and is not shown (fail). An FBX whose own job failed is uncooked whatever the Editor still shows.
+- D.34 In the difference between two runs, a pass that becomes failing, uncooked or unmatched is a regression, and the reverse is fixed.
 
 ## Q - Open questions
 - Q.1 (resolved, D.21) How much of the stage run logic can leave `main_app.py` without a change in behaviour, and what is the shared module called - blocks I.2.
-- Q.2 Is Unity in the loop a required stage of conversion, or only the verifier? It is required if any of the 232 FBX cannot be explained from its file alone (H.2). Answered by the baseline; blocks the conclusion and the follow-up plan for a GUI surface.
+- Q.2 (carried into the fix plans, D.32) Is Unity in the loop a required stage of conversion, or only the verifier? It is required if any of the 232 FBX cannot be explained from its file alone (H.2). Answered by the baseline; blocks the conclusion and the follow-up plan for a GUI surface.
 - Q.3 (resolved, D.29) Can an external gem link `Gem::Atom_RPI.Public` and `AZ::AzToolsFramework` against the installed SDK, and which calls give model positions and the prefab alias of an entity - blocks I.3.
 - Q.4 (resolved, D.29) Are the shapes of `EditorColliderComponent`, `EditorShapeColliderComponent` and `EditorMeshColliderComponent` in the Editor's physics scene in edit mode, readable through `Physics::Shape::GetGeometry`, and in which frame? If not, colliders are read in game mode - blocks I.3.
 - Q.5 (resolved, D.29) The patch paths a level needs to place a nested instance (container transform alias, parent link) - blocks I.3; read from the scene converter's level writer.
 - Q.6 (resolved, D.29) Which Unity API values equal the converter's fileID chain for objects inside nested instances and prefab variants - blocks I.4. I.1 dumps the whole correspondence chain so that no second dump is needed.
-- Q.7 Orthographic capture: `Camera.Render` under URP in batch mode on the Unity side; a camera entity with the Orthographic option and clip planes in the Editor viewport on the O3DE side. Fallback: matched perspective cameras - blocks I.5.
+- Q.7 (dropped with the rendered pictures, D.31) Orthographic capture: `Camera.Render` under URP in batch mode on the Unity side; a camera entity with the Orthographic option and clip planes in the Editor viewport on the O3DE side. Fallback: matched perspective cameras - blocks I.5.
 - Q.8 (resolved, D.25) Convex colliders: PhysX hull cooking moves vertices, so which measure and tolerance are fair - blocks the collider verdicts of I.4.
 
 ## I - Stages
@@ -147,7 +151,7 @@ The truth dump and the O3DE record share one schema. Values are metres in each e
   - [x] I.2a Trace collector and hooks (`conversion_trace.py`), FBX facts reader. Ran: 0 emitted values uncovered on the full pack.
   - [x] I.2b `stage_runner.py`; GUI tabs call it. Ran: CLI output equals the GUI's own pre-lift output, 916 files, 0 differences.
   - [x] I.2c CLI `run` (`--stage`, `--only`, `--set`, `--trace`, `--project-out`, `--seed`, `--log`, `--quiet`) and `describe`. Ran: 21 unit tests pass.
-- [ ] I.3 O3DE bake, cook and probe (ran; T.12 not run as written) - Done when:
+- [ ] I.3 O3DE bake, cook and probe (ran) - Done when:
   - `python parity/parity.py setup <config>` registers the probe gem in the O3DE project and it builds.
   - `bake` writes `Levels/Bench_Parity_Office` with its recipe; `cook` runs the Asset Processor in batch and lists every failed job by source asset.
   - `probe` starts the Editor unattended on the baked level, writes the O3DE record in the schema of Design / Records plus a scrub of every property of every component, exits 0, and closes the Asset Processor it started.
@@ -163,12 +167,12 @@ The truth dump and the O3DE record share one schema. Values are metres in each e
   - [x] I.4a Math (`compare.py`): frames, distances, placement fit, residual search over the 48 axis permutations. 31 unit tests.
   - [x] I.4b Join, verdicts, clusters, import table, report (`report.py`). Ran on the whole pack in 35 s.
   - [x] I.4c Shift explained against the trace ("= minus the rule's auto_center translation").
-- [ ] I.5 Views (sheets from the records ran; rendered pictures from the engines not started; open for the person: T.16) - Done when:
+- [ ] I.5 Views (ran, as changed by D.31; open for the person: T.16) - Done when:
   - The truth dump and the probe each write front, top and left pictures per prefab from the shared camera spec.
   - `compare` builds one sheet per prefab: three views by three columns (Unity, O3DE, overlay of both records with colliders).
   - The report links every sheet.
   - [x] I.5a Sheets drawn from the records, one per prefab, linked from the report (D.30).
-  - [ ] I.5b Rendered pictures from Unity and from the Editor (Q.7 open; not started).
+  - I.5b Rendered pictures from Unity and from the Editor: dropped (D.31).
 - [ ] I.6 Cycle and baseline (ran; open for the person: T.19) - Done when:
   - `python parity/parity.py cycle <config> [--only <glob>]` runs truth (cached), convert, bake check, cook, probe and compare unattended, and prints the result with its difference from the previous run: clusters closed, clusters opened, regressions.
   - The converted `Showcase` level is probed and every instance placement is compared with the scene truth.
@@ -185,7 +189,7 @@ Whole pack, tolerance 1 mm / 0.1 degree / 1 mm. 13 prefabs pass, 203 fail, 5 unm
 | Element | pass | fail | other |
 |---|---|---|---|
 | transform | 355 | 32 | |
-| mesh | 28 | 339 | |
+| mesh | 28 | 338 | 1 uncooked |
 | collider | 613 | 69 | 1 unmeasured |
 | materials | 360 | 7 | |
 | object | | | 6 unmatched |
@@ -203,7 +207,7 @@ Verdicts on the suspects:
 - H.1 confirmed. 21 of the 32 failing transforms are an inverted rotation, 7 more are children of one. In `Showcase`, 4 of the 5 misplaced instances are inverted rotations (a 180 degree error on three floors and a door trim).
 - H.2 not as feared. 156 of 255 models match Unity's mesh without a mirror or a turn: Unity's X negation and the axis swap together are a plain rotation, which O3DE's importer already makes. A mirror is needed for 16.
 - H.3 and H.4 not exercised: no prefab root of the pack stores a scale or a rotation, and no object with a uniform scale other than 1 fails.
-- H.5 seen: three FBX get more than one assetinfo write; 7 prefabs have a renderer with no model in O3DE (Bookshelf_A, the three StairsMod, the three elevator prefabs).
+- H.5 confirmed on one case: three FBX get more than one assetinfo write, and Bookshelf_A names a model (`Bookshelf-Bookshelf_...`) that was not produced. Separately, 6 prefabs (10 renderers: the three StairsMod and the three elevator prefabs) have a renderer for which the converter emitted no model at all.
 - H.6 confirmed: the converted `Showcase` level fails its prefab job; the baked level did until it named prefabs as Stage 1 does.
 - H.7 fact: all 232 FBX use High mesh compression in Unity.
 - H.8 seen: 7 objects with a non-uniform scale come out at scale 1.
@@ -211,7 +215,7 @@ Verdicts on the suspects:
 - H.10 seen: the three elevator prefabs fail their prefab job.
 - Not converted: 5 door prefabs have no instance in the level and 6 objects are not in the trace (nested instances the converter did not record); `FPS Controller` has nothing measurable.
 
-Q.2 is not closed. For 61 per cent of the models no mirror and no turn is needed, so the file alone may be enough there; whether the remaining shifts and turns follow from the FBX facts has not been tested. The truth dump is what would show it: each model's residual is in `report.json` beside the file's node transforms in `fbx_facts.json`.
+Q.2 is not closed and is carried into the fix plans (D.32). For 61 per cent of the models no mirror and no turn is needed, so the file alone may be enough there; whether the remaining shifts and turns follow from the FBX facts has not been tested. The truth dump is what would show it: each model's residual is in `report.json` beside the file's node transforms in `fbx_facts.json`.
 
 ## T - Proofs
 | ID | Proof | Stage |

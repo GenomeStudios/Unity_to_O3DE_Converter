@@ -28,6 +28,7 @@ import numpy as np
 from tests.harness import run_module_tests
 import compare as cmp
 import level_bake
+import report
 from records import matrix_from_trs, transform_points
 
 TOLERANCE = 0.001   # one millimetre
@@ -274,6 +275,35 @@ def test_points_on_a_sphere_and_a_capsule_are_on_the_surface():
     cap = np.array([[0.0, 0.0, 1.25]])
     distances = cmp.capsule_surface_distances(np.concatenate([side, cap]), [0, 0, 0], [0, 0, 1], 0.25)
     assert distances.max() < 1e-12
+
+
+# =============================================================================
+# DIFFERENCE BETWEEN TWO REPORTS
+# =============================================================================
+
+def _report(statuses: dict, signatures=()) -> dict:
+    """A report with one prefab holding one object per given element."""
+    objects = [{"index": index, "path": path, "elements": [{"kind": "mesh", "status": status}]}
+               for index, (path, status) in enumerate(statuses.items())]
+    return {"prefabs": [{"name": "Desk", "objects": objects}],
+            "clusters": [{"signature": signature} for signature in signatures]}
+
+
+def test_difference_names_regressions_and_fixes():
+    before = _report({"Desk/Frame": "pass", "Desk/Drawer": "fail", "Desk/Door": "pass", "Desk/Lid": "uncooked"},
+                     ["mesh: shift"])
+    after = _report({"Desk/Frame": "fail", "Desk/Drawer": "pass", "Desk/Door": "uncooked", "Desk/Lid": "pass"},
+                    ["mesh: rot Z 180"])
+    change = report.difference(before, after)
+    assert change["regressions"] == ["Desk / Desk/Door #2 / mesh 1", "Desk / Desk/Frame #0 / mesh 1"]
+    assert change["fixed"] == ["Desk / Desk/Drawer #1 / mesh 1", "Desk / Desk/Lid #3 / mesh 1"]
+    assert change["clusters_closed"] == ["mesh: shift"]
+    assert change["clusters_opened"] == ["mesh: rot Z 180"]
+
+
+def test_difference_of_equal_reports_is_empty():
+    same = _report({"Desk/Frame": "pass", "Desk/Drawer": "fail"}, ["mesh: shift"])
+    assert not any(report.difference(same, same).values())
 
 
 # =============================================================================

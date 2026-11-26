@@ -14,6 +14,27 @@ Report words: verified (the person ran it and confirmed), ran (executed with log
 
 Log, newest first.
 
+## 2026-11-25 - Conclusion asked for; not concluded
+
+### State
+- `/pit-conclude` was run. The gate did not pass: no stage is ticked, because the person's own checks (T.3, T.8, T.15, T.16, T.19) are not done yet (their answer). No record was written, nothing was wiped.
+- The person committed the work as `f572a9c`. Uncommitted since: `parity/report.py`, `tests/unit/test_parity_compare.py`, these memories.
+
+### Decisions taken from the person
+- Rendered pictures from the two engines are dropped from this plan (D.31).
+- Q.2 is carried into the fix plans (D.32).
+
+### Verification
+- T.12 ran, failed, was fixed and ran again. `Carpet_round.FBX.assetinfo` was overwritten with text that is not JSON; cook, probe, compare. First run: the Asset Processor reported no failed job for it and the report said "fail: the entity shows no model". After F.9: the prefab is `uncooked`, "the model the prefab names was not produced: assets/officepack/meshes/Carpet_round-Carpet_round.fbx.azmodel". Convert, cook, probe, compare then gave the baseline back.
+- Unit tests: 33 in `test_parity_compare.py` (two new, on the difference).
+
+### Fixes
+- F.9 A broken assetinfo was reported as a failing mesh, not as uncooked. Cause: the Asset Processor does not fail the job of an FBX whose assetinfo it cannot read; it falls back to default mesh groups, so the model the prefab names is simply absent. Fix: a model the entity does not show is checked against the product cache (D.33).
+- F.10 A pass that became uncooked did not show in the difference. Fix: D.34.
+
+### Behavioural notes
+- The refined verdict moved the baseline's 11 "no mesh component" elements into "the converter emitted no model" (10, in 6 prefabs) and "the model the prefab names was not produced" (1, Bookshelf_A). The copy in `baseline_2026-11-25/` was refreshed with these labels; the measurements are the same.
+
 ## 2026-11-25 - I.5 sheets, I.6 cycle and baseline (ran)
 
 ### What landed
