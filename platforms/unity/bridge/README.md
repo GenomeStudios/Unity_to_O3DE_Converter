@@ -31,6 +31,11 @@ The Editor is found in Unity Hub's install folders. To use another one, pass `--
   to one clone, so the folder never shows in `git status`.
 - Nothing else. The script saves no asset and no scene.
 
+Unity itself may. Opening a project, it upgrades what an older version or an earlier render pipeline saved and
+writes the files back (two materials of one pack, on a first run). The run compares the scope before and after
+and names every file Unity changed, in its output and as the result's `changed_files`; they are left as Unity
+wrote them. The dump is then filed under what the project looks like afterwards, so the next request finds it.
+
 Nothing of Unity's ships with the converter. The script is the converter's own source and uses the public Editor
 API. A dump holds data derived from the project's assets: keep it out of version control.
 

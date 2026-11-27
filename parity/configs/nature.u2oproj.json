@@ -1,0 +1,27 @@
+{
+    "schema_version": 2,
+    "name": "Parity - NatureManufacture",
+    "source_engine": "unity",
+    "active_platform": "unity",
+    "notes": "Third test bed of the parity harness. Source: the NatureManufacture assets of the AGURP2024 Unity project (Unity 6, URP 17): several packs under one distributor's folder, vegetation with LOD groups and the distributor's own shaders. Target: the ConverterTest O3DE project, beside the Office and Tirgames packs, in the source's own folder structure. Runs work on a copy of this file, so it stays as written.",
+    "scope_root": "D:/OffLocalDev/AGURP2024/Assets/NatureManufacture Assets",
+    "o3de_project_root": "D:/OffLocalDev/xxxxxDelete/ConverterTest",
+    "stages_by_platform": {
+        "unity": {
+            "asset_processor": {
+                "selected_prefabs": [],
+                "output_path": "D:/OffLocalDev/xxxxxDelete/ConverterTest/Assets/NatureManufacture",
+                "mirror_source_folders": true
+            },
+            "scene_converter": {
+                "selected_scenes": [
+                    "Advanced Rock Pack/Demo and Maps/Overview Map.unity",
+                    "Advanced Rock Pack/Demo and Maps/Small Demo Map.unity",
+                    "Forest Environment Dynamic Nature/Demo Scenes/Overview Scene.unity",
+                    "Meadow Environment Dynamic Nature/Demo Scenes/Overview Scene.unity"
+                ],
+                "output_path": "D:/OffLocalDev/xxxxxDelete/ConverterTest/Levels/NatureManufacture"
+            }
+        }
+    }
+}

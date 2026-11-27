@@ -119,6 +119,9 @@ class TruthResult:
     done:        Dict = field(default_factory=dict)
     problems:    List[str] = field(default_factory=list)
     seconds:     float = 0.0
+    # Files of the scope that Unity itself wrote while it was open for the
+    # dump, by their path below the project (see ``run_truth_dump``).
+    changed_files: List[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -319,10 +322,25 @@ def _exclude_from_git(project_root: Path) -> None:
 # What a dump depends on. Two requests with one fingerprint give one dump.
 # =============================================================================
 
-def fingerprint(request: TruthRequest, editor_version: str) -> str:
+def scope_state(request: TruthRequest) -> Dict[str, tuple]:
+    """``{file: (size, modification time)}`` of every file a dump is made
+    from: every file of the scope, and every scene outside it."""
+    scope_root = Path(request.scope_root)
+    files = [path for path in scope_root.rglob("*") if path.is_file()]
+    files += [Path(scene) for scene in request.scenes
+              if Path(scene).is_file() and scope_root not in Path(scene).parents]
+    state = {}
+    for path in files:
+        stat = path.stat()
+        state[path.as_posix()] = (stat.st_size, stat.st_mtime_ns)
+    return state
+
+
+def fingerprint(request: TruthRequest, editor_version: str, state: Optional[Dict[str, tuple]] = None) -> str:
     """Hash of everything the dump is made from: every file of the scope and
-    every scene (by path, size and modification time), the bridge script,
-    the Editor version, and the request's ``only`` and ``mode``."""
+    every scene (by path, size and modification time; ``scope_state``, read
+    now unless given), the bridge script, the Editor version, and the
+    request's ``only`` and ``mode``."""
     digest = hashlib.sha256()
     digest.update(f"bridge {BRIDGE_VERSION}|unity {editor_version}|"
                   f"only {request.only}|mode {request.mode}\n".encode("utf-8"))
@@ -330,13 +348,10 @@ def fingerprint(request: TruthRequest, editor_version: str) -> str:
     for name in SCRIPT_FILES:
         digest.update((SCRIPT_DIR / name).read_bytes())
 
-    scope_root = Path(request.scope_root)
-    files = [path for path in scope_root.rglob("*") if path.is_file()]
-    files += [Path(scene) for scene in request.scenes
-              if Path(scene).is_file() and scope_root not in Path(scene).parents]
-    for path in sorted(files):
-        stat = path.stat()
-        digest.update(f"{path.as_posix()}|{stat.st_size}|{stat.st_mtime_ns}\n".encode("utf-8"))
+    state = scope_state(request) if state is None else state
+    for path in sorted(Path(file) for file in state):           # in the order paths sort, as ever
+        size, modified = state[path.as_posix()]
+        digest.update(f"{path.as_posix()}|{size}|{modified}\n".encode("utf-8"))
     return digest.hexdigest()
 
 
@@ -363,7 +378,8 @@ def run_truth_dump(request: TruthRequest,
     unity_exe    = find_unity_editor(version, request.unity_exe)
 
     # ----- Cache -------------------------------------------------------------
-    print_hash = fingerprint(request, version)
+    before     = scope_state(request)
+    print_hash = fingerprint(request, version, before)
     dump_dir   = Path(request.out_base) / print_hash[:16]
     if not request.fresh:
         cached = _read_done(dump_dir)
@@ -398,6 +414,28 @@ def run_truth_dump(request: TruthRequest,
     log(f"[truth] log: {log_file}")
     exit_code = (launcher or _launch_unity)(argv, project_root, request.timeout_s)
 
+    # ----- What Unity changed ------------------------------------------------
+    # The dump only reads. Unity does not: opening a project, it upgrades
+    # what an older version saved (a material of an earlier render pipeline
+    # version) and writes it back. Such files are named, never hidden; and
+    # the dump is filed under what the project looks like now, so the next
+    # request finds it instead of starting Unity again.
+    after = scope_state(request)
+    changed = sorted(to_asset_path(project_root, Path(path)) for path in set(before) | set(after)
+                     if before.get(path) != after.get(path))
+    if changed:
+        log(f"[truth] Unity changed {len(changed)} file(s) of the project while it was open "
+            f"(the dump itself only reads):")
+        for path in changed:
+            log(f"[truth]   {path}")
+        log("[truth] They are left as Unity wrote them; put them back from version control "
+            "if that is not wanted.")
+        print_hash = fingerprint(request, version, after)
+        filed = Path(request.out_base) / print_hash[:16]
+        if filed != dump_dir and not filed.exists():
+            dump_dir.rename(filed)
+            dump_dir = filed
+
     # ----- Result ------------------------------------------------------------
     done = _read_done(dump_dir)
     seconds = time.time() - started
@@ -406,7 +444,7 @@ def run_truth_dump(request: TruthRequest,
             "dump": dump_dir.as_posix(), "fingerprint": print_hash,
         }, indent=2), encoding="utf-8")
         return TruthResult(status="ok", dump_dir=dump_dir, fingerprint=print_hash,
-                           done=done, seconds=seconds)
+                           done=done, seconds=seconds, changed_files=changed)
 
     problems = [f"Unity left with exit code {exit_code}."]
     problems += [f"Unity: {error}" for error in done.get("errors", [])]
@@ -414,7 +452,7 @@ def run_truth_dump(request: TruthRequest,
         problems.append("Unity wrote no done.json: the bridge script did not run to its end.")
     problems += [f"log: {line}" for line in read_log_trouble(log_file)]
     return TruthResult(status="failed", dump_dir=dump_dir, fingerprint=print_hash,
-                       done=done, problems=problems, seconds=seconds)
+                       done=done, problems=problems, seconds=seconds, changed_files=changed)
 
 
 def _launch_unity(argv: List[str], project_root: Path, timeout_s: float) -> int:

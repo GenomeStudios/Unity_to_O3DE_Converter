@@ -609,15 +609,25 @@ def physx_group_name(fbx_stem: str, node_path: str,
 # `targets.o3de.assetinfo_writer`. Re-exported here so existing call
 # sites in this module + any tests reaching for them work unchanged.
 from fbx_reader import mesh_node_names, read_import_facts  # noqa: E402
+from fbx_material_names import give_materials_unique_names  # noqa: E402
+from platforms.unity.shader_source import read_shader_facts  # noqa: E402
+from platforms.unity.mesh_asset import (  # noqa: E402
+    material_label as mesh_asset_material_label,
+    obj_node_path,
+    read_mesh_asset,
+    write_obj,
+)
 from platforms.unity.builtin_meshes import (  # noqa: E402
     BUILTIN_MATERIAL_LABEL,
     BUILTIN_MESH_GUID,
     BUILTIN_MESH_NAMES,
+    FLAT_MESHES,
     builtin_mesh_node_path,
     write_builtin_mesh,
 )
 from platforms.unity.model_import import (  # noqa: E402
     assign_materials,
+    import_scale as model_import_scale,
     model_objects,
     node_for_mesh,
     read_model_meta,
@@ -627,6 +637,7 @@ from targets.o3de.assetinfo_writer import (  # noqa: E402
     _euler_deg_to_quat,
     _quat_mul,
     _resolve_mesh_settings,
+    source_mesh_stretch,
     write_fbx_assetinfo,
 )
 
@@ -718,6 +729,54 @@ def _derive_asset_hint_root(output_root: Path) -> str:
 
 
 
+# =============================================================================
+# TEXTURE FILES THE ENGINE CANNOT READ
+# =============================================================================
+
+# TGA image types that hold grey values: plain and run-length encoded.
+GREYSCALE_TGA_TYPES = (3, 11)
+
+
+def is_greyscale_tga(texture_path: Path) -> bool:
+    """Whether a file is a TGA of grey values, by its header's image type."""
+    if Path(texture_path).suffix.lower() != ".tga":
+        return False
+    try:
+        with open(texture_path, "rb") as file:
+            header = file.read(3)
+    except OSError:
+        return False
+    return len(header) == 3 and header[2] in GREYSCALE_TGA_TYPES
+
+
+# =============================================================================
+# OUTPUT LAYOUT
+# =============================================================================
+
+# The asset stage's option that keeps the source's folders in the output.
+MIRROR_OPTION = "mirror_source_folders"
+# Where a mirrored output keeps what lies outside the source root.
+OUTSIDE_SOURCE_FOLDER = "_OutsideSource"
+
+
+def mirrored_folder(source_root: Path, source_file: Path) -> Path:
+    """The folder, relative to the output root, that keeps a source file's
+    place: its folder below the source root. A file outside the source root
+    (a prefab may use a texture of another pack) goes under
+    ``_OutsideSource``, by its folder below the Unity project's ``Assets``
+    when it has one, so two such files of one name stay apart too."""
+    folder = Path(source_file).parent
+    try:
+        return folder.relative_to(source_root)
+    except ValueError:
+        pass
+    parts = folder.parts
+    for index in range(len(parts) - 1, -1, -1):
+        if parts[index].lower() == "assets":
+            return Path(OUTSIDE_SOURCE_FOLDER, *parts[index + 1:])
+    return Path(OUTSIDE_SOURCE_FOLDER, folder.name)
+
+
 class IntegratedAssetProcessor:
     """Processes Unity prefabs with materials to O3DE format"""
     
@@ -731,11 +790,18 @@ class IntegratedAssetProcessor:
                  scope_root:        Optional[Path] = None,
                  state_index:       Optional[Dict] = None,
                  strip_lods:        bool = True,
+                 options:           Optional[Dict] = None,
                  platform=None,
                  trace=None):
         self.unity_assets_root = unity_assets_root
         self.output_root = output_root
         self.log = log_callback or print
+
+        # The asset stage's options the emitters read
+        # (`stage_runner.asset_stage_options`): where a spot light sits,
+        # whether the output keeps the source's folders. Empty means every
+        # option at its default.
+        self.options: Dict[str, Any] = dict(options or {})
 
         # Optional `conversion_trace.ConversionTrace`. When set, the emitters
         # record how every value they write was produced. None changes
@@ -798,17 +864,22 @@ class IntegratedAssetProcessor:
         if hasattr(self.platform, "bind_asset_db"):
             self.platform.bind_asset_db(self.asset_db)
         
-        # Output structure
+        # Output structure. The flat layout has one folder per kind of
+        # asset. With the option `mirror_source_folders` every asset keeps
+        # its source's folder instead (see `output_folder`), and these four
+        # hold only what has no source file (a built-in mesh).
+        self.mirror_source_folders = bool(self.options.get(MIRROR_OPTION, False))
         self.prefabs_dir = output_root / "Prefabs"
         self.materials_dir = output_root / "Materials"
         self.textures_dir = output_root / "Textures"
         self.meshes_dir = output_root / "Meshes"
+        self._hint_folders: Dict[str, str] = {}     # see `hint_folder`
 
-        # Create directories
-        self.prefabs_dir.mkdir(parents=True, exist_ok=True)
-        self.materials_dir.mkdir(parents=True, exist_ok=True)
-        self.textures_dir.mkdir(parents=True, exist_ok=True)
-        self.meshes_dir.mkdir(parents=True, exist_ok=True)
+        if not self.mirror_source_folders:
+            self.prefabs_dir.mkdir(parents=True, exist_ok=True)
+            self.materials_dir.mkdir(parents=True, exist_ok=True)
+            self.textures_dir.mkdir(parents=True, exist_ok=True)
+            self.meshes_dir.mkdir(parents=True, exist_ok=True)
 
         # The converter's bookkeeping (entity maps, asset index, coverage)
         # used to live in `<output_root>/.ImporterData/`. That directory is
@@ -830,6 +901,10 @@ class IntegratedAssetProcessor:
         # Standard, etc.) don't resolve to a file in the project; we
         # fall back to a small lookup table for those.
         self._shader_name_cache: Dict[str, str] = {}
+        # What each shader's own file says about its materials, by the
+        # shader's guid; None for a shader that is no file of the project
+        # (`platforms.unity.shader_source`).
+        self._shader_facts_cache: Dict[str, Any] = {}
         
         # Track processed assets
         self.processed_materials: Dict[str, str] = {}  # guid -> output_path
@@ -846,9 +921,12 @@ class IntegratedAssetProcessor:
         self._model_meta_cache:    Dict[str, Any] = {}
         self._model_objects_cache: Dict[str, Optional[list]] = {}
         self._material_guid_by_name: Optional[Dict[str, str]] = None
-        # {Unity's file id of a built-in mesh: the model hint written for it,
-        # or None when the converter does not write that mesh}.
-        self._builtin_mesh_hints: Dict[str, Optional[str]] = {}
+        # {Unity's file id of a built-in mesh: the model written for it
+        # (`_builtin_mesh_model`), or None for an id that names no such mesh}.
+        self._builtin_mesh_models: Dict[str, Optional[dict]] = {}
+        # {guid of a Unity mesh asset: {"hint", "labels"} of the model written
+        # for it, or None when the converter cannot read that asset}.
+        self._mesh_asset_models: Dict[str, Optional[dict]] = {}
         # The groups this run knows for each FBX's .assetinfo, by guid:
         # {"nodes": {node name: node path}, "physx": {group name: spec}}.
         # See `_mesh_groups_for`.
@@ -920,6 +998,50 @@ class IntegratedAssetProcessor:
                 self.log("  [Config] Smoothness→Roughness texture conversion REQUESTED "
                          "but Pillow is not installed. Install with: pip install Pillow")
     
+    # =========================================================================
+    # OUTPUT LAYOUT
+    # Where a converted asset is written, and the hint that names it. Every
+    # emitter asks here, so the two layouts differ in this section only.
+    # =========================================================================
+
+    def output_folder(self, flat_folder: Path, source_file: Optional[Path]) -> Path:
+        """The folder a converted asset is written into, made if need be.
+
+        Flat layout: ``flat_folder``, one of the four by kind
+        (``Prefabs``, ``Materials``, ``Textures``, ``Meshes``). Two source
+        files of one name then land on one output file.
+
+        Mirrored layout (the option ``mirror_source_folders``): the source
+        file's own folder below the source root, under the output root
+        (``mirrored_folder``). A pack's structure, and the packs under one
+        distributor's folder, stay as they are. An asset with no source
+        file keeps the flat folder."""
+        if self.mirror_source_folders and source_file is not None:
+            folder = self.output_root / mirrored_folder(self.unity_assets_root, Path(source_file))
+        else:
+            folder = flat_folder
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    def prefab_output_path(self, prefab_path: Path) -> Path:
+        """Where the converted prefab of a Unity prefab is written."""
+        return self.output_folder(self.prefabs_dir, prefab_path) / f"{Path(prefab_path).stem}.prefab"
+
+    def hint_folder(self, output_file: Path) -> str:
+        """The folder part of the hint of an asset made from ``output_file``:
+        its folder from the O3DE project root, lowercased
+        (``_derive_asset_hint_root``). Kept by folder: finding the project
+        root walks the disk."""
+        folder = Path(output_file).parent
+        if str(folder) not in self._hint_folders:
+            self._hint_folders[str(folder)] = _derive_asset_hint_root(folder)
+        return self._hint_folders[str(folder)]
+
+    def output_relative(self, output_file: Path) -> str:
+        """An output file's path from the output root, with forward slashes:
+        how the worker's bookkeeping names a file."""
+        return Path(output_file).relative_to(self.output_root).as_posix()
+
     def convert_assets_of(self, game_objects: Dict, owner_name: str) -> Dict[str, Any]:
         """Convert everything a set of parsed objects shows - the objects of
         one prefab, or a scene's own objects - and say where each object
@@ -962,7 +1084,7 @@ class IntegratedAssetProcessor:
         # --- Copy FBX files to output ---
         fbx_output_paths = {}   # {mesh_guid: Path}
         for mesh_guid in all_mesh_guids:
-            if mesh_guid and mesh_guid != BUILTIN_MESH_GUID:
+            if mesh_guid and mesh_guid != BUILTIN_MESH_GUID and not self._is_mesh_asset(mesh_guid):
                 out_path = self._process_mesh(mesh_guid)
                 if out_path:
                     fbx_output_paths[mesh_guid] = out_path
@@ -995,6 +1117,17 @@ class IntegratedAssetProcessor:
                     mesh_mapping[go.file_id] = hint
                     if go.material_guids:
                         fbx_material_labels[go.file_id] = [BUILTIN_MATERIAL_LABEL]
+
+        # --- Unity mesh assets (a mesh stored on its own, not in a model file) ---
+        # Nothing the Asset Processor can read: the converter writes the
+        # mesh out as a model. Its material slots are its sub-meshes.
+        for go in game_objects.values():
+            if go.mesh_guid and self._is_mesh_asset(go.mesh_guid):
+                shown = self._mesh_asset_model(go.mesh_guid, owner_name, go.name)
+                if shown:
+                    mesh_mapping[go.file_id] = shown["hint"]
+                    if go.material_guids:
+                        fbx_material_labels[go.file_id] = shown["labels"][:len(go.material_guids)]
 
         # --- Collect MeshCollider collision-mesh references ---
         # A collider's geometry is the sub-mesh m_Mesh = {guid, fileID}
@@ -1036,6 +1169,14 @@ class IntegratedAssetProcessor:
         # component to point at the exact per-sub-mesh physics asset.
         collider_pxmesh_mapping = {}
 
+        # A collider on one of Unity's built-in meshes collides with the
+        # mesh the converter writes for it.
+        for cg, cf, cx, rg, rname, rfid in collider_refs:
+            if cg == BUILTIN_MESH_GUID:
+                hint = self._builtin_collision_hint(cf or rfid, cx, owner_name, rname)
+                if hint:
+                    collider_pxmesh_mapping[(cg, cf)] = hint
+
         # Every FBX needing an assetinfo: render meshes ∪ collision meshes.
         assetinfo_guids = set(entities_by_guid) | set(collider_refs_by_guid)
 
@@ -1072,6 +1213,11 @@ class IntegratedAssetProcessor:
                              f"names no node of {fbx_path.name}")
                     continue
                 node_of_entity[go.file_id] = node
+                # A mesh stretched by axis: its entity carries the stretch
+                # (targets.o3de.assetinfo_writer.source_mesh_stretch).
+                stretch = source_mesh_stretch(facts, node)
+                if stretch:
+                    go.component_data["mesh_stretch"] = stretch
 
             # The file's groups are named by node and kept across prefabs.
             groups = self._mesh_groups_for(mesh_guid, facts)
@@ -1093,7 +1239,7 @@ class IntegratedAssetProcessor:
                     continue
                 gname = physx_group_name(fbx_stem, path_of(node), mesh_nodes)
                 collider_pxmesh_mapping[(mesh_guid, cf)] = (
-                    f"{self.asset_hint_root}/meshes/{gname}.fbx.pxmesh")
+                    f"{self.hint_folder(fbx_path)}/{gname}.fbx.pxmesh")
                 # The collision mesh needs no alignment of its own: the
                 # assetinfo writer gives its node the same file-derived
                 # rule a render mesh gets.
@@ -1129,7 +1275,7 @@ class IntegratedAssetProcessor:
                 mesh_settings=self._mesh_settings,
                 mesh_guid=mesh_guid,
                 correction_quat=correction_quat,
-                import_scale=meta.global_scale,
+                import_scale=model_import_scale(meta, facts),
                 trace=self.trace,
             )
             # F-9.I.4 — record mesh fingerprint AFTER the assetinfo
@@ -1152,7 +1298,7 @@ class IntegratedAssetProcessor:
                 if node is None:
                     continue
                 mesh_mapping[go.file_id] = (
-                    f"{self.asset_hint_root}/meshes/{fbx_stem}-{node}.fbx.azmodel"
+                    f"{self.hint_folder(fbx_path)}/{fbx_stem}-{node}.fbx.azmodel"
                 )
                 # Per-entity material label list: the FBX-internal names
                 # of the materials the node's mesh uses, in the order of
@@ -1211,7 +1357,7 @@ class IntegratedAssetProcessor:
                 self.trace.begin_prefab(
                     self.asset_db.path_to_guid(prefab_path) or str(prefab_path),
                     prefab_path,
-                    self.prefabs_dir / f"{prefab_path.stem}.prefab",
+                    self.prefab_output_path(prefab_path),
                 )
 
             # Everything the prefab's objects show: materials, models,
@@ -1225,8 +1371,7 @@ class IntegratedAssetProcessor:
             all_mesh_guids          = assets["mesh_guids"]
 
             # Create O3DE prefab
-            output_name = prefab_path.stem
-            output_path = self.prefabs_dir / f"{output_name}.prefab"
+            output_path = self.prefab_output_path(prefab_path)
             
             # F-Collision — resolve per-entity collision layer/group from the
             # collision_processor stage (defaults + per-object overrides),
@@ -1246,6 +1391,7 @@ class IntegratedAssetProcessor:
                 output_path,
                 collider_pxmesh_mapping,
                 collision_config_mapping,
+                source_path=prefab_path,
             )
 
             # F-9.I.4 — record the prefab's fingerprint after every
@@ -1510,7 +1656,7 @@ class IntegratedAssetProcessor:
                     mesh_settings=self._mesh_settings,
                     mesh_guid=guid,
                     correction_quat=platform_correction,
-                    import_scale=self._model_meta(guid).global_scale,
+                    import_scale=model_import_scale(self._model_meta(guid), self._model_facts(guid, fbx_path)),
                 )
             except Exception as exc:
                 self.log(
@@ -1688,29 +1834,110 @@ class IntegratedAssetProcessor:
             self._model_objects_cache[guid] = objects or None
         return self._model_objects_cache[guid]
 
-    def _builtin_mesh_hint(self, mesh_file_id: str, prefab_name: str, object_name: str) -> Optional[str]:
-        """The model hint for one of Unity's built-in meshes, writing the
-        mesh and its ``.assetinfo`` into the output the first time it is
-        asked for. None, with a coverage warning, for a built-in mesh the
-        converter does not write."""
+    def model_hint_for(self, mesh_guid: str, mesh_file_id: str, owner_name: str) -> Optional[str]:
+        """The hint of the model for one mesh reference (a model file's guid
+        and Unity's id of one of its meshes), converting the file and adding
+        the model to its ``.assetinfo`` if this run has not yet. For a
+        placement that gives an object of its prefab another mesh. None for
+        a mesh no model can be made of."""
+        stand_in = GameObject(file_id=f"mesh:{mesh_guid}:{mesh_file_id}", name=owner_name, transform=Transform(),
+                              mesh_guid=mesh_guid, mesh_file_id=str(mesh_file_id))
+        return self.convert_assets_of({stand_in.file_id: stand_in}, owner_name)["meshes"].get(stand_in.file_id)
+
+    def material_hint_for(self, material_guid: str) -> Optional[str]:
+        """The hint of the converted material with this Unity guid,
+        converting it (and its textures) now if this run has not yet. None
+        for a guid that is no material of the project."""
+        return self.asset_index["materials"].get(material_guid) or self._process_material(material_guid)
+
+    def _is_mesh_asset(self, mesh_guid: str) -> bool:
+        """Whether a mesh reference names a Unity ``.asset`` file, not a
+        model file."""
+        source = self.asset_db.resolve_guid(mesh_guid)
+        return source is not None and source.suffix.lower() == ".asset"
+
+    def _mesh_asset_model(self, mesh_guid: str, owner_name: str, object_name: str) -> Optional[dict]:
+        """The model written for a Unity mesh asset, as ``{"hint": the model
+        hint, "labels": one material slot label per sub-mesh}``, written
+        with its ``.assetinfo`` beside where the asset's own folder goes the
+        first time it is asked for (``platforms.unity.mesh_asset``). None,
+        with a coverage warning, for an asset the converter cannot read."""
+        source = self.asset_db.resolve_guid(mesh_guid)
+        if mesh_guid not in self._mesh_asset_models:
+            mesh = read_mesh_asset(source)
+            shown = None
+            if mesh is not None:
+                obj = write_obj(mesh, self.output_folder(self.meshes_dir, source) / f"{source.stem}.obj")
+                write_fbx_assetinfo(obj, obj.stem, {obj.stem: obj_node_path(obj)}, self.log,
+                                    mesh_guid=mesh_guid, trace=self.trace)
+                shown = {"hint":   f"{self.hint_folder(obj)}/{obj.stem}-{obj.stem}{obj.suffix}.azmodel",
+                         "labels": [mesh_asset_material_label(index) for index in range(len(mesh.sub_meshes))]}
+                self.processed_meshes[mesh_guid] = obj
+                self.asset_index["meshes"][mesh_guid] = obj.stem
+                self.log(f"    [Mesh] Unity mesh asset {source.name} written as {obj.name} "
+                         f"({len(mesh.positions)} vertices, {len(mesh.sub_meshes)} sub-mesh(es))")
+            self._mesh_asset_models[mesh_guid] = shown
+        shown = self._mesh_asset_models[mesh_guid]
+        if shown is None:
+            self.coverage.record_missing_mesh(mesh_guid)
+            self.coverage.warn(
+                f"{owner_name}: '{object_name}' shows the Unity mesh asset {source.name}, which the "
+                f"converter cannot read (binary, compressed, or no triangle mesh); no model emitted.")
+        return shown
+
+    def _builtin_mesh_model(self, mesh_file_id: str, prefab_name: str, object_name: str) -> Optional[dict]:
+        """The model written for one of Unity's built-in meshes, as
+        ``{"path": the file, "node": the name of its mesh, "hint": the model
+        hint, "physx": its collision mesh group or None}``. The mesh and its
+        ``.assetinfo`` are written into the output the first time it is
+        asked for (``platforms.unity.builtin_meshes``). None, with a
+        coverage warning, for an id that names no built-in mesh."""
         mesh_file_id = str(mesh_file_id or "")
-        if mesh_file_id not in self._builtin_mesh_hints:
-            path = write_builtin_mesh(mesh_file_id, self.meshes_dir)
-            hint = None
+        if mesh_file_id not in self._builtin_mesh_models:
+            path = write_builtin_mesh(mesh_file_id, self.output_folder(self.meshes_dir, None))
+            model = None
             if path is not None:
                 node = BUILTIN_MESH_NAMES[mesh_file_id]
-                write_fbx_assetinfo(path, path.stem, {node: builtin_mesh_node_path(path)}, self.log,
-                                    trace=self.trace)
-                hint = f"{self.asset_hint_root}/meshes/{path.stem}-{node}{path.suffix}.azmodel"
+                model = {"path": path, "node": node, "physx": None,
+                         "hint": f"{self.hint_folder(path)}/{path.stem}-{node}{path.suffix}.azmodel"}
+                self._write_builtin_assetinfo(model)
                 self.log(f"    [Mesh] Unity's built-in {node} written as {path.name}")
-            self._builtin_mesh_hints[mesh_file_id] = hint
-        hint = self._builtin_mesh_hints[mesh_file_id]
-        if hint is None:
-            name = BUILTIN_MESH_NAMES.get(mesh_file_id, f"mesh {mesh_file_id}")
+            self._builtin_mesh_models[mesh_file_id] = model
+        model = self._builtin_mesh_models[mesh_file_id]
+        if model is None:
             self.coverage.warn(
-                f"{prefab_name}: '{object_name}' shows Unity's built-in {name}, which the "
-                f"converter does not write yet; no model emitted.")
-        return hint
+                f"{prefab_name}: '{object_name}' shows Unity's built-in mesh {mesh_file_id}, which "
+                f"the converter does not know; no model emitted.")
+        return model
+
+    def _builtin_mesh_hint(self, mesh_file_id: str, prefab_name: str, object_name: str) -> Optional[str]:
+        """The model hint for one of Unity's built-in meshes; None, with a
+        coverage warning, for an id that names none."""
+        model = self._builtin_mesh_model(mesh_file_id, prefab_name, object_name)
+        return model["hint"] if model else None
+
+    def _builtin_collision_hint(self, mesh_file_id: str, convex: bool, prefab_name: str,
+                                object_name: str) -> Optional[str]:
+        """The hint of the collision mesh of one of Unity's built-in meshes,
+        adding it to the model's ``.assetinfo`` the first time it is asked
+        for. The first collider to ask decides whether it is a convex hull;
+        a mesh without thickness is never one."""
+        model = self._builtin_mesh_model(mesh_file_id, prefab_name, object_name)
+        if model is None:
+            return None
+        path = model["path"]
+        if model["physx"] is None:
+            model["physx"] = {"name": path.stem, "node_paths": [builtin_mesh_node_path(path)],
+                              "convex": bool(convex) and model["node"] not in FLAT_MESHES}
+            self._write_builtin_assetinfo(model)
+        return f"{self.hint_folder(path)}/{path.stem}{path.suffix}.pxmesh"
+
+    def _write_builtin_assetinfo(self, model: dict) -> None:
+        """Write the ``.assetinfo`` of a built-in mesh's model: its one mesh,
+        and its collision mesh once a collider has asked for it."""
+        path = model["path"]
+        write_fbx_assetinfo(path, path.stem, {model["node"]: builtin_mesh_node_path(path)}, self.log,
+                            physx_specs=[model["physx"]] if model["physx"] else None, trace=self.trace)
 
     def _material_guid_named(self, name: str) -> Optional[str]:
         """The guid of the project's material with this name: what Unity's
@@ -1798,6 +2025,15 @@ class IntegratedAssetProcessor:
             self.asset_db, shader_guid, shader_fileid,
             cache=self._shader_name_cache,
         )
+
+    def _shader_facts(self, shader_guid: str):
+        """What a material's shader file says (``ShaderFacts``), read once
+        per shader; None for a shader that is no ShaderLab file of the
+        project - one of Unity's own, or a Shader Graph kept as a graph."""
+        if shader_guid not in self._shader_facts_cache:
+            shader_file = self.asset_db.resolve_guid(shader_guid) if shader_guid else None
+            self._shader_facts_cache[shader_guid] = read_shader_facts(shader_file) if shader_file else None
+        return self._shader_facts_cache[shader_guid]
 
     def _resolve_profile_for_material(self, material_guid: str,
                                        shader_name: str) -> Optional[Dict]:
@@ -2048,8 +2284,13 @@ class IntegratedAssetProcessor:
         shader_name = self._resolve_shader_name(shader_guid, shader_fid)
         profile_name, profile = self._resolve_profile_name_for_material(
             material_guid, shader_name)
-        if profile is not None:
-            material_data = self.asset_db.parse_material(material_path, profile=profile)
+        # 5. A shader whose own file is in the project says which of the
+        #    material's stored properties it reads, which faces it draws
+        #    and whether it cuts by alpha: the material is read by that.
+        shader_facts = self._shader_facts(shader_guid)
+        if profile is not None or shader_facts is not None:
+            material_data = self.asset_db.parse_material(
+                material_path, profile=profile, shader_facts=shader_facts)
             if not material_data:
                 self.log(f"      ⚠ Failed to re-parse material with profile")
                 return None
@@ -2074,14 +2315,29 @@ class IntegratedAssetProcessor:
         # Process textures
         texture_paths = {}
         mg_source_guids = material_data.get('metallic_gloss_source_guids', set())
+        packed = material_data.get('texture_channels', {})
         for o3de_prop, texture_guid in material_data.get('textures', {}).items():
+            if o3de_prop in packed and PIL_AVAILABLE and packed[o3de_prop] != ('R', False):
+                # A value in one channel of a packed texture (the shader's
+                # label says which): O3DE reads every such value from the
+                # red channel, so it gets a grey image of its own. A value
+                # that is in red already is read from the texture itself.
+                channel, inverted = packed[o3de_prop]
+                suffix = {'roughness': '_Roughness', 'occlusion.specular': '_Occlusion'}.get(o3de_prop, '_Metallic')
+                texture_output = self._process_channel_texture(
+                    texture_guid, channel=channel, suffix=suffix, invert=inverted)
             # The roughness slot wants an INVERTED alpha when the source came
             # from Unity's _MetallicGlossMap (alpha=smoothness, not roughness).
             # The metallic slot still uses the raw texture — its RGB is correct.
-            if (o3de_prop == 'roughness'
+            elif (o3de_prop == 'roughness'
                     and self.convert_smoothness_to_roughness
                     and texture_guid in mg_source_guids):
                 texture_output = self._process_metallic_gloss_as_roughness(texture_guid)
+            elif o3de_prop == 'occlusion.specular' and PIL_AVAILABLE:
+                # Unity reads occlusion from a texture's green channel, O3DE
+                # from its red one.
+                texture_output = self._process_channel_texture(
+                    texture_guid, channel='G', suffix='_Occlusion', invert=False)
             else:
                 texture_output = self._process_texture(texture_guid)
             if texture_output:
@@ -2099,7 +2355,7 @@ class IntegratedAssetProcessor:
 
         # Create O3DE material
         output_name = material_path.stem
-        output_path = self.materials_dir / f"{output_name}.material"
+        output_path = self.output_folder(self.materials_dir, material_path) / f"{output_name}.material"
 
         # F-9 materialType resolution: override.materialtype (raw escape
         # hatch) → profile.target_materialtype → builtin StandardPBR
@@ -2112,18 +2368,22 @@ class IntegratedAssetProcessor:
             "propertyValues": {}
         }
         
-        # Add texture properties with RELATIVE paths (../Textures/filename)
+        # Add texture properties. A texture this run wrote is named by its
+        # path from the material's own folder ("../Textures/<file>" in the
+        # flat layout); a path the user gave as an override stays as written.
         for o3de_prop, texture_rel_path in texture_paths.items():
-            # Convert "Textures/filename" to "../Textures/filename" for relative path from Materials/ folder
-            if texture_rel_path.startswith("Textures/"):
-                relative_texture_path = f"../{texture_rel_path}"
+            if not Path(texture_rel_path).is_absolute() and (self.output_root / texture_rel_path).is_file():
+                relative_texture_path = Path(os.path.relpath(
+                    self.output_root / texture_rel_path, output_path.parent)).as_posix()
             else:
                 relative_texture_path = texture_rel_path
             
             # Handle special property naming
-            # For "occlusion.specular", it becomes "occlusion.specularTextureMap"
+            # Unity's one occlusion map dims the surrounding light as a whole;
+            # O3DE splits that into diffuse and specular, so both get it.
             if o3de_prop == 'occlusion.specular':
                 property_name = 'occlusion.specularTextureMap'
+                o3de_material["propertyValues"]['occlusion.diffuseTextureMap'] = relative_texture_path
             else:
                 property_name = f"{o3de_prop}.textureMap"
             
@@ -2131,7 +2391,10 @@ class IntegratedAssetProcessor:
         
         # Add scalar/color/enum properties
         for o3de_prop, value in material_data.get('properties', {}).items():
-            if isinstance(value, list):
+            if isinstance(value, list) and len(value) == 2:
+                # A pair of numbers (uv.center), written as it is
+                o3de_material["propertyValues"][o3de_prop] = [float(value[0]), float(value[1])]
+            elif isinstance(value, list):
                 # Color property - ensure 4 components
                 color = value[:3] if len(value) >= 3 else [1.0, 1.0, 1.0]
                 alpha = value[3] if len(value) >= 4 else 1.0
@@ -2143,6 +2406,9 @@ class IntegratedAssetProcessor:
                 ]
             elif isinstance(value, str):
                 # Enum property (e.g. opacity.mode = "Blended")
+                o3de_material["propertyValues"][o3de_prop] = value
+            elif isinstance(value, bool):
+                # Switch property (e.g. emissive.enable)
                 o3de_material["propertyValues"][o3de_prop] = value
             else:
                 # Scalar property
@@ -2161,8 +2427,25 @@ class IntegratedAssetProcessor:
         # converted (missing texture, package-only texture, etc.).
         # ---------------------------------------------------------------
         prop_values = o3de_material["propertyValues"]
+        # Unity's occlusion strength is one number for both halves.
+        if 'occlusion.specularFactor' in prop_values:
+            prop_values['occlusion.diffuseFactor'] = prop_values['occlusion.specularFactor']
+
         opacity_mode = prop_values.get('opacity.mode')
-        if opacity_mode in ('Cutout', 'Blended') and 'baseColor.textureMap' not in prop_values:
+        if opacity_mode == 'Blended' and 'baseColor.textureMap' not in prop_values:
+            # A blended surface without a texture is evenly transparent by
+            # its factor alone.
+            prop_values['opacity.alphaSource'] = "None"
+        elif opacity_mode in ('Cutout', 'Blended') and 'baseColor.textureMap' in prop_values:
+            # The base colour texture's alpha is the opacity: tell the image
+            # builder to keep it (see targets/o3de/texture_settings.py).
+            from targets.o3de.texture_settings import write_opacity_texture_settings
+            base_texture = self.output_root / texture_paths.get('baseColor', '')
+            if base_texture.is_file():
+                write_opacity_texture_settings(base_texture, cutout=(opacity_mode == 'Cutout'))
+                self.log(f"      Texture settings: {base_texture.name} keeps its alpha as opacity")
+
+        if opacity_mode == 'Cutout' and 'baseColor.textureMap' not in prop_values:
             prop_values.pop('opacity.mode', None)
             prop_values.pop('opacity.alphaSource', None)
             prop_values.pop('opacity.factor', None)
@@ -2179,7 +2462,7 @@ class IntegratedAssetProcessor:
             json.dump(o3de_material, f, indent=4)
 
         # Generate gem-style asset hint: assets/projectname/materials/filename.azmaterial
-        asset_hint = f"{self.asset_hint_root}/materials/{output_path.stem}.azmaterial"
+        asset_hint = f"{self.hint_folder(output_path)}/{output_path.stem}.azmaterial"
         self.processed_materials[material_guid] = asset_hint
         self.asset_index["materials"][material_guid] = asset_hint
         # F-6 metadata. shader_name was already resolved up front to drive
@@ -2215,13 +2498,22 @@ class IntegratedAssetProcessor:
             return None
         
         # Copy texture to output
-        output_path = self.textures_dir / texture_path.name
-        
+        output_path = self.output_folder(self.textures_dir, texture_path) / texture_path.name
+
         try:
-            if not output_path.exists():
+            if is_greyscale_tga(texture_path) and PIL_AVAILABLE:
+                # The engine's TGA loader reads true-colour and colour-mapped
+                # files only ("unsupported type code", TgaLoader.cpp): a
+                # greyscale one is written as a PNG of the same name.
+                output_path = output_path.with_suffix(".png")
+                if not output_path.exists():
+                    with Image.open(texture_path) as image:
+                        image.save(output_path, format='PNG')
+                    self.log(f"      Greyscale TGA written as {output_path.name}")
+            elif not output_path.exists():
                 shutil.copy2(texture_path, output_path)
 
-            relative_path = f"Textures/{output_path.name}"
+            relative_path = self.output_relative(output_path)
             self.processed_textures[texture_guid] = relative_path
             # F-9.I.4 — fingerprint for the patch worker.
             self._record_texture_state(texture_guid, texture_path, relative_path)
@@ -2237,33 +2529,34 @@ class IntegratedAssetProcessor:
     # =========================================================================
 
     def _process_metallic_gloss_as_roughness(self, texture_guid: str) -> Optional[str]:
-        """
-        Re-bake a Unity `_MetallicGlossMap` texture for use as an O3DE roughness map.
+        """Write the roughness texture for a Unity metallic-gloss map: one
+        grey image holding ``1 - smoothness``, Unity's smoothness being the
+        map's alpha channel. Returns ``Textures/<name>_Roughness.png``."""
+        return self._process_channel_texture(texture_guid, channel='A', suffix='_Roughness', invert=True)
 
-        Unity packs smoothness into the alpha channel of the metallic-gloss map.
-        O3DE samples the roughness texture directly — it has no built-in
-        smoothness-to-roughness inversion. To make the texture sample correctly
-        as roughness we invert the alpha channel (alpha = 1 − alpha) and write
-        the result as `<stem>_Roughness.png` into the Textures/ folder.
+    def _process_channel_texture(self, texture_guid: str, channel: str, suffix: str,
+                                 invert: bool) -> Optional[str]:
+        """Write one channel of a Unity texture as a grey image of its own
+        and return its path relative to the output (``Textures/<name><suffix>.png``).
 
-        The RGB channels are left untouched: the metallic slot still references
-        the original texture and reads metallic from RGB exactly as Unity wrote
-        it. Only the roughness slot routes through this method.
+        Unity packs several surface values into the channels of one texture
+        (the mask map: metallic in red, occlusion in green, smoothness in
+        alpha). O3DE reads each of roughness, metallic and occlusion from
+        the RED channel of the texture bound to it, so a value that sits in
+        another channel needs an image of its own. ``invert`` writes
+        ``1 - value`` (smoothness to roughness).
 
-        Returns None if Pillow isn't installed, the source can't be loaded, or
-        the file lacks an alpha channel (in which case the caller falls back to
-        plain copy via _process_texture and the user gets a coverage warning).
-        """
-        if texture_guid in self.processed_inverted_textures:
-            return self.processed_inverted_textures[texture_guid]
+        Falls back to copying the texture as it is when Pillow is missing or
+        the image cannot be read; the slot is then bound to the wrong
+        channel, and that is reported."""
+        cache_key = (texture_guid, channel, invert)
+        if cache_key in self.processed_inverted_textures:
+            return self.processed_inverted_textures[cache_key]
 
         if not PIL_AVAILABLE:
-            self.log("      ⚠ Smoothness→roughness conversion requested but Pillow is "
-                     "not installed; falling back to raw texture copy.")
             self.coverage.warn(
-                "Smoothness→Roughness conversion enabled but Pillow is missing. "
-                "Install with: pip install Pillow"
-            )
+                f"A texture's {channel} channel is needed as a texture of its own "
+                f"({suffix.strip('_')}), but Pillow is missing. Install with: pip install Pillow")
             return self._process_texture(texture_guid)
 
         texture_path = self.asset_db.resolve_guid(texture_guid)
@@ -2271,38 +2564,33 @@ class IntegratedAssetProcessor:
             self.coverage.record_missing_texture(texture_guid)
             return None
 
-        # Re-baked file lives next to the originals but always as PNG, because
-        # PNG preserves alpha losslessly and O3DE's image processor accepts it.
-        output_name = f"{texture_path.stem}_Roughness.png"
-        output_path = self.textures_dir / output_name
-        relative_path = f"Textures/{output_name}"
+        output_name = f"{texture_path.stem}{suffix}.png"
+        output_path = self.output_folder(self.textures_dir, texture_path) / output_name
+        relative_path = self.output_relative(output_path)
 
         try:
-            if not output_path.exists():
+            # An earlier version wrote this file with the value still in its
+            # alpha channel; only a single-channel image is the current one.
+            current = False
+            if output_path.exists():
+                with Image.open(output_path) as existing:
+                    current = existing.mode == 'L'
+            if not current:
                 with Image.open(texture_path) as img:
-                    # Force RGBA so we always have an alpha channel to invert,
-                    # even when the source was RGB-only (in which case the
-                    # synthetic alpha is fully opaque → inverted is fully
-                    # transparent → roughness=0, which is correct for a
-                    # "fully smooth" interpretation of a missing smoothness map).
-                    rgba = img.convert('RGBA')
-                    r, g, b, a = rgba.split()
-                    # Pillow's `Image.eval` runs `1 − x` on the 8-bit channel.
-                    inverted_a = a.point(lambda v: 255 - v)
-                    out = Image.merge('RGBA', (r, g, b, inverted_a))
-                    out.save(output_path, format='PNG')
-                self.log(f"      ✓ Wrote inverted-alpha roughness map: {output_name}")
-            else:
-                self.log(f"      Inverted-alpha roughness map already exists: {output_name}")
+                    # A source without an alpha channel reads as fully opaque:
+                    # smoothness one, roughness zero.
+                    value = img.convert('RGBA').getchannel(channel)
+                    if invert:
+                        value = value.point(lambda v: 255 - v)
+                    value.save(output_path, format='PNG')
+                self.log(f"      ✓ Wrote {suffix.strip('_').lower()} map from the {channel} channel: {output_name}")
 
-            self.processed_inverted_textures[texture_guid] = relative_path
+            self.processed_inverted_textures[cache_key] = relative_path
             return relative_path
 
         except Exception as e:
-            self.log(f"      ⚠ Failed to invert alpha for {texture_path.name}: {e}")
             self.coverage.warn(
-                f"Failed to re-bake smoothness→roughness for {texture_path.name}: {e}"
-            )
+                f"Failed to write the {channel} channel of {texture_path.name} as {output_name}: {e}")
             # Fall back to the plain copy so the slot still has SOMETHING bound.
             return self._process_texture(texture_guid)
 
@@ -2319,7 +2607,7 @@ class IntegratedAssetProcessor:
             return None
 
         self.log(f"    Processing mesh: {mesh_path.name}")
-        output_path = self.meshes_dir / mesh_path.name
+        output_path = self.output_folder(self.meshes_dir, mesh_path) / mesh_path.name
 
         try:
             if not output_path.exists():
@@ -2327,6 +2615,12 @@ class IntegratedAssetProcessor:
                 self.log(f"      Copied mesh file")
             else:
                 self.log(f"      Mesh already exists")
+
+            # O3DE knows a material by its name: two of one name on one mesh
+            # would be one slot there. In the copy they get names of their own.
+            for old_name, new_name in give_materials_unique_names(output_path):
+                self.log(f"      Material '{old_name}' shares its name with another of its mesh: "
+                         f"named '{new_name}' in the copy")
 
             self.processed_meshes[mesh_guid] = output_path
             # Record the FBX stem; per-entity sub-mesh hints are computed
@@ -2369,13 +2663,15 @@ class IntegratedAssetProcessor:
                            fbx_material_labels: Dict[str, List[str]],
                            output_path: Path,
                            collider_pxmesh_mapping: Optional[Dict] = None,
-                           collision_config_mapping: Optional[Dict] = None) -> None:
+                           collision_config_mapping: Optional[Dict] = None,
+                           source_path: Optional[Path] = None) -> None:
         from targets.o3de.prefab_writer import create_o3de_prefab
         return create_o3de_prefab(
             self, root_go, all_game_objects, transform_map,
             material_mapping, mesh_mapping, fbx_material_labels, output_path,
             collider_pxmesh_mapping or {},
             collision_config_mapping or {},
+            source_path=source_path,
         )
 
     def _write_entity_map_sidecar(self, prefab_output_path: Path,

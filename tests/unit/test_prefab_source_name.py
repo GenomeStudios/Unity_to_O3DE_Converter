@@ -25,7 +25,9 @@ def _worker(output_root: Path) -> SimpleNamespace:
     """The few things the nested-instance emitter reads from the worker."""
     (output_root / "Prefabs").mkdir(parents=True, exist_ok=True)
     return SimpleNamespace(prefabs_dir=output_root / "Prefabs", asset_hint_root="assets/art/pack",
-                           coverage=CoverageTracker(), _entity_map_cache={}, asset_index={"materials": {}})
+                           prefab_output_path=lambda prefab: output_root / "Prefabs" / Path(prefab).name,
+                           coverage=CoverageTracker(), _entity_map_cache={}, asset_index={"materials": {}},
+                           material_hint_for=lambda guid: None)
 
 
 def _nested(worker) -> dict:

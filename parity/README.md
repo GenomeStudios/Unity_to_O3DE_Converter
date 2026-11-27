@@ -24,6 +24,15 @@ A bed is a config in `parity/configs/` and the conversion project it names. Seve
 |---|---|---|---|
 | `office.json` | `Assets/OfficeAndPoliceStation` | `Assets/OfficePack`, level `Bench_Parity_Office` | `user/Parity` |
 | `tirgames.json` | `Assets/TirgamesAssets` | `Assets/TirgamesPack`, level `Bench_Parity_Tirgames` | `user/Parity_Tirgames` |
+| `nature.json` | `Assets/NatureManufacture Assets` of another Unity project (Unity 6) | `Assets/NatureManufacture` in the source's own folders, level `Bench_Parity_Nature` | `user/Parity_Nature` |
+
+A bed's Unity project is the one its scope lies in; each is opened with the Editor of its own version.
+
+A bed whose conversion project sets `mirror_source_folders` keeps the source's folders in its output: file names
+repeat there, so the report calls a prefab by its path below the scope, and a scene's level lies below the scene's
+folders (`Levels/<folders>/<scene>/<scene>.prefab`). The harness joins everything by guid and place, in both
+layouts: the baked level names each converted prefab by the `Source` string the converter itself uses, read from
+the bookkeeping the convert step leaves in the run folder.
 
 A config's `work` names the bed's run folder under the O3DE project's `user/` (`Parity` when it names none). Give
 every bed its own: the run folder holds the truth dump, the trace and the report, and two beds on one would write

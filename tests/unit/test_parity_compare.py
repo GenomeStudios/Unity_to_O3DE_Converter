@@ -529,27 +529,53 @@ def _make_o3de_project(root: Path) -> list:
         "Instances": {"Instance_[9]": {"Source": "assets/pack/prefabs/Drawer.prefab", "Patches": []}}}),
         encoding="utf-8")
     (prefabs / "Drawer.prefab").write_text(json.dumps({"Instances": {}}), encoding="utf-8")
-    return sorted(prefabs.glob("*.prefab"))
+    return [DESK, DRAWER]
+
+
+# The converted prefabs of the stand-in project, as the converter names them
+# where one nests another.
+DESK, DRAWER = "Assets/Pack/Prefabs/Desk.prefab", "Assets/Pack/Prefabs/Drawer.prefab"
 
 
 def test_recipe_lays_prefabs_out_without_overlap():
     with tempfile.TemporaryDirectory() as tmp:
         prefabs = _make_o3de_project(Path(tmp))
-        recipe = level_bake.make_recipe(Path(tmp), prefabs, {"Desk": 3.0, "Drawer": 0.5})
-        assert recipe["spacing"] == 8.0                      # twice the largest reach, plus two
-        cells = [cell["cell"] for cell in recipe["instances"]]
-        assert abs(cells[0][0] - cells[1][0]) >= recipe["spacing"]
-        assert [cell["source"] for cell in recipe["instances"]] == [
-            "Assets/Pack/Prefabs/Desk.prefab", "Assets/Pack/Prefabs/Drawer.prefab"]
+        recipe = level_bake.make_recipe(Path(tmp), prefabs, {DESK: 3.0, DRAWER: 0.5})
+        # The small one stands on the origin; the large one in a cell of its own size beside it.
+        assert [(cell["source"], cell["cell"]) for cell in recipe["instances"]] == [
+            (DRAWER, [0.0, 0.0, 0.0]), (DESK, [-8.0, -8.0, 0.0])]
+        assert recipe["reach"] == 8.0
 
 
-def test_level_names_prefabs_the_way_they_name_each_other():
+def test_two_prefabs_of_one_name_get_a_cell_each():
+    """A level names a prefab by its whole Source string: two prefabs that
+    share a file name in different folders are two instances."""
     with tempfile.TemporaryDirectory() as tmp:
-        prefabs = _make_o3de_project(Path(tmp))
-        folder = level_bake.nested_source_folder(prefabs)
-        assert folder == "assets/pack/prefabs"
-        recipe = level_bake.make_recipe(Path(tmp), prefabs, {}, folder)
-        assert recipe["instances"][0]["source"] == "assets/pack/prefabs/Desk.prefab"
+        _make_o3de_project(Path(tmp))
+        rocks = ["Assets/Pack/Forest/Rocks/Rock.prefab", "Assets/Pack/Meadow/Rocks/Rock.prefab"]
+        recipe = level_bake.make_recipe(Path(tmp), list(reversed(rocks)), {rocks[1]: 9.0})
+        assert [cell["source"] for cell in recipe["instances"]] == rocks
+        assert recipe["instances"][0]["cell"] != recipe["instances"][1]["cell"]
+
+
+def test_a_cell_is_as_large_as_its_prefab_needs():
+    assert [level_bake.cell_side(radius) for radius in (0.0, 1.0, 1.1, 3.0, 26.5, 804.6)] == [
+        4.0, 4.0, 8.0, 8.0, 64.0, 2048.0]
+
+
+def test_no_two_cells_overlap_and_the_small_ones_are_nearest_the_origin():
+    """The NatureManufacture pack: a thousand prefabs within 27 m and six
+    hills of 800 m. One spacing for all put the level 26 km from the origin."""
+    sides = [4.0] * 500 + [8.0] * 300 + [16.0] * 150 + [64.0] * 100 + [2048.0] * 6
+    centres = level_bake.lay_out(sides)
+    boxes = [(x - side / 2, y - side / 2, x + side / 2, y + side / 2) for (x, y, _), side in zip(centres, sides)]
+    for first in range(len(boxes)):
+        a = boxes[first]
+        for b in boxes[first + 1:]:
+            assert a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1], (a, b)
+    reach = [max(abs(x), abs(y)) for x, y, _ in centres]
+    assert max(reach[:1050]) < 600.0, "the ordinary prefabs stay within a few hundred metres"
+    assert max(reach) <= 2048.0, "a hill is one cell out, not tens of kilometres"
 
 
 def test_bake_writes_level_and_recipe():
@@ -574,8 +600,7 @@ def test_a_changed_recipe_is_refused():
         prefabs = _make_o3de_project(root)
         level_bake.bake_level(root, "Bench_Test", level_bake.make_recipe(root, prefabs, {}))
 
-        (prefabs[0].parent / "Chair.prefab").write_text("{}", encoding="utf-8")
-        wider = level_bake.make_recipe(root, sorted(prefabs[0].parent.glob("*.prefab")), {})
+        wider = level_bake.make_recipe(root, prefabs + ["Assets/Pack/Prefabs/Chair.prefab"], {})
         problem = level_bake.recipe_problem(root / "Levels" / "Bench_Test", wider)
         assert "no longer matches its recipe" in problem
 

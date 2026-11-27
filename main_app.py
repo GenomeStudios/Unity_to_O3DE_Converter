@@ -3105,7 +3105,8 @@ class PrefabProcessorTab(QWidget):
             "  Prefabs/    — O3DE prefabs with material references\n"
             "  Materials/  — O3DE PBR materials (.material)\n"
             "  Textures/   — All textures consolidated\n"
-            "  Meshes/     — FBX models with .assetinfo sub-mesh definitions\n\n"
+            "  Meshes/     — FBX models with .assetinfo sub-mesh definitions\n"
+            "  (or each asset in its source's own folder: see Conversion Options)\n\n"
             "  Converter bookkeeping (entity maps, asset index, coverage)\n"
             "  is stored in the project file, not on disk next to outputs."
         )
@@ -3124,6 +3125,29 @@ class PrefabProcessorTab(QWidget):
         )
         self._strip_lods_cb.toggled.connect(self._on_strip_lods_changed)
         opts_lay.addWidget(self._strip_lods_cb)
+        self._turn_spot_entity_cb = QCheckBox("Spot lights — turn the light's own entity")
+        self._turn_spot_entity_cb.setToolTip(
+            "An O3DE spot light shines along its entity's +Z, a quarter turn "
+            "from where the converted Unity object points it. On: an object "
+            "that holds only the light has its own entity turned, and no "
+            "second entity is made. Off: every spot light goes on a child "
+            "entity, and every object keeps Unity's transform. An object that "
+            "also shows a mesh, carries a collider or has children always "
+            "gets the child entity. On by default."
+        )
+        self._turn_spot_entity_cb.toggled.connect(self._on_strip_lods_changed)
+        opts_lay.addWidget(self._turn_spot_entity_cb)
+        self._mirror_folders_cb = QCheckBox("Use the same folder structure as the source")
+        self._mirror_folders_cb.setToolTip(
+            "On: every converted asset is written where its source lies below "
+            "the source folder, and a level below its scene's folders, so a "
+            "pack keeps its structure and several packs under one folder stay "
+            "apart. Off: one folder per kind of asset (Prefabs, Materials, "
+            "Textures, Meshes); two source files of one name then land on one "
+            "output file. Off by default."
+        )
+        self._mirror_folders_cb.toggled.connect(self._on_strip_lods_changed)
+        opts_lay.addWidget(self._mirror_folders_cb)
         root.addWidget(opts_box)
 
         # ── Processing Log ──────────────────────────────────────────────
@@ -3166,6 +3190,9 @@ class PrefabProcessorTab(QWidget):
         self._suppress_prefab_signals = True
         try:
             self._strip_lods_cb.setChecked(bool(cfg.get("strip_lods", True)))
+            self._turn_spot_entity_cb.setChecked(
+                cfg.get("spot_light_placement", "turn_entity") != "child_entity")
+            self._mirror_folders_cb.setChecked(bool(cfg.get("mirror_source_folders", False)))
         finally:
             self._suppress_prefab_signals = False
         self._refresh_effective_source_label()
@@ -3195,6 +3222,9 @@ class PrefabProcessorTab(QWidget):
             "selected_prefabs": sorted(self._selected_prefabs),
             "output_path":      self._output_edit.text(),
             "strip_lods":       self._strip_lods_cb.isChecked(),
+            "spot_light_placement": ("turn_entity" if self._turn_spot_entity_cb.isChecked()
+                                     else "child_entity"),
+            "mirror_source_folders": self._mirror_folders_cb.isChecked(),
         }
 
     def _save_settings(self) -> None:
@@ -3483,10 +3513,12 @@ class PrefabProcessorTab(QWidget):
                               if proj else None)
         strip_lods        = (bool(proj.stage_settings("asset_processor").get("strip_lods", True))
                               if proj else True)
+        from stage_runner import asset_stage_options
+        options           = asset_stage_options(proj.stage_settings("asset_processor") if proj else {})
 
         self._worker = WorkerThread(
             self._do_processing, source, output, resolved,
-            material_settings, mesh_settings, collision_settings, strip_lods,
+            material_settings, mesh_settings, collision_settings, strip_lods, options,
         )
         self._worker.emitter.message.connect(self._log)
         self._worker.finished.connect(self._on_finished)
@@ -3497,6 +3529,7 @@ class PrefabProcessorTab(QWidget):
                        material_settings: dict, mesh_settings: dict,
                        collision_settings: dict,
                        strip_lods: bool,
+                       options: dict,
                        log) -> str:
         # The run itself lives in `stage_runner`, shared with
         # `converter_cli.py`; this tab only stores its bookkeeping.
@@ -3510,6 +3543,7 @@ class PrefabProcessorTab(QWidget):
             strip_lods=strip_lods,
             convert_smoothness_to_roughness=get_config()["convert_smoothness_to_roughness"],
             log=log,
+            options=options,
         )
         pm = project_manager()
         store_run(pm, pm.current(), run, input_hash_for(self.STAGE_KEY, pm.current()))
@@ -4011,11 +4045,10 @@ class SceneConverterTab(QWidget):
         dirs: list = []
         proj = project_manager().current()
         if proj is not None:
-            ap_cfg = proj.stage_settings("asset_processor")
-            ap_out = (ap_cfg.get("output_path") or "").strip()
-            if ap_out:
-                # Stage 1 writes prefabs into <output>/Prefabs/.
-                dirs.append(str(Path(ap_out) / "Prefabs"))
+            # Where Stage 1 writes prefabs: <output>/Prefabs/, or the whole
+            # output when it keeps the source's folders.
+            from stage_runner import converted_prefab_dirs
+            dirs += converted_prefab_dirs(proj)
         for d in (self._prefab_dirs or []):
             if d and d not in dirs:
                 dirs.append(d)

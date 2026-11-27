@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import struct
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -129,6 +130,12 @@ class ConversionTrace:
             "parent_entity_id": transform.get("Parent Entity", ""),
             "unity":            _unity_transform(go),
             "rule":             rule,
+            # The mesh's own stretch that the entity's scale also carries
+            # (targets.o3de.prefab_writer.with_mesh_stretch), or None.
+            "mesh_stretch":     _copy(go.component_data.get("mesh_stretch")),
+            # True when the entity was turned to carry its spot light itself
+            # (targets.o3de.prefab_writer.with_light_turn).
+            "light_turn":       bool(go.component_data.get("light_turns_entity")),
             "transform_modified_by": transform_modified_by,
             "emitted": {
                 "translate":        _copy(data.get("Translate")),
@@ -184,7 +191,8 @@ class ConversionTrace:
         ``node_translations`` holds, by node, the translation the file's own
         geometric transform gave its rule; ``user_translation`` the user's
         ``default_position`` when one applies."""
-        self.fbx_files[Path(fbx_path).name] = Path(fbx_path)
+        # By guid: two model files in different folders may share a name.
+        self.fbx_files[mesh_guid or Path(fbx_path).name] = Path(fbx_path)
 
         records = []
         for group in groups:
@@ -215,6 +223,7 @@ class ConversionTrace:
 
         self.assetinfos.append({
             "fbx":           Path(fbx_path).name,
+            "path":          str(fbx_path),
             "mesh_guid":     mesh_guid or "",
             "written_for":   (self._current or {}).get("source_guid", ""),
             "up_axis":       up_axis,
@@ -355,8 +364,15 @@ def uncovered_in_prefab(prefab_file: Path, record: dict) -> List[str]:
 def uncovered_in_assetinfo(assetinfo_file: Path, writes: List[dict]) -> List[str]:
     """Every coordinate rule of one ``.assetinfo`` file that the last trace
     write for that file does not hold. Empty means covered."""
-    fbx_name = Path(assetinfo_file).name[:-len(".assetinfo")]
-    last = next((w for w in reversed(writes) if w["fbx"] == fbx_name), None)
+    # The writes for this very file: two model files in different folders
+    # may share a name. A write that carries no path is known by name.
+    fbx_file = str(assetinfo_file)[:-len(".assetinfo")]
+    fbx_name = Path(fbx_file).name
+    same_file = os.path.normcase(os.path.abspath(fbx_file))
+    of_this_file = [w for w in writes
+                    if (os.path.normcase(os.path.abspath(w["path"])) == same_file if w.get("path")
+                        else w["fbx"] == fbx_name)]
+    last = of_this_file[-1] if of_this_file else None
     if last is None:
         return [f"{Path(assetinfo_file).name}: no trace record of its write"]
 

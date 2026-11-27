@@ -173,6 +173,31 @@ def source_import_scale(facts: dict, node_name: str, import_scale: float = 1.0) 
     return scaling[0] * import_scale
 
 
+def source_mesh_stretch(facts: dict, node_name: str) -> Optional[list]:
+    """For a mesh node whose geometric scaling differs by axis: the scale
+    ``[x, y, z]``, in the model's own axes, that the model still lacks once
+    the coordinate rule is applied. None for a node that needs none, or
+    whose stretch cannot be given this way.
+
+    The rule cannot hold such a scaling (``source_import_scale``), but an
+    entity can: its non-uniform scale stretches the model along the model's
+    axes. That equals the node's scaling whenever the rule's rotation maps
+    axes onto axes, which the quarter turns exporters write always do: the
+    scaling then only changes which axis each factor belongs to. The rule's
+    translation is written divided by the stretch, since the entity's scale
+    stretches it as well."""
+    node = (facts.get("nodes") or {}).get(node_name)
+    if node is None or facts.get("up_axis") not in _RAW_FROM_PIPELINE:
+        return None
+    scaling = [float(value) for value in node["geometric_scaling"]]
+    if max(scaling) - min(scaling) <= 1e-4 * max(abs(value) for value in scaling) or min(scaling) <= 0.0:
+        return None
+    turn = _mat_mul(_UNITY_MESH_TO_O3DE, _euler_xyz_matrix(node["geometric_rotation"]))
+    if any(sorted(abs(value) for value in row)[1] > 1e-4 for row in turn):
+        return None                      # the turn mixes axes: no scale on axes equals it
+    return [sum(turn[row][column] ** 2 * scaling[column] for column in range(3)) for row in range(3)]
+
+
 # ---------------------------------------------------------------------------
 # Per-mesh settings resolution (F-9 chain)
 # ---------------------------------------------------------------------------
@@ -208,6 +233,34 @@ def _resolve_mesh_settings(mesh_settings: Optional[Dict],
 # ---------------------------------------------------------------------------
 # .assetinfo writer
 # ---------------------------------------------------------------------------
+
+# The number of lower levels of detail a model can hold (``LodRule::m_maxLods``).
+LOD_RULE_LEVELS = 5
+
+
+def lod_rule_of_one_level(node_paths: list) -> dict:
+    """The LOD rule of a model that is one level of detail: exactly the
+    nodes its group selects.
+
+    Left to itself the engine fills a model's lower levels from the file's
+    node names: every node called ``..._LOD1`` becomes level 1 of every
+    model of the file, ``..._LOD2`` level 2, and so on, whatever the group
+    selects (``LodRuleBehavior::UpdateLodRules`` adds each level the rule
+    does not hold yet). A model made of a node called ``..._LOD1`` then has
+    nothing at its top level, and its job fails ("Size of the buffer in the
+    descriptor was 0"); a file that holds two objects with levels of detail
+    gets both objects' lower levels in each model.
+
+    A rule that already holds every level is left as written. So all
+    ``LOD_RULE_LEVELS`` are written, each selecting no node. The converter
+    keeps one level of a Unity LOD group (the asset stage's ``strip_lods``);
+    the levels Unity lists would go into these lists."""
+    nothing_selected = {"selectedNodes": [], "unselectedNodes": list(node_paths)}
+    return {
+        "$type": "{6E796AC8-1484-4909-860A-6D3F22A7346F} LodRule",
+        "nodeSelectionList": [dict(nothing_selected) for _ in range(LOD_RULE_LEVELS)],
+    }
+
 
 def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
                          entity_node_map: dict, log=print,
@@ -293,12 +346,18 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
 
         scale = source_import_scale(facts, leaf, import_scale) if axis_rule else 1.0
         if scale is None:
+            # A scaling that differs by axis: the entity carries it (see
+            # source_mesh_stretch), and stretches the rule's translation too.
             scale = import_scale
-            if leaf not in unscaled_nodes:
+            stretch = source_mesh_stretch(facts, leaf)
+            if stretch:
+                translation = [value / factor for value, factor in zip(translation, stretch)]
+            elif leaf not in unscaled_nodes:
                 unscaled_nodes.add(leaf)
-                log(f"    [Mesh] ⚠ '{leaf}' of {fbx_dest_path.name} has a geometric scaling that "
-                    f"differs by axis {facts['nodes'][leaf]['geometric_scaling']}: the import rule "
-                    f"holds one scale for all axes, so the model comes out unscaled.")
+                log(f"    [Mesh] ⚠ '{leaf}' of {fbx_dest_path.name} has a geometric scaling "
+                    f"{facts['nodes'][leaf]['geometric_scaling']} under a turn that mixes axes: "
+                    f"neither the import rule nor an entity's scale can hold it; the model comes "
+                    f"out unscaled.")
 
         rotation = _mat_mul(user_matrix, rotation)
         translation = [a + b for a, b in zip(_mat_vec(user_matrix, translation), user_translation)]
@@ -329,13 +388,14 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
     for entity_name, node_path in entity_node_map.items():
         group_name = f"{fbx_stem}-{entity_name}"
         unselected = [p for p in all_node_paths if p != node_path]
+        top_node = node_path.split(".")[0]
         groups.append({
             "$type": "{07B356B7-3635-40B5-878A-FAC4EFD5AD86} MeshGroup",
             "name": group_name,
             "nodeSelectionList": {
                 # The top of the graph, then the node itself. The top is
                 # "RootNode" in an FBX; an OBJ's is named after the file.
-                "selectedNodes": list(dict.fromkeys([node_path.split(".")[0], node_path])),
+                "selectedNodes": list(dict.fromkeys([top_node, node_path])),
                 "unselectedNodes": unselected
             },
             "rules": {
@@ -343,7 +403,7 @@ def write_fbx_assetinfo(fbx_dest_path: Path, fbx_stem: str,
                     {"$type": "StaticMeshAdvancedRule", "vertexColorStreamName": "Col0"},
                     {"$type": "MaterialRule"},
                     rule_for(node_path),
-                    {"$type": "{6E796AC8-1484-4909-860A-6D3F22A7346F} LodRule"}
+                    lod_rule_of_one_level(list(dict.fromkeys([top_node] + all_node_paths))),
                 ]
             },
             "id": "{" + str(_uuid.uuid4()).upper() + "}"

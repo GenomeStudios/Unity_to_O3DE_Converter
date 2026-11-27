@@ -68,10 +68,12 @@ def run_asset_processor(source_path: str, output_path: str, prefab_files: list, 
                         strip_lods: bool,
                         convert_smoothness_to_roughness: bool,
                         log: Callable[[str], None],
-                        trace=None) -> StageRun:
+                        trace=None,
+                        options: Optional[dict] = None) -> StageRun:
     """Convert the given Unity prefabs, with every material, texture and
     mesh they use, into ``output_path``. ``trace`` is an optional
-    ``conversion_trace.ConversionTrace``."""
+    ``conversion_trace.ConversionTrace``; ``options`` is
+    ``asset_stage_options(...)``."""
     from integrated_asset_processor import IntegratedAssetProcessor
 
     log("\n" + "=" * 60)
@@ -87,6 +89,7 @@ def run_asset_processor(source_path: str, output_path: str, prefab_files: list, 
         mesh_settings=mesh_settings,
         collision_settings=collision_settings,
         strip_lods=strip_lods,
+        options=options,
         trace=trace,
     )
 
@@ -154,6 +157,57 @@ def run_asset_processor(source_path: str, output_path: str, prefab_files: list, 
 # STAGE 2 - SCENE CONVERTER
 # =============================================================================
 
+def asset_stage_options(settings: dict) -> dict:
+    """The asset stage's options that the emitters read, each at its
+    default when the project's settings do not name it.
+
+      ``spot_light_placement``   where a spot light is written: on its
+                                 object's own entity, turned, when the
+                                 object holds only the light
+                                 (``turn_entity``), or always on a child
+                                 entity (``child_entity``).
+      ``mirror_source_folders``  whether every converted asset keeps its
+                                 source's folder below the source root,
+                                 instead of one folder per kind of asset
+                                 (``IntegratedAssetProcessor.output_folder``)."""
+    from integrated_asset_processor import MIRROR_OPTION
+    from platforms.unity.components.light import PLACEMENT_DEFAULT, PLACEMENT_OPTION
+
+    settings = settings or {}
+    return {
+        PLACEMENT_OPTION: settings.get(PLACEMENT_OPTION) or PLACEMENT_DEFAULT,
+        MIRROR_OPTION:    bool(settings.get(MIRROR_OPTION, False)),
+    }
+
+
+def converted_prefab_dirs(project) -> list:
+    """The folders the scene stage looks converted prefabs up in: where
+    Stage 1 writes them. With mirrored folders that is the whole output."""
+    from integrated_asset_processor import MIRROR_OPTION
+
+    settings = project.stage_settings("asset_processor")
+    output = (settings.get("output_path") or "").strip()
+    if not output:
+        return []
+    return [str(Path(output) if settings.get(MIRROR_OPTION) else Path(output) / "Prefabs")]
+
+
+def level_name_for(scene_path: Path, asset_stage: Optional[dict]) -> str:
+    """The name a scene's level is known by: its folder below the levels
+    output, and what the Editor opens it by.
+
+    It is the scene file's name. With mirrored folders the scene's folders
+    below the source root come first (``Pack/Demo Scenes/Overview``), so two
+    scenes of one name become two levels."""
+    from integrated_asset_processor import MIRROR_OPTION, mirrored_folder
+
+    stem = Path(scene_path).stem
+    options = (asset_stage or {}).get("options") or {}
+    if not options.get(MIRROR_OPTION):
+        return stem
+    return (mirrored_folder(Path(asset_stage["source_path"]), Path(scene_path)) / stem).as_posix()
+
+
 def asset_stage_arguments(project, convert_smoothness_to_roughness: bool) -> Optional[dict]:
     """What Stage 1 runs with, read off a conversion project, for
     ``run_scene_converter``: a scene's own objects have their materials and
@@ -173,6 +227,7 @@ def asset_stage_arguments(project, convert_smoothness_to_roughness: bool) -> Opt
         "mesh_settings":      copy.deepcopy(project.stage_settings("mesh_processor")),
         "collision_settings": copy.deepcopy(project.stage_settings("collision_processor")),
         "strip_lods":         bool(settings.get("strip_lods", True)),
+        "options":            asset_stage_options(settings),
         "convert_smoothness_to_roughness": convert_smoothness_to_roughness,
         "state_index":        copy.deepcopy(project.outputs.get("state_index") or {}),
     }
@@ -193,7 +248,7 @@ def run_scene_converter(scenes: list, output_dir: str, prefab_dirs: list,
     scenes' own objects (the ones that are not prefab instances) get their
     materials and models converted by one Stage 1 worker shared by the run;
     without it they are placed without them."""
-    from platforms.unity.scene_converter import PrefabDatabase, UnitySceneConverter
+    from platforms.unity.scene_converter import PrefabDatabase, UnitySceneConverter, prefab_key
 
     log("\n" + "=" * 60)
     log("STARTING MULTI-SCENE CONVERSION")
@@ -209,15 +264,24 @@ def run_scene_converter(scenes: list, output_dir: str, prefab_dirs: list,
 
     ap_outputs = asset_processor_outputs or {}
     ap_prefabs = ap_outputs.get("prefabs", {})  # guid_or_stem → record
+    stage_1_root = Path(asset_stage["output_path"]) if asset_stage else None
     entity_maps_by_stem: dict = {}
+    entity_maps_by_path: dict = {}
     for record in ap_prefabs.values():
         stem = Path(record.get("output_path", "")).stem
         if stem:
             entity_maps_by_stem[stem] = record
-        # A placed prefab is found by the guid the scene names it by. The
-        # name of an instance is only what the scene's author called it: a
-        # renamed instance would be missed, or take another prefab's place.
-        if stem and record.get("source_guid"):
+        # A placed prefab is found by the guid the scene names it by, and
+        # its converted file by where Stage 1 says it wrote it. The name of
+        # an instance is only what the scene's author called it (a renamed
+        # instance would be missed, or take another prefab's place), and
+        # two prefabs in different folders may share a file name.
+        converted = stage_1_root / record["output_path"] if stage_1_root and stem else None
+        if converted is not None and converted.is_file():
+            entity_maps_by_path[prefab_key(converted)] = record
+            if record.get("source_guid"):
+                prefab_db.add_converted_prefab(record["source_guid"], converted)
+        elif stem and record.get("source_guid"):
             prefab_db.add_guid_mapping(record["source_guid"], stem)
 
     # One Stage 1 worker for the run, for what the scenes' own objects show.
@@ -233,6 +297,7 @@ def run_scene_converter(scenes: list, output_dir: str, prefab_dirs: list,
             mesh_settings=asset_stage.get("mesh_settings"),
             collision_settings=asset_stage.get("collision_settings"),
             strip_lods=asset_stage.get("strip_lods", True),
+            options=asset_stage.get("options"),
             state_index=asset_stage.get("state_index"),
             trace=trace,
         )
@@ -257,15 +322,17 @@ def run_scene_converter(scenes: list, output_dir: str, prefab_dirs: list,
 
     for i, scene_path in enumerate(scenes, 1):
         scene_stem    = scene_path.stem
-        scene_out_dir = Path(output_dir) / scene_stem
+        level_name    = level_name_for(scene_path, asset_stage)
+        scene_out_dir = Path(output_dir) / level_name
         scene_out_dir.mkdir(parents=True, exist_ok=True)
         level_prefab  = scene_out_dir / f"{scene_stem}.prefab"
 
-        log(f"\n[{i}/{len(scenes)}] {scene_path.name}  →  {scene_out_dir.name}/")
+        log(f"\n[{i}/{len(scenes)}] {scene_path.name}  →  {level_name}/")
         try:
             conv = UnitySceneConverter(
                 prefab_db, log_callback=log,
                 entity_maps_by_stem=entity_maps_by_stem,
+                entity_maps_by_path=entity_maps_by_path,
                 asset_index=asset_index_for_scene,
                 trace=trace,
                 asset_processor=asset_processor,
@@ -280,7 +347,7 @@ def run_scene_converter(scenes: list, output_dir: str, prefab_dirs: list,
                 f"missing: {len(conv.missing_prefabs)}")
 
             total, refs, blanks = conv.create_o3de_level(
-                str(level_prefab), scene_out_dir
+                str(level_prefab), scene_out_dir, level_name=level_name,
             )
             conv.finalize(scene_out_dir)
 
@@ -289,7 +356,8 @@ def run_scene_converter(scenes: list, output_dir: str, prefab_dirs: list,
                 output_rel = str(level_prefab.relative_to(Path(output_dir)))
             except Exception:
                 output_rel = level_prefab.name
-            scene_records[scene_path.name] = {
+            # Keyed by the level's name: two scenes may share a file name.
+            scene_records[f"{level_name}{scene_path.suffix}"] = {
                 "output_path":       output_rel.replace("\\", "/"),
                 "entities":          total,
                 "prefab_references": refs,
@@ -306,7 +374,7 @@ def run_scene_converter(scenes: list, output_dir: str, prefab_dirs: list,
             log(f"  ✓ Wrote {level_prefab.name}")
         except Exception as exc:
             log(f"  ✗ Scene failed: {exc}")
-            totals["failures"].append(scene_path.name)
+            totals["failures"].append(f"{level_name}{scene_path.suffix}")
 
     log("\n" + "=" * 60)
     log("CONVERSION COMPLETE!")

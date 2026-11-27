@@ -67,8 +67,12 @@ def main():
 
         # ----- The level -----------------------------------------------------
         progress("level")
-        level_name = config["level"]
-        general.open_level_no_prompt(level_name)
+        # A level may lie below folders of the Levels folder
+        # ("Pack/Demo Scenes/Overview"): it is opened by that path and is
+        # current under its own name, the last part.
+        level_path = config["level"]
+        level_name = level_path.replace("\\", "/").split("/")[-1]
+        general.open_level_no_prompt(level_path)
         waited = 0.0
         while general.get_current_level_name() != level_name and waited < 300.0:
             general.idle_wait(1.0)
@@ -76,7 +80,7 @@ def main():
         result["steps"]["level"] = general.get_current_level_name()
         result["steps"]["level_open_seconds"] = waited
         if result["steps"]["level"] != level_name:
-            raise RuntimeError("the level '%s' did not open" % level_name)
+            raise RuntimeError("the level '%s' did not open" % level_path)
         general.idle_wait(float(config.get("settle_seconds", 5.0)))
 
         # ----- The probe -----------------------------------------------------

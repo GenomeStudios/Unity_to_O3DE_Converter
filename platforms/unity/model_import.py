@@ -55,14 +55,19 @@ from matrix3 import euler_xyz_matrix, mat_mul, mat_vec, matrix_to_quat, transpos
 
 CLASS_GAME_OBJECT = 1
 CLASS_TRANSFORM = 4
+CLASS_MESH_RENDERER = 23
 CLASS_MESH = 43
 
 # The name the id table gives the model's root object.
 ROOT_NAME = "//RootNode"
 
-# The root object's ids in a file whose id table is empty.
+# The root object's ids in a file whose id table is empty
+# (``hashed_object_ids`` of no path).
 HASHED_ROOT_GAME_OBJECT = "919132149155446097"
 HASHED_ROOT_TRANSFORM = "-8679921383154817045"
+
+# What Unity calls the root of a model when it hashes an object's place.
+HASHED_ROOT_PATH = "//RootNode/root"
 
 # The first mesh id of the oldest scheme: mesh number n has 4300000 + 2n.
 LEGACY_FIRST_MESH_ID = 4300000
@@ -91,6 +96,9 @@ class ModelMeta:
     # The importer's "Scale Factor" (``globalScale``): Unity multiplies the
     # model by it - the vertices of every mesh and the place of every node.
     global_scale: float = 1.0
+    # The importer's "Convert Units". On, Unity brings the file's unit to
+    # metres; off, it takes one unit of the file for one metre.
+    use_file_scale: bool = True
     # Importer switches this module's rules do not cover, when they are set
     # away from their default.
     unsupported: List[str] = field(default_factory=list)
@@ -135,11 +143,21 @@ def read_model_meta(meta_path: Path) -> ModelMeta:
     for switch in ("bakeAxisConversion", "preserveHierarchy"):
         if str(meshes.get(switch, importer.get(switch, "0"))) == "1":
             meta.unsupported.append(switch)
-    # With the file's unit switched off Unity reads the file's numbers as
-    # centimetres, whatever the file says.
-    if str(meshes.get("useFileScale", "1")) == "0":
-        meta.unsupported.append("useFileScale off")
+    meta.use_file_scale = str(meshes.get("useFileScale", "1")) != "0"
     return meta
+
+
+def import_scale(meta: ModelMeta, facts: dict) -> float:
+    """How much larger Unity makes a model than its file's unit says: the
+    importer's scale factor, and with "Convert Units" off the file's unit
+    undone (Unity then takes one unit for one metre, a centimetre file comes
+    out a hundred times its size). The engine always brings a file to metres
+    by its unit, so this is the scale the import rule adds
+    (``assetinfo_writer.source_import_scale``)."""
+    scale = meta.global_scale
+    if not meta.use_file_scale:
+        scale /= float(facts.get("unit_to_metres") or 0.01)
+    return scale
 
 
 # =============================================================================
@@ -191,7 +209,36 @@ def xxhash64(data: bytes, seed: int = 0) -> int:
 
 def hashed_mesh_id(mesh_name: str) -> str:
     """The id Unity gives a mesh whose name the id table does not list."""
-    digest = xxhash64(f"Type:Mesh->{mesh_name}0".encode("utf-8"))
+    return _hashed_id(f"Type:Mesh->{mesh_name}0")
+
+
+def hashed_object_ids(path: List[str]) -> tuple:
+    """The ids Unity gives the object at ``path`` below a model's root, and
+    its transform, in a file whose id table is empty (Unity 2019.3 and
+    later). ``path`` holds the names from the root's child down to the
+    object; it is empty for the root itself.
+
+    Unity hashes where the object sits: ``//RootNode/root/pit`` for a child
+    called ``pit``. (Read off a fire pit of the NatureManufacture pack,
+    whose placement in a prefab names its objects by these ids.)"""
+    place = _hashed_place(path)
+    return _hashed_id(f"Type:GameObject->{place}0"), _hashed_id(f"Type:Transform->{place}/Transform0")
+
+
+def hashed_renderer_id(path: List[str]) -> str:
+    """The id Unity gives the mesh renderer of the object at ``path`` (see
+    ``hashed_object_ids``). An override of the object's materials names it."""
+    return _hashed_id(f"Type:MeshRenderer->{_hashed_place(path)}/MeshRenderer0")
+
+
+def _hashed_place(path: List[str]) -> str:
+    """Where an object sits below a model's root, as Unity writes it to hash it."""
+    return HASHED_ROOT_PATH + "".join(f"/{name}" for name in path)
+
+
+def _hashed_id(text: str) -> str:
+    """A text's 64-bit hash as Unity writes a file id: a signed number."""
+    digest = xxhash64(text.encode("utf-8"))
     return str(digest - (1 << 64) if digest >= (1 << 63) else digest)
 
 
@@ -227,6 +274,12 @@ def node_for_mesh(mesh_file_id: str, meta: ModelMeta, facts: dict, object_name: 
     for name in names:
         if wanted and mesh_id_of_node(meta, name) == wanted:
             return name
+    # The id is the one Unity gives a node of the file that carries no mesh:
+    # an empty mesh (the file reader counts no vertices for it). It shows
+    # nothing, and must not be taken for another node by its position.
+    for name, node in facts.get("nodes", {}).items():
+        if wanted and not node["mesh"] and mesh_id_of_node(meta, name) == wanted:
+            return None
     if object_name in names:
         return object_name
     if len(names) == 1:
@@ -257,6 +310,7 @@ class ModelObject:
     material_guids: List[str] = field(default_factory=list)
     game_object_id: str = ""             # Unity's ids in the model; "" when not known
     transform_id:   str = ""
+    renderer_id:    str = ""             # of its mesh renderer; "" without a mesh
 
 
 def model_objects(facts: dict, file_stem: str, meta: ModelMeta) -> List[ModelObject]:
@@ -270,22 +324,30 @@ def model_objects(facts: dict, file_stem: str, meta: ModelMeta) -> List[ModelObj
         return []
     top = [name for name in order if nodes[name]["parent"] is None]
     hashed = not meta.id_table.get(CLASS_GAME_OBJECT)
+    # Each object's names from the root's child down to itself, as the list
+    # of objects grows: what a file without an id table hashes for an id.
+    paths: List[List[str]] = []
 
-    def ids_for(table_name: str, is_root: bool) -> tuple:
+    def ids_for(table_name: str, path: List[str]) -> tuple:
         if hashed:
-            return (HASHED_ROOT_GAME_OBJECT, HASHED_ROOT_TRANSFORM) if is_root else ("", "")
+            return hashed_object_ids(path)
         return _id_of(meta, CLASS_GAME_OBJECT, table_name), _id_of(meta, CLASS_TRANSFORM, table_name)
 
     def object_for(name: str, parent: int, is_root: bool) -> ModelObject:
         node = nodes[name]
-        position, rotation = _unity_node_transform(facts, node, meta.global_scale)
-        game_object_id, transform_id = ids_for(ROOT_NAME if is_root else name, is_root)
+        position, rotation = _unity_node_transform(facts, node, import_scale(meta, facts))
+        paths.append([] if is_root else paths[parent] + [name])
+        game_object_id, transform_id = ids_for(ROOT_NAME if is_root else name, paths[-1])
+        renderer_id = ""
+        if node["mesh"]:
+            renderer_id = (hashed_renderer_id(paths[-1]) if hashed
+                           else _id_of(meta, CLASS_MESH_RENDERER, ROOT_NAME if is_root else name))
         return ModelObject(
             name=file_stem if is_root else name, node=name, parent=parent,
             position=position, rotation=rotation, scale=tuple(node["local_scaling"]),
             mesh_file_id=mesh_id_of_node(meta, name) if node["mesh"] else "",
             material_names=list(node["materials"]) if node["mesh"] else [],
-            game_object_id=game_object_id, transform_id=transform_id,
+            game_object_id=game_object_id, transform_id=transform_id, renderer_id=renderer_id,
         )
 
     objects: List[ModelObject] = []
@@ -293,7 +355,8 @@ def model_objects(facts: dict, file_stem: str, meta: ModelMeta) -> List[ModelObj
         objects.append(object_for(top[0], -1, True))
         queue = [(top[0], 0)]
     else:
-        game_object_id, transform_id = ids_for(ROOT_NAME, True)
+        paths.append([])
+        game_object_id, transform_id = ids_for(ROOT_NAME, paths[-1])
         objects.append(ModelObject(name=file_stem, node=None, parent=-1,
                                    game_object_id=game_object_id, transform_id=transform_id))
         queue = []
@@ -310,10 +373,10 @@ def model_objects(facts: dict, file_stem: str, meta: ModelMeta) -> List[ModelObj
     return objects
 
 
-def _unity_node_transform(facts: dict, node: dict, global_scale: float = 1.0) -> tuple:
+def _unity_node_transform(facts: dict, node: dict, scale: float = 1.0) -> tuple:
     """A node's local position (metres) and rotation (quaternion) as Unity
-    imports them. ``global_scale`` is the importer's scale factor."""
-    unit = float(facts.get("unit_to_metres") or 0.01) * global_scale
+    imports them. ``scale`` is ``import_scale(meta, facts)``."""
+    unit = float(facts.get("unit_to_metres") or 0.01) * scale
     translation = [value * unit for value in node["local_translation"]]
     rotation = mat_mul(mat_mul(euler_xyz_matrix(node["pre_rotation"]), euler_xyz_matrix(node["local_rotation"])),
                        transpose(euler_xyz_matrix(node["post_rotation"])))

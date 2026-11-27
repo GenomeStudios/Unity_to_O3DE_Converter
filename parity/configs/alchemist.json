@@ -1,0 +1,12 @@
+{
+    "name": "alchemist",
+    "project": "alchemist.u2oproj.json",
+    "level": "Bench_Parity_Alchemist",
+    "work": "Parity_Alchemist",
+    "seed": 1234,
+    "tolerance": {
+        "position_mm": 1.0,
+        "rotation_deg": 0.1,
+        "geometry_mm": 1.0
+    }
+}

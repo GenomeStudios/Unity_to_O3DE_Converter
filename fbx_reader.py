@@ -49,7 +49,9 @@ def read_records(fbx_path: Path, int_arrays=()) -> List[dict]:
     """The record tree of a binary FBX: ``[{name, props, children}, ...]``.
     Array payloads are skipped (their place in ``props`` holds None), except
     the 32-bit integer arrays of the records named in ``int_arrays``, which
-    are read as lists. Empty for a file that is missing or is not binary FBX.
+    are read as lists, and an array of no elements, which is an empty list
+    (so a geometry without vertices can be told). Empty for a file that is
+    missing or is not binary FBX.
     Handles both the 32-bit record headers of files before version 7500 and
     the 64-bit ones after."""
     try:
@@ -76,8 +78,8 @@ def read_records(fbx_path: Path, int_arrays=()) -> List[dict]:
             elif kind in "fdlib":
                 length, encoding, stored = struct.unpack("<III", data[position:position + 12])
                 position += 12
-                values = None
-                if kind == "i" and keep_int_arrays:
+                values = [] if length == 0 else None
+                if kind == "i" and keep_int_arrays and length:
                     payload = data[position:position + stored]
                     payload = zlib.decompress(payload) if encoding == 1 else payload
                     values = list(struct.unpack(f"<{length}i", payload[:4 * length]))
@@ -152,12 +154,16 @@ def read_import_facts(fbx_path: Path) -> dict:
          "order":            [node name, ...] as the file lists them,
          "nodes": {node name: {
              "kind":                  "Mesh", "Null", "LimbNode", ...
-             "mesh":                  True when the node carries geometry,
+             "mesh":                  True when the node carries geometry that has
+                                      vertices (a file may hold an empty mesh),
              "parent":                the parent node's name, None at the top,
              "path":                  "RootNode.Parent.Node", as O3DE names it,
              "materials":             [material name, ...] the node's mesh uses, in the
                                       order its polygons first use them (the order
-                                      of the sub-meshes Unity and O3DE make of it),
+                                      of the sub-meshes Unity and O3DE make of it).
+                                      A material connected through several slots
+                                      is one material and is listed once,
+             "material_ids":          [object id, ...] of those materials,
              "local_translation":     [x, y, z],   file units
              "local_rotation":        [x, y, z],   Euler degrees, order XYZ
              "pre_rotation":          [x, y, z],   applied before local_rotation
@@ -190,7 +196,7 @@ def read_import_facts(fbx_path: Path) -> dict:
     slots_used_of_geometry, material_of_id = {}, {}
     for record in by_name.get("Objects", {"children": []})["children"]:
         object_id = record["props"][0] if record["props"] else None
-        if record["name"] == "Geometry":
+        if record["name"] == "Geometry" and not _is_empty(record):
             slots_used_of_geometry[object_id] = _material_slots_used(record)
         elif record["name"] == "Material":
             material_of_id[object_id] = object_name(record)
@@ -208,6 +214,7 @@ def read_import_facts(fbx_path: Path) -> dict:
             "parent":                None,
             "path":                  "",
             "materials":             [],
+            "material_ids":          [],
             "local_translation":     _three(found.get("Lcl Translation"), 0.0),
             "local_rotation":        _three(found.get("Lcl Rotation"), 0.0),
             "pre_rotation":          _three(found.get("PreRotation"), 0.0),
@@ -230,15 +237,28 @@ def read_import_facts(fbx_path: Path) -> dict:
             node["mesh"] = True
             node["slots_used"] = slots_used_of_geometry[child]
         elif child in material_of_id:
-            node["materials"].append(material_of_id[child])
+            node["material_ids"].append(child)          # one per slot, in the file's order
 
     for name, node in facts["nodes"].items():
-        node["path"] = ".".join(["RootNode"] + _ancestry(facts["nodes"], name))
-        # The node lists every material assigned to it; its mesh may use fewer.
+        node["path"] = ".".join(["RootNode"] + [scene_node_name(part) for part in _ancestry(facts["nodes"], name)])
+        # The node lists a material for every slot; its mesh may use fewer
+        # slots, and one material through several of them. Unity makes one
+        # sub-mesh of each material used, and so does O3DE.
+        by_slot = node["material_ids"]
         slots_used = node.pop("slots_used", None)
         if slots_used is not None:
-            node["materials"] = [node["materials"][slot] for slot in slots_used if slot < len(node["materials"])]
+            by_slot = [by_slot[slot] for slot in slots_used if slot < len(by_slot)]
+        node["material_ids"] = list(dict.fromkeys(by_slot))
+        node["materials"] = [material_of_id[material] for material in node["material_ids"]]
     return facts
+
+
+def _is_empty(geometry: dict) -> bool:
+    """Whether a geometry has no vertices. Such a mesh shows nothing in
+    Unity, and O3DE cannot make a model of it: its node counts as carrying
+    no mesh."""
+    vertices = next((c for c in geometry["children"] if c["name"] == "Vertices"), None)
+    return vertices is not None and bool(vertices["props"]) and vertices["props"][0] == []
 
 
 def _material_slots_used(geometry: dict):
@@ -250,6 +270,18 @@ def _material_slots_used(geometry: dict):
     if slots is None:
         return None
     return list(dict.fromkeys(slots))
+
+
+def scene_node_name(name: str) -> str:
+    """A node's name as O3DE's scene graph holds it. A dot separates the
+    parts of a node path there, so the importer turns every dot of a name
+    into an underscore (``RenamedNodesMap::SanitizeNodeName``): Blender's
+    ``leaf.002`` is the node ``leaf_002``. Named by its own spelling, such a
+    node is not found and its model comes out empty.
+
+    The importer also numbers a name that repeats under one parent; that is
+    not followed here."""
+    return name.replace(".", "_")
 
 
 def mesh_node_names(facts: dict) -> List[str]:

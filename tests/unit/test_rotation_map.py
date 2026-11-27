@@ -162,9 +162,11 @@ def test_a_compound_unity_rotation_arrives_whole():
 def test_directional_light_leaves_the_transform_alone():
     from platforms.unity.components.light import LightComponentProcessor
     rotate = [12.0, -34.0, 56.0]
-    entity = {"Components": {"TransformComponent": {"Transform Data": {"Rotate": list(rotate)}}}}
+    entity = {"Id": "Entity_[1]",
+              "Components": {"TransformComponent": {"Transform Data": {"Rotate": list(rotate)}}}}
     context = SimpleNamespace(generate_component_id=lambda: 1, log=lambda line: None, stats={})
-    LightComponentProcessor()._emit_directional({"intensity": 1.0, "shadows": True}, entity, None, context)
+    sun = SimpleNamespace(component_data={})
+    LightComponentProcessor()._emit_directional({"intensity": 1.0, "shadows": True}, entity, sun, context)
     assert entity["Components"]["TransformComponent"]["Transform Data"]["Rotate"] == rotate
     assert "AZ::Render::EditorDirectionalLightComponent" in entity["Components"]
 

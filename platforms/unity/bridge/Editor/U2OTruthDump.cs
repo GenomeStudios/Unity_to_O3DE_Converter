@@ -266,7 +266,7 @@ namespace U2OTruth
         // State of one run.
         static Request s_request;
         static Done s_done;
-        static Dictionary<string, Mesh> s_meshes;
+        static Dictionary<string, MeshRecord> s_meshes;
 
         // ---------------------------------------------------------------------
         // ENTRY POINT
@@ -276,7 +276,7 @@ namespace U2OTruth
         {
             var watch = System.Diagnostics.Stopwatch.StartNew();
             s_done = new Done();
-            s_meshes = new Dictionary<string, Mesh>();
+            s_meshes = new Dictionary<string, MeshRecord>();
             s_request = null;
 
             try
@@ -423,7 +423,7 @@ namespace U2OTruth
             s_done.scenes = catalog.scenes.Count;
             Log("scenes written: " + s_done.scenes);
 
-            WriteMeshes();
+            WriteMeshIndex();
             catalog.meshes = s_done.meshes;
             File.WriteAllText(Path.Combine(s_request.outDir, "truth.json"), JsonUtility.ToJson(catalog, true));
         }
@@ -832,7 +832,9 @@ namespace U2OTruth
 
         // ---------------------------------------------------------------------
         // MESHES
-        // Each mesh is written once, whatever number of objects use it.
+        // Each mesh is written once, whatever number of objects use it, and
+        // when it is first met: a mesh that lives in a scene is destroyed
+        // when the scene is left.
         // ---------------------------------------------------------------------
 
         static AssetRef RegisterMesh(Mesh mesh)
@@ -841,23 +843,22 @@ namespace U2OTruth
             string key = reference.guid + "_" + reference.fileId;
             if (!s_meshes.ContainsKey(key))
             {
-                s_meshes[key] = mesh;
+                string directory = Path.Combine(s_request.outDir, "meshes");
+                Directory.CreateDirectory(directory);
+                s_meshes[key] = WriteMesh(key, mesh, directory);
             }
             return reference;
         }
 
-        static void WriteMeshes()
+        static void WriteMeshIndex()
         {
-            string directory = Path.Combine(s_request.outDir, "meshes");
-            Directory.CreateDirectory(directory);
-
             var keys = new List<string>(s_meshes.Keys);
             keys.Sort(StringComparer.Ordinal);
 
             var index = new MeshIndex();
             foreach (string key in keys)
             {
-                index.meshes.Add(WriteMesh(key, s_meshes[key], directory));
+                index.meshes.Add(s_meshes[key]);
             }
             s_done.meshes = index.meshes.Count;
             File.WriteAllText(Path.Combine(s_request.outDir, "meshes.json"), JsonUtility.ToJson(index, true));

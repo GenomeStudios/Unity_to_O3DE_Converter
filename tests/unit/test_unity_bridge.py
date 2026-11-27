@@ -302,6 +302,37 @@ def test_changed_file_misses_the_cache():
         assert second.status == "ok" and second.dump_dir != first.dump_dir
 
 
+def test_files_unity_changed_during_the_dump_are_named():
+    """Unity upgrades what an older version saved and writes it back (two
+    materials of the Alchemist House pack, on the first dump). The result
+    names such files, and the dump is found again without a second start."""
+    with tempfile.TemporaryDirectory() as tmp:
+        plays_unity = _fake_unity()
+
+        def launcher(argv, project_root, timeout_s):
+            (Path(project_root) / "Assets" / "Pack" / "Chair.prefab").write_text("upgraded by Unity", encoding="utf-8")
+            return plays_unity(argv, project_root, timeout_s)
+
+        lines = []
+        scope = _make_project(Path(tmp))
+        search_root = _make_editor(Path(tmp))
+        request = TruthRequest(scope_root=scope, out_base=Path(tmp) / "out")
+        with _Patched(editor_search_roots=lambda: [search_root], EDITOR_ENV_VAR="U2O_TEST_NO_SUCH_VARIABLE"):
+            first = bridge.run_truth_dump(request, log=lines.append, launcher=launcher)
+            second = bridge.run_truth_dump(request, log=lines.append, launcher=launcher)
+
+        assert first.status == "ok" and first.changed_files == ["Assets/Pack/Chair.prefab"]
+        assert any("Unity changed 1 file(s)" in line for line in lines)
+        assert first.dump_dir.is_dir() and first.dump_dir.name == first.fingerprint[:16]
+        assert second.status == "cached" and second.dump_dir == first.dump_dir
+        assert len(plays_unity.calls) == 1, "the dump is filed under the project as Unity left it"
+
+
+def test_a_dump_that_changes_nothing_names_nothing():
+    with tempfile.TemporaryDirectory() as tmp:
+        assert _run(Path(tmp), _fake_unity()).changed_files == []
+
+
 def test_failed_unity_start_names_the_reason():
     with tempfile.TemporaryDirectory() as tmp:
         log_text = "Assets/Other/Broken.cs(4,1): error CS1002: ; expected\nScripts have compiler errors.\n"

@@ -42,6 +42,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import yaml
 
 from platforms.unity.model_import import instance_object_id
+from platforms.unity.scale_carry import carry_scales_down
 from platforms.unity.types import GameObject, Transform
 
 
@@ -115,6 +116,8 @@ def parse_unity_prefab(ctx: UnityParseContext,
     # the only place its data is retained.
     component_owner: Dict[str, str] = {}
     lod_groups: Dict[str, List[List[str]]] = {}
+    # {component file id: its place in its object's m_Component list}.
+    component_rank: Dict[str, int] = {}
 
     with open(prefab_path, 'r', encoding='utf-8') as f:
         content = f.read()
@@ -134,6 +137,7 @@ def parse_unity_prefab(ctx: UnityParseContext,
                 parse_transform(ctx, doc['Transform'], anchor,
                                 game_objects, transform_to_gameobject)
             elif 'GameObject' in doc:
+                component_rank.update(component_ranks(doc['GameObject']))
                 parse_game_object(ctx, doc['GameObject'], anchor,
                                   game_objects, transform_to_gameobject)
             elif 'PrefabInstance' in doc:
@@ -177,15 +181,51 @@ def parse_unity_prefab(ctx: UnityParseContext,
         except yaml.YAMLError:
             continue
 
-    # Build hierarchy and assign components.
-    build_hierarchy(ctx, game_objects, transform_to_gameobject, components_data)
+    # Build hierarchy and assign components, each object's in Unity's order.
+    build_hierarchy(ctx, game_objects, transform_to_gameobject,
+                    in_unity_order(components_data, component_rank))
 
     # Collapse Unity LODGroups so only the kept level survives into emission.
     if ctx.strip_lods and lod_groups:
         strip_lod_groups(ctx, game_objects, lod_groups, component_owner,
                          keep_level=ctx.lod_keep_level)
 
+    # A scale that differs by axis reaches nothing below its entity in O3DE:
+    # it is carried down to the objects below here (`scale_carry`).
+    carry_scales_down(game_objects, getattr(ctx.coverage, "warn", None))
+
     return game_objects, transform_to_gameobject
+
+
+# ---------------------------------------------------------------------------
+# The order of an object's components
+# ---------------------------------------------------------------------------
+
+def component_ranks(go_data: Dict) -> Dict[str, int]:
+    """``{component file id: its place}`` in a GameObject's ``m_Component``
+    list: the order Unity shows an object's components in, and hands them
+    out in. An entry is ``component: {fileID}``, or in files older than
+    Unity 5.5 ``<class id>: {fileID}``."""
+    ranks: Dict[str, int] = {}
+    for place, entry in enumerate(go_data.get('m_Component') or []):
+        reference = next(iter(entry.values()), None) if isinstance(entry, dict) else None
+        if isinstance(reference, dict) and reference.get('fileID'):
+            ranks[str(reference['fileID'])] = place
+    return ranks
+
+
+def in_unity_order(components_data: Dict, ranks: Dict[str, int]) -> Dict:
+    """The parsed components, each object's in the order of its
+    ``m_Component`` list.
+
+    A file stores its documents in no order that means anything; Unity goes
+    by the list. So the first collider of an object is the one Unity calls
+    its first, and that decides which collider sits on the object's own
+    entity and which get entities of their own. A component no list names
+    (one added to an object of a nested prefab) keeps its place in the
+    file, after the listed ones."""
+    unlisted = len(ranks)
+    return dict(sorted(components_data.items(), key=lambda item: ranks.get(item[0], unlisted)))
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +320,7 @@ def parse_game_object(ctx: UnityParseContext,
             name=name,
             transform=Transform(),
         )
+    game_objects[file_id].is_active = str(go_data.get('m_IsActive', 1)) != '0'
 
 
 def parse_prefab_instance_in_prefab(ctx: UnityParseContext,
@@ -434,6 +475,25 @@ def targets_root(mod: Dict, root_target: Optional[str]) -> bool:
     return root_target is None or str((mod.get('target') or {}).get('fileID', '')) == root_target
 
 
+def lost_root(modifications: List[Dict], sidecar: Optional[Dict], prefab_guid: Optional[str]) -> bool:
+    """Whether a placement's overrides name, as its root, a transform its
+    prefab does not have: the prefab was rebuilt after the placement was
+    saved. Unity drops an override that names nothing, so such a placement
+    stands where the prefab's own root stands, not where its overrides say.
+
+    ``sidecar`` is the prefab's entity map, whose ``transform_owners`` lists
+    the prefab's transforms. Only a root named with the prefab's own guid is
+    judged: an object the prefab takes from another file (a model, a nested
+    prefab) is named by that file's guid and its id there."""
+    root = root_override_target(modifications)
+    known = (sidecar or {}).get("transform_owners") or {}
+    if root is None or not known or root in known:
+        return False
+    guids = {str((mod.get('target') or {}).get('guid', '')) for mod in modifications
+             if str((mod.get('target') or {}).get('fileID', '')) == root}
+    return bool(prefab_guid) and guids == {prefab_guid}
+
+
 def nested_prefabs_first(prefab_files: List[Path], guid_of: Callable[[Path], Optional[str]]) -> List[Path]:
     """The same prefab files, ordered so that a prefab comes after the ones
     it nests. A prefab that nests another needs the nested one's entity map
@@ -519,6 +579,8 @@ def add_model_instance(log: Callable[[str], None],
 
         if source.game_object_id:
             by_source_id[source.game_object_id] = go
+        if source.renderer_id:
+            by_source_id[source.renderer_id] = go     # an override of its materials names the renderer
         if source.transform_id:
             by_source_id[source.transform_id] = go
             transform_map[instance_object_id(anchor, source.transform_id)] = file_id
@@ -622,6 +684,7 @@ def build_hierarchy(ctx: UnityParseContext,
             continue
 
         go = game_objects[go_id]
+        go.component_ids[comp_type] = str(_comp_id)
 
         processor = ctx.component_dispatch.get(comp_type)
         if processor:

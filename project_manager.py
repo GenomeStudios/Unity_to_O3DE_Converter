@@ -301,6 +301,15 @@ DEFAULT_SHADER_PROFILE = {
         "_RockAlbedo":       {"slot": "baseColor",  "transform": "passthrough"},
         "_RockNormal":       {"slot": "normal",     "transform": "passthrough"},
         "_RockSpecular":     {"slot": "specular",   "transform": "passthrough"},
+        # The first layer of a layered shader, by the names packs give it
+        # (NatureManufacture: a trunk under bark, a top over a bottom). Read
+        # only where the shader declares them; a packed mask map is read by
+        # the shader's own label for it, not from here.
+        "_TrunkBaseColorMap":  {"slot": "baseColor", "transform": "passthrough"},
+        "_TopAlbedo":          {"slot": "baseColor", "transform": "passthrough"},
+        "_BaseNormalMap":      {"slot": "normal",    "transform": "passthrough"},
+        "_TrunkNormalMap":     {"slot": "normal",    "transform": "passthrough"},
+        "_TopNormal":          {"slot": "normal",    "transform": "passthrough"},
         # emissive
         "_EmissionMap":      {"slot": "emissive",   "transform": "passthrough"},
         "_EmissionTex":      {"slot": "emissive",   "transform": "passthrough"},
@@ -333,6 +342,12 @@ DEFAULT_SHADER_PROFILE = {
         "_BumpScale":         {"target": "normal.factor",           "transform": "passthrough"},
         "_OcclusionStrength": {"target": "occlusion.specularFactor", "transform": "passthrough"},
         "_EmissionColor":     {"target": "emissive.color",          "transform": "passthrough"},
+        # A layered shader's first layer (see texture_map).
+        "_NormalScale":        {"target": "normal.factor",           "transform": "passthrough"},
+        "_BaseNormalScale":    {"target": "normal.factor",           "transform": "passthrough"},
+        "_TrunkNormalScale":   {"target": "normal.factor",           "transform": "passthrough"},
+        "_TrunkBaseColor":     {"target": "baseColor.color",         "transform": "passthrough"},
+        "_HealthyColor":       {"target": "baseColor.color",         "transform": "passthrough"},
     },
     "special_rules": {
         # When True, _MetallicGlossMap's alpha channel is inverted and routed
@@ -353,6 +368,20 @@ def _default_stages() -> dict:
             # Unity LOD child as its own entity renders them all at once. On by
             # default — toggled from the Prefab Processor tab.
             "strip_lods":       True,
+            # Where a spot light is written. An O3DE spot shines along its
+            # entity's +Z, a quarter turn from where the converted Unity
+            # object points it. "turn_entity": the object's own entity is
+            # turned when it holds only the light, and no second entity is
+            # made; "child_entity": every spot goes on a child entity and
+            # every object keeps Unity's transform.
+            "spot_light_placement": "turn_entity",
+            # Keep the source's folders in the output: every converted asset
+            # goes where its source lies below the source root, and a level
+            # below its scene's folders. Off: one folder per kind of asset
+            # (Prefabs, Materials, Textures, Meshes), where two source files
+            # of one name land on one output file. A distributor's folder
+            # that holds several packs needs it on.
+            "mirror_source_folders": False,
         },
         "scene_converter": {
             "source_path":     "",   # F-2 override (walking root for scene scrubbing)

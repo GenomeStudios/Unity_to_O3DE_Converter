@@ -18,7 +18,9 @@ The converter holds on a pack it was not shaped on, and converts what a scene ho
 
 For: the person. The reports of the two beds are the evidence.
 
-Out of scope: how materials shade (the pack's shader graph, 19 materials); baked lighting, reflection probes, light probes, audio, cameras, animation; terrain; a third pack; the GUI.
+Plan change, 2026-11-26: the person walked `OfficePack_Example` and `GentlemensClubScene` in the Editor and asked for what they saw to be put right - lights, material overrides, glass, smoothness, cutout textures, collider drawing, the podiums - and for each attribute of a Unity material to get a rendition in O3DE even where it cannot be exact. So how a Lit material shades is in scope (stages I.5 to I.7 and the Material mapping section).
+
+Out of scope: the pack's own shader-graph additions (a tint mask); baked lighting, reflection probes, light probes, audio, cameras, animation; terrain; a third pack; the GUI.
 
 ## Design
 - Two test beds side by side in the one O3DE project `D:/OffLocalDev/xxxxxDelete/ConverterTest`: the Office bed as it is, the Tirgames bed with its own output folder (`Assets/TirgamesPack`), measurement level (`Bench_Parity_Tirgames`) and run folder.
@@ -49,11 +51,36 @@ Out of scope: how materials shade (the pack's shader graph, 19 materials); baked
   - On a mesh of four vertices the noise left after the fit does not show it: the fit takes a shift that all vertices share. So the allowance of `mem:parity_fixes/plan` D.13 is the larger of that noise and one step on all three axes. Only High is measured; other settings get no allowance.
 - D.14 The report's lighting row reads Unity's one-colour ambient mode as one colour: the sky colour counts for all three, as the converter writes it.
 - D.15 The report measures a placed prefab at the prefab's own root entity, not at its container. Unity's instance root is both; in O3DE a placement's non-uniform scale can only sit on the root entity, so a container never shows it.
+- D.16 The person may have their hand-tuned files overwritten (said on 2026-11-26: "they were not necessarily measurably working"): two materials, two texture settings and two saved levels in the converted output. Copies are in `user/Parity/hand_tuned_2026-11-26/` of the test project. Everything in the converted output is the converter's; no asset is adjusted by hand to reach parity.
+- D.17 Lights.
+  - An O3DE spot light shines along its entity's +Z (`SimpleSpotLightFeatureProcessor`: `transform.GetBasisZ()`); the converted Unity object points its light along +Y. A spot is written on a child entity turned -90 degrees about X, so the object's own entity keeps Unity's transform for whatever else it carries. Directional lights shine along +Y and need nothing.
+  - Unity's Range ends the light. Every light is written with `AttenuationRadiusMode` Explicit (0) and that range; left at Automatic the engine works a radius out from the intensity.
+- D.18 A collision mesh is written with its debug drawing off, like the shape colliders.
+- D.19 A material override on a placed prefab reaches its renderer. Unity names the MeshRenderer; the entity map knew objects only, so every such override was skipped (1123 in the club level). The map now holds each renderer's object; the patch adds the slot's entry whole under the model's label for it, and slot 0 also as the entity's default slot. A material that only overrides use (the club's red carpet) is in no prefab: the scene stage converts it when it meets it.
+- D.20 An object Unity has switched off does not show (found while checking the levels; not on the person's list). Unity hides an inactive object and everything below it; the converter ignored `m_IsActive`, so 140 switched-off instances stood in the club level and 22 in the Office example. An entity is written `IsRuntimeActive: false` with its Editor visibility off, for the object and everything below it (the runtime does not pass inactivity down). An instance's `m_IsActive` override is patched onto the entities of the nested prefab, by the entity map's parents.
+- D.21 Opacity, from the engine's shaders (`AlphaInput.azsli`, `AlphaUtils.azsli`): alpha is the base colour texture's alpha times `opacity.factor`; a cutout discards where that alpha is below `1 - factor`.
+  - A transparent surface blends, with the base colour's alpha as factor (the texture's alpha is then the same as Unity's) and its highlights unfaded unless Unity's "Preserve Specular Lighting" is off.
+  - An alpha clip at a threshold of zero clips nothing: the Office pack's Glass is such a surface, and was written as a cutout.
+  - A cutout's factor is one minus Unity's threshold (it was the threshold itself: right at 0.5 only).
+- D.22 A colour texture whose alpha is the material's opacity gets its own texture settings beside it: the preset `Decal_AlbedoWithOpacity` at full resolution, as the person found by hand for the Office plant. Without it the image builder treats the file as plain colour and a cutout shows flat distorted planes. The converter writes the sidecar, replacing one that is there.
+- D.23 O3DE reads roughness, metallic and occlusion each from the red channel of the texture bound to it. Unity's mask map holds metallic in red, occlusion in green and smoothness in alpha.
+  - Roughness: the converter's baked texture kept `1 - smoothness` in the alpha channel, so the engine read the metallic channel as roughness. That is why the toilet mirror did not reflect and its fingerprints were gone. It is now a grey image of `1 - alpha`.
+  - Occlusion: bound the mask map itself (red: metallic) to specular occlusion only. It is now a grey image of the green channel on both the diffuse and the specular occlusion, with Unity's strength on both.
+- D.24 Emission. A Unity material glows when `_EMISSION` is set. Written as `emissive.enable`, a colour within one and `emissive.intensity` = 3 + log2(brightness), the engine giving off colour * 2^(intensity - 3) nits. Unity's numbers are taken as O3DE's, as the lights' intensities already are, so a Unity emission of one is one nit. That scale is an assumption; the person judges it (T.9). 47 materials of the Tirgames pack and 5 of the Office pack glow; none did.
+- D.25 The base map's tiling and offset become the material's `uv.tileU/tileV/offsetU/offsetV` (five materials in the two packs). Which way a V offset runs is not checked.
+- D.26 A geometric scaling that differs by axis is carried by the entity (closes the carried part of D.10). The rule's rotation maps axes onto axes for the quarter turns exporters write, so the node's scaling equals a scale along the model's axes; the entity's non-uniform scale holds it on top of the object's own. The rule's translation is written divided by it, a box collider on the same entity too; a capsule or sphere goes to its own entity (D.12); what hangs below is not stretched, since a non-uniform scale is not passed down. The report takes the stretch out of the transform row and measures it in the mesh row.
+- D.27 Where a spot light sits is an option of the asset stage, `spot_light_placement` (the person, 2026-11-26: a child entity for every spot doubles the entities, and turning the entity is inconsequential where the light has an entity to itself). Replaces the first half of D.17.
+  - `turn_entity`, the default: an object that holds only the light (no mesh, collider, body or child, and no scale that differs by axis) has its own entity turned the quarter about X, and no second entity is made. Any other spot goes on a child entity as before.
+  - `child_entity`: every spot on a child entity; every object keeps Unity's transform.
+  - The turn is made by the writer before the entity's rotation is written (`prefab_writer.with_light_turn`), noted on the object, and read by the light processor and the trace; the report takes it out of the transform row (`own_transform`), as it does a mesh's stretch.
+- D.28 A Unity point light is an O3DE simple point light. It was written as a sphere light, which needs a sphere shape beside it; the Editor draws that shape over the light's range (the person, on `LightCeilingRetro02On`). Unity's point light has no size.
+- D.29 A placed prefab's overrides of a light inside it are carried: range, intensity, colour (written whole, the channels not overridden kept from the light), spot angles (halved), shadows. The entity map holds, per Unity Light, the entity and component the light was written on and its colour (`light_owners`). Bounce intensity and lightmapping belong to baked lighting and are reported as not carried. The club level holds 13 intensity, 10 range, 9 shadow and 2 colour overrides; none was placed before.
+- D.30 Tiling and offset, corrected (replaces D.25). O3DE's transform scales about `uv.center`, by default the middle of the image (`AZ::Render::CreateUvTransformMatrix`), and its V runs down the image (`AssImpUvMapImporter` stores `1 - v`). Unity's tiling is about the origin with V up. The material is written with the centre at the origin and the V offset `1 - tileV - offsetV`, kept within one image. D.25 passed tiling and offset through as they were, which picked another cell of an atlas: `DoorFrameLight04` (tiling 0.25, offset 0 and 0.75: the top left cell of a 4 by 4 atlas) showed off-white blocks.
 
 ## Q - Open questions
 - Q.1 (answered, the Baseline section) What does the baseline of the new pack show: which clusters, and which of them are new kinds - blocks I.3.
 - Q.5 Placed prefabs with a negative scale (43 in the club level: mirrored walls, bars, sofas, steps). The converter gives their root entity a non-uniform scale with the negative axis, and the Editor holds it: their transform rows pass. Whether the engine draws and collides a negative non-uniform scale right is not measured (the probe reads transforms, not pictures). The person said on 2026-11-25 that inverse scale needs Transform 2. To settle: the person looks at one mirrored piece in the level (T.6), and if it is wrong, how a mirrored instance is to be written for Transform 2 - blocks I.4.
-- Q.6 Two materials of the pack's shader graph are not emitted (`LightEmission01`, `CommonLight01`): is the material missing or only not assigned - blocks I.3.
+- Q.6 (answered) Two renderers lack one material each (`LightEmission01`, `CommonLight01`). The model file holds two different materials under one name (`Material #35` twice); O3DE names a model's material slots by name, so the two parts share one slot and one material. Carried: whether the engine tells such slots apart by another id is not looked into.
 - Q.2 (answered, D.10) Does the engine's scene pipeline bring a file's unit to metres under an advanced coordinate rule, and how does Unity's importer `globalScale` reach the model - blocks I.3 (the baseline answers it).
 - Q.3 (answered, D.8) A scene has no asset stage of its own: by which path do a scene object's mesh and materials get copied, grouped and named - blocks I.2.
 - Q.4 (answered, D.9) Which of the five things `OfficePack_Example` misses is the unnamed one - blocks I.2.
@@ -79,9 +106,23 @@ Out of scope: how materials shade (the pack's shader graph, 19 materials); baked
   - [x] I.3c Capsules and spheres on entities of their own (D.12). Ran: 12 unit tests.
   - [x] I.3d Harness: the compression step (D.13), the one-colour ambient mode (D.14), placements at their root entity (D.15). Ran: 4 unit tests.
   - [x] I.3g Cycle with I.3a to I.3d. Ran: prefabs 250 of 263, the level cooks (failed jobs 1 -> 0), `GentlemensClubScene` 2021 of 2033 rows; against the baseline 154 elements fixed, 0 regressions, 40 of 44 clusters closed.
-  - [ ] I.3e A geometric scaling that differs by axis (D.10, carried part).
-  - [ ] I.3f The two materials of Q.6.
+  - [x] I.3e A geometric scaling that differs by axis, on the entity (D.26). Ran: 8 unit tests; cycle, meshes 328 -> 344 of 344, colliders 317 -> 322 of 323, prefabs 250 -> 260 of 263.
+  - [x] I.3f The two materials of Q.6: carried with their reason.
 - [ ] I.4 The formed levels - Done when: every row of `GentlemensClubScene` and of `OfficePack_Example` passes or is carried with a reason, and the person has walked both.
+- [ ] I.5 Lights (ran) - Done when: a spot light shines where Unity's does, and lights end at Unity's range.
+  - [x] I.5a Spot on a turned child entity; Explicit attenuation (D.17). Ran: 3 unit tests. Verified by the person, 2026-11-26: the lights match their orientation.
+  - [x] I.5b The placement option; the entity turned where the object holds only the light (D.27). Ran: 4 unit tests; cycle of the Tirgames bed: transforms 439 of 439, "no change".
+  - [x] I.5c A point light as a simple point (D.28). Ran: 1 unit test.
+- [ ] I.6 What a level changes on its prefabs (ran) - Done when: a placed prefab shows the materials the level gave it, and what the level switched off does not show.
+  - [x] I.6a Material overrides (D.19). Ran: 4 unit tests; conversion of the club level places 1123 of 1123 overrides (0 before), materials converted 131 -> 198. Verified by the person, 2026-11-26: material overrides and material imports work.
+  - [x] I.6d Light overrides (D.29). Ran: 5 unit tests.
+  - [x] I.6b Active state (D.20). Ran: 9 unit tests.
+  - [x] I.6c Collision meshes not drawn (D.18). Ran: 1 unit test.
+- [ ] I.7 Materials (ran) - Done when: each attribute of a Unity Lit material in the Material mapping table is carried or listed as not carried, and the person finds glass, mirror, plants and glowing parts rendered.
+  - [x] I.7a Opacity rules and texture settings (D.21, D.22). Ran: 8 unit tests.
+  - [x] I.7b Roughness and occlusion channels (D.23). Ran: 3 unit tests.
+  - [x] I.7c Emission, tiling (D.24, D.25). Ran: 4 unit tests.
+  - [x] I.7d Tiling about the origin with V running down (D.30). Ran: 3 unit tests.
 
 ## Baseline of the Tirgames bed (2026-11-25, before any change made for it)
 | | Baseline |
@@ -110,6 +151,28 @@ Suspects, with what became of them:
 
 State after the first session (2026-11-25): prefabs 250 pass, 12 fail, 1 unmeasured; transforms 439 pass; meshes 328 pass (93 within Unity's rounding), 16 fail; colliders 317 pass, 5 fail, 1 unmeasured; materials 342 pass, 2 fail; `GentlemensClubScene` 2021 of 2033 rows; failed jobs 0; clusters 4 (S.6 three times, S.8).
 
+## Material mapping (Unity URP Lit to O3DE StandardPBR)
+What the converter does with each attribute, after I.7. "Carried" is by construction from the engine's shader sources, not from a compared picture.
+
+| Unity | O3DE | State |
+|---|---|---|
+| `_BaseMap` colour, `_BaseColor` | `baseColor.textureMap`, `baseColor.color` | carried |
+| `_BaseMap` alpha, `_Surface`, `_AlphaClip`, `_Cutoff`, Preserve Specular | `opacity.mode`, `alphaSource`, `factor`, `alphaAffectsSpecular`; the texture's settings | carried (D.21, D.22) |
+| `_MetallicGlossMap` red, `_Metallic` | `metallic.textureMap`, `metallic.factor` | carried |
+| `_MetallicGlossMap` alpha times `_Smoothness` | `roughness.textureMap` (grey, 1 - alpha), `lowerBound` 1 - s, `upperBound` 1 | carried (D.23) |
+| `_Smoothness` without a map | `roughness.factor` = 1 - s | carried |
+| smoothness from the albedo's alpha (`_SmoothnessTextureChannel` 1) | - | not carried; no case in the two packs |
+| `_OcclusionMap` green, `_OcclusionStrength` | diffuse and specular occlusion texture and factor | carried (D.23) |
+| `_BumpMap`, `_BumpScale` | `normal.textureMap`, `normal.factor` | carried; the green channel's direction not checked |
+| `_EMISSION`, `_EmissionColor`, `_EmissionMap` | `emissive.enable`, `color`, `intensity`, `textureMap` | carried; the brightness scale is an assumption (D.24) |
+| base map tiling and offset | `uv.center` at the origin, `uv.tileU`, `tileV`, `offsetU`, `offsetV` (V turned) | carried (D.30) |
+| `_Cull` (two-sided) | `opacity.doubleSided` | not carried; every material of the two packs culls its back |
+| `_SpecularHighlights`, `_EnvironmentReflections`, `_ReceiveShadows` | - | not carried |
+| specular workflow (`_SpecGlossMap`, `_SpecColor`) | `specularF0` | the texture is bound; the workflow is not worked through |
+| `_ParallaxMap`, `_Parallax` | `parallax` | the texture is bound; its depth is not |
+| detail maps and mask | - | not carried |
+| baked lightmaps, light and reflection probes | - | not converted (out of scope) |
+
 ## T - Proofs
 | ID | Proof | Stage |
 |---|---|---|
@@ -120,6 +183,9 @@ State after the first session (2026-11-25): prefabs 250 pass, 12 fail, 1 unmeasu
 | T.5 | Cycle of the Tirgames bed: clusters closed or listed; cycle of the Office bed: no regression | I.3 |
 | T.6 | The person opens `Showcase` (the floor is there), `OfficePack_Example` (the elevator doors stand) and `GentlemensClubScene` in the Editor | I.2, I.4 |
 | T.7 | The person reads the Tirgames report against its baseline and accepts what is carried | P |
+| T.8 | Unit tests for I.5 to I.7 and I.3e; cycles of both beds with no regression | I.5, I.6, I.7 |
+| T.10 | The person opens `GentlemensClubScene` again: `LightCeilingRetro02On` is a simple point light with the level's range of 6 and intensity of 1; `DoorFrameLight04` shows one flat cell of its atlas; a lamp that holds only a spot is one entity | I.5, I.6, I.7 |
+| T.9 | The person walks `OfficePack_Example` and `GentlemensClubScene` again: spot lights point as in Unity; floors carry their overridden materials (the blue carpets, the red carpet); nothing stands that Unity has switched off; glass blends, the toilet mirror reflects with its smudges, plants are cut out; lamps and signs glow; the podiums have Unity's size with their colliders on them; no collision mesh is drawn | I.5, I.6, I.7, I.3 |
 
 ## Project
 - Rules read: `AGENTICS_GUIDELINES.md`, `tests/README.md`, `parity/README.md`, the memories named at the top, the global CLAUDE.md. No CLAUDE.md or AGENTS.md in the repo.

@@ -8,6 +8,11 @@ terrain (``New Terrain2.asset`` from the Alien Fantasy Forest pack):
        to the real Ground_Fantasy_* PNGs
   T-3  the heightmap grid and embedded splatmaps decode
 
+The sample has since been opened by Unity 6, which upgraded it: its layers
+are TerrainLayer assets of their own now, in ``Assets/_TerrainAutoUpgrade``
+(nature_pack I.7). The same proofs hold for that form; the layer file itself
+is read in ``test_a_terrain_layer_file_gives_its_textures_and_tiling``.
+
 The sample lives outside the repo. Set ``U2O_TERRAIN_SAMPLE`` to override the
 path. If UnityPy or the sample is unavailable, the tests print SKIP and pass so
 the suite stays green on machines without the testbed."""
@@ -98,6 +103,29 @@ def test_layer_tiling_populated():
     for layer in terrain.layers:
         assert layer.tile_size_x > 0 and layer.tile_size_y > 0, \
             f"layer {layer.index} has non-positive tiling"
+
+
+def test_a_terrain_layer_file_gives_its_textures_and_tiling():
+    """A ``.terrainlayer`` file as Unity writes it (text form)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as folder:
+        layer_file = Path(folder) / "Moss.terrainlayer"
+        layer_file.write_text(
+            "%YAML 1.1\n--- !u!1953259897 &8574412962073106934\nTerrainLayer:\n"
+            "  m_DiffuseTexture: {fileID: 2800000, guid: 3a5e0e19344fad04394c7143d31abca0, type: 3}\n"
+            "  m_NormalMapTexture: {fileID: 2800000, guid: 0a6dd76ba7641f646b51f77e3e78f040, type: 3}\n"
+            "  m_MaskMapTexture: {fileID: 0}\n  m_TileSize: {x: 7, y: 5}\n  m_TileOffset: {x: 0.5, y: 0}\n"
+            "  m_Metallic: 0.25\n  m_Smoothness: 0.5\n", encoding="utf-8")
+        layer = td.read_terrain_layer(3, layer_file)
+    assert (layer.index, layer.albedo_guid, layer.normal_guid) == (
+        3, "3a5e0e19344fad04394c7143d31abca0", "0a6dd76ba7641f646b51f77e3e78f040")
+    assert (layer.tile_size_x, layer.tile_size_y, layer.tile_offset_x, layer.tile_offset_y) == (7.0, 5.0, 0.5, 0.0)
+    assert (layer.metallic, layer.smoothness) == (0.25, 0.5)
+
+
+def test_a_missing_terrain_layer_file_gives_a_layer_without_textures():
+    layer = td.read_terrain_layer(0, None)
+    assert layer.albedo_guid is None and layer.normal_guid is None and layer.tile_size_x == 1.0
 
 
 # ── T-3: heightmap + alphamaps ───────────────────────────────────────────────

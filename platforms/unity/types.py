@@ -92,6 +92,13 @@ class GameObject:
     prefab_source_guid:  Optional[str] = None
     prefab_name:         Optional[str] = None
     component_data:      Dict[str, Any] = field(default_factory=dict)
+    # Unity's m_IsActive. An object switched off does not show, and neither
+    # does anything below it.
+    is_active:           bool = True
+    # The file ids of the object's components, by component type
+    # ({"MeshRenderer": "2300000"}). An override on a component names the
+    # component, not the object that carries it.
+    component_ids:       Dict[str, str] = field(default_factory=dict)
 
     # =========================================================================
     # Prefab-instance override capture (populated only when is_prefab_instance=True)

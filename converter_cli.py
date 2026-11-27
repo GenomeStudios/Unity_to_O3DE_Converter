@@ -261,6 +261,8 @@ def _seeded_uuid4() -> uuid.UUID:
 
 
 def _run_stage_1(project, arguments, log: Callable, trace, run_asset_processor, _unused):
+    from stage_runner import asset_stage_options
+
     settings = project.stage_settings("asset_processor")
     source = project.effective_source("asset_processor")
     output = (settings.get("output_path") or "").strip()
@@ -283,6 +285,7 @@ def _run_stage_1(project, arguments, log: Callable, trace, run_asset_processor, 
         strip_lods=bool(settings.get("strip_lods", True)),
         convert_smoothness_to_roughness=global_config()["convert_smoothness_to_roughness"],
         log=log, trace=trace,
+        options=asset_stage_options(settings),
     )
 
 
@@ -296,13 +299,10 @@ def _run_stage_2(project, arguments, log: Callable, trace, _unused, run_scene_co
         raise Refused("scene_converter: no marked scene exists on disk.")
 
     # Converted prefabs are looked up where Stage 1 wrote them.
-    prefab_dirs = []
-    stage_1_output = (project.stage_settings("asset_processor").get("output_path") or "").strip()
-    if stage_1_output:
-        prefab_dirs.append(str(Path(stage_1_output) / "Prefabs"))
+    from stage_runner import asset_stage_arguments, converted_prefab_dirs
+    prefab_dirs = converted_prefab_dirs(project)
     prefab_dirs += [d for d in settings.get("prefab_dirs", []) if d and d not in prefab_dirs]
 
-    from stage_runner import asset_stage_arguments
     return run_scene_converter(
         scenes, output, prefab_dirs, project.outputs.get("asset_processor", {}), log, trace,
         asset_stage=asset_stage_arguments(project, global_config()["convert_smoothness_to_roughness"]))

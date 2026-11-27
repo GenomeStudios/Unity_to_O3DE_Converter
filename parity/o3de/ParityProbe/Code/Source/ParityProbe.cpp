@@ -33,6 +33,7 @@
 #include <AzCore/Console/IConsole.h>
 #include <AzCore/Interface/Interface.h>
 #include <AzCore/IO/SystemFile.h>
+#include <AzCore/Math/Crc.h>
 #include <AzCore/Math/Matrix3x4.h>
 #include <AzCore/Name/Name.h>
 #include <AzCore/std/containers/unordered_set.h>
@@ -144,10 +145,19 @@ namespace ParityProbe
         return Numbers(values, 12);
     }
 
+    // A file name for an asset hint. A hint is the asset's whole path, and a
+    // pack that keeps its own folder structure makes hints of 200 characters:
+    // written out in full the file's path passes the file system's limit and
+    // the file cannot be opened. So the name is a hash of the whole hint, which
+    // keeps it unique, followed by the hint's own end, which keeps it readable.
     static AZStd::string FileKey(AZStd::string_view text)
     {
-        AZStd::string key;
-        for (char character : text)
+        constexpr size_t MaxReadableLength = 64;
+        const AZStd::string_view readable =
+            text.size() > MaxReadableLength ? text.substr(text.size() - MaxReadableLength) : text;
+
+        AZStd::string key = AZStd::string::format("%08x_", static_cast<AZ::u32>(AZ::Crc32(text)));
+        for (char character : readable)
         {
             const bool keep = (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z')
                 || (character >= '0' && character <= '9') || character == '-' || character == '.';

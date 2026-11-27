@@ -11,6 +11,9 @@ from typing import Dict, List
 
 from .base import ComponentProcessor, ProcessingContext
 
+# The key the mesh processor writes its component under.
+MESH_COMPONENT = 'AZ::Render::EditorMeshComponent'
+
 
 class MaterialComponentProcessor(ComponentProcessor):
     """
@@ -60,6 +63,18 @@ class MaterialComponentProcessor(ComponentProcessor):
 
     def emit(self, go, entity: Dict, ctx: ProcessingContext) -> List[str]:
         if not go.material_guids:
+            return []
+
+        # A material component needs a mesh component beside it: the engine
+        # refuses to activate the entity otherwise ("EditorMaterialComponent
+        # is missing another required service"), and the whole prefab's job
+        # fails with it. An object whose model could not be emitted (a mesh
+        # the converter cannot read) therefore gets no materials either.
+        if MESH_COMPONENT not in entity['Components']:
+            ctx.log(
+                f"  [Material] ⚠ '{go.name}' shows no model — its "
+                f"{len(go.material_guids)} material(s) are not emitted."
+            )
             return []
 
         fbx_labels = ctx.fbx_material_labels.get(go.file_id, [])

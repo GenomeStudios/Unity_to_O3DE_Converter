@@ -34,7 +34,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
@@ -45,7 +45,8 @@ for path in (str(REPO_ROOT), str(HERE)):
 import converter_cli                      # noqa: E402
 import level_bake                         # noqa: E402
 import o3de_run                           # noqa: E402
-from records import latest_truth          # noqa: E402
+import stage_runner                       # noqa: E402
+from records import file_name_of, latest_truth   # noqa: E402
 
 EXIT_OK, EXIT_FAILED, EXIT_REFUSED = 0, 1, 2
 PROBE_GEM = HERE / "o3de" / "ParityProbe"
@@ -78,6 +79,9 @@ class Bed:
         self.work: Path = self.o3de_root / "user" / self.config.get("work", "Parity")
         self.level: str = self.config["level"]
         self.output: Path = Path(self.project.stage_settings("asset_processor")["output_path"])
+        # What Stage 1 runs with (source folder, options): the names of the
+        # converted levels follow from it.
+        self.asset_stage: dict = stage_runner.asset_stage_arguments(self.project, False) or {}
 
     # ----- Folders of the latest run of each step ------------------------------
     @property
@@ -91,21 +95,75 @@ class Bed:
     @property
     def report_dir(self) -> Path:    return self.work / "report"
 
-    def converted_prefabs(self) -> List[Path]:
-        return sorted((self.output / "Prefabs").glob("*.prefab"))
+    # ----- What the last convert run wrote --------------------------------------
+    def converted(self) -> Dict[str, str]:
+        """``{Unity prefab guid: Source string of its converted prefab}`` of
+        the last convert run, read from the bookkeeping the run left.
+
+        By guid, because two prefabs in different folders may share a name;
+        and as the string the converter writes where one prefab nests
+        another, because the engine wants one prefab named one way."""
+        from integrated_asset_processor import _project_relative_path
+
+        try:
+            run = json.loads((self.convert_dir / "project.u2oproj.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        records = (run.get("outputs_by_platform", {}).get("unity", {})
+                      .get("asset_processor", {}).get("prefabs", {}))
+        sources = {}
+        for record in records.values():
+            file = self.output / record.get("output_path", "")
+            if record.get("source_guid") and record.get("output_path") and file.is_file():
+                sources[record["source_guid"]] = _project_relative_path(file)
+        return sources
+
+    def level_name(self, scene_file: Path) -> str:
+        """The name of the level a marked scene is converted into."""
+        return stage_runner.level_name_for(Path(scene_file), self.asset_stage)
+
+    def level_path(self, scene_file: Path) -> str:
+        """A converted level as the Editor opens it: its path below the
+        project's ``Levels`` folder. A bed may keep its levels in a folder
+        of their own there (the scene stage's output folder)."""
+        output = Path(self.project.stage_settings("scene_converter").get("output_path") or "")
+        try:
+            folder = output.resolve().relative_to((self.o3de_root / "Levels").resolve()).as_posix()
+        except ValueError:
+            folder = "."
+        name = self.level_name(scene_file)
+        return name if folder == "." else f"{folder}/{name}"
+
+    def label(self, asset_path: str) -> str:
+        """What the report calls a prefab: its file's name. In a bed whose
+        output keeps the source's folders, where names repeat, its path
+        below the scope, as given by its Unity asset path."""
+        from integrated_asset_processor import MIRROR_OPTION
+
+        if not (self.asset_stage.get("options") or {}).get(MIRROR_OPTION):
+            return Path(asset_path).stem
+        scope = Path(self.asset_stage["source_path"]).as_posix().lower()
+        path = Path(asset_path).with_suffix("").as_posix()
+        # The asset path starts at the Unity project; the scope ends with it.
+        for cut in range(len(path)):
+            if path[cut:cut + 1] != "/" and cut:
+                continue
+            head = path[:cut] if cut else ""
+            if head and scope.endswith(head.lower()):
+                return path[cut + 1:]
+        return path
 
     def recipe(self) -> dict:
         """The recipe the measurement level must have for the current state."""
         truth = latest_truth(self.truth_base)
         if truth is None:
             raise Refused("There is no truth dump yet: run 'truth' first.")
-        prefabs = self.converted_prefabs()
-        if not prefabs:
+        sources = self.converted()
+        if not sources:
             raise Refused("There are no converted prefabs yet: run 'convert' first.")
-        radii = {Path(entry["assetPath"]).stem: truth.prefab_radius(truth.hierarchy(entry))
-                 for entry in truth.prefab_entries()}
-        return level_bake.make_recipe(self.o3de_root, prefabs, radii,
-                                      level_bake.nested_source_folder(prefabs))
+        radii = {sources[entry["guid"]]: truth.prefab_radius(truth.hierarchy(entry))
+                 for entry in truth.prefab_entries() if entry["guid"] in sources}
+        return level_bake.make_recipe(self.o3de_root, list(sources.values()), radii)
 
 
 def run_python(script: Path, *arguments: str) -> int:
@@ -166,7 +224,7 @@ def step_bake(bed: Bed, arguments) -> int:
         return EXIT_OK
     level_file = level_bake.bake_level(bed.o3de_root, bed.level, recipe)
     print(f"[bake] wrote {level_file} ({len(recipe['instances'])} instances, "
-          f"{recipe['spacing']:.0f} m apart, recipe {recipe['hash'][:12]})")
+          f"within {recipe['reach']:.0f} m of the origin, recipe {recipe['hash'][:12]})")
     return EXIT_OK
 
 
@@ -206,10 +264,10 @@ def step_probe(bed: Bed, arguments) -> int:
 
     # The levels the scene converter made, for the placement of their instances.
     for scene in converter_cli.marked_scenes(bed.project):
-        level = scene.stem
-        if not (bed.o3de_root / "Levels" / level / f"{level}.prefab").is_file():
+        level = bed.level_path(scene)
+        if not (bed.o3de_root / "Levels" / level / f"{scene.stem}.prefab").is_file():
             continue
-        scene_dir = run_dir / f"scene_{level}"
+        scene_dir = run_dir / f"scene_{file_name_of(level)}"
         # Of a converted level only its lighting is read back, not every component.
         result = o3de_run.editor_session(bed.o3de_root, scene_dir, {
             "level": level, "out": (scene_dir / "o3de").as_posix(),

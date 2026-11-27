@@ -8,6 +8,14 @@ Emits:    EditorBoxShapeComponent + EditorShapeColliderComponent
 Also exports _resolve_target() — a shared helper used by all collider
 processors to route components to the main entity (global_index == 0) or
 to an auto-generated child entity for overflow colliders (global_index > 0).
+
+A box and its object's scale by axis:
+  - the engine stretches a box with the scale by axis of the entity it sits
+    on, and passes none of that scale to an entity below. A box that gets
+    an entity of its own carries the object's scale itself.
+  - PhysX takes no box with a negative side, so a box cannot sit on a
+    mirrored entity: it gets an entity of its own, which carries the scale
+    without the mirror. The mirror goes into where the box's centre lies.
 =============================================================================
 """
 
@@ -54,12 +62,14 @@ def own_entity_placement(collider: Dict, unity_scale, stretched: bool) -> Tuple[
 
     The entity of its own follows the object's transform but not its
     non-uniform scale, so for a ``stretched`` object the scale is applied
-    here the way Unity applies it to a collider: the centre by each axis, a
+    here the way Unity applies it to a collider: the centre by each axis
+    (with its sign: a mirrored object has its collider on the other side), a
     capsule's height by the scale along it and its radius by the larger of
     the two across it, a sphere's radius by the largest of the three."""
-    sx, sy, sz = [abs(float(v)) for v in unity_scale] if stretched else (1.0, 1.0, 1.0)
-    cx, cy, cz = collider.get('center', (0.0, 0.0, 0.0))
-    transform_data: Dict = {'Translate': [cx * sx, cz * sz, cy * sy]}      # Unity (x, y, z) -> O3DE (x, z, y)
+    scale = [float(v) for v in unity_scale] if stretched else [1.0, 1.0, 1.0]
+    sx, sy, sz = (abs(v) for v in scale)
+    cx, cy, cz = (centre * factor for centre, factor in zip(collider.get('center', (0.0, 0.0, 0.0)), scale))
+    transform_data: Dict = {'Translate': [cx, cz, cy]}                     # Unity (x, y, z) -> O3DE (x, z, y)
     placed = dict(collider, center=(0.0, 0.0, 0.0))
 
     if collider.get('type') == 'CapsuleCollider':
@@ -76,6 +86,22 @@ def own_entity_placement(collider: Dict, unity_scale, stretched: bool) -> Tuple[
     elif collider.get('type') == 'SphereCollider':
         placed['radius'] = float(collider.get('radius', 0.5)) * max(sx, sy, sz)
     return transform_data, placed
+
+
+def object_scale(entity: Dict) -> Optional[List[float]]:
+    """The scale by axis the entity made of an object carries (O3DE's axes),
+    or None when it carries none."""
+    component = entity['Components'].get('EditorNonUniformScaleComponent')
+    return [float(value) for value in component['NonUniformScale']] if component else None
+
+
+def scale_component(scale, ctx: ProcessingContext) -> Dict:
+    """An ``EditorNonUniformScaleComponent`` holding ``scale`` (O3DE's axes)."""
+    return {
+        '$type':           'EditorNonUniformScaleComponent',
+        'Id':              ctx.generate_component_id(),
+        'NonUniformScale': [float(value) for value in scale],
+    }
 
 
 def _resolve_target(
@@ -200,14 +226,28 @@ class BoxColliderProcessor(ComponentProcessor):
         child_ids: List[str] = []
         for collider in my_colliders:
             global_idx = collider['global_index']
-            target_comps, child_id = _resolve_target(global_idx, go, entity, ctx)
+            # A box on a mirrored object gets an entity of its own (see the
+            # module's notes).
+            scale = object_scale(entity)
+            mirrored = scale is not None and min(scale) < 0.0
+            target_comps, child_id = _resolve_target(global_idx, go, entity, ctx, own_entity=mirrored)
             if child_id:
                 child_ids.append(child_id)
 
-            _write_box_shape(target_comps, collider, go, ctx)
+            # An entity of its own carries the object's scale by axis itself,
+            # without the mirror; the box's centre is mirrored instead.
+            flips = None
+            if child_id and scale:
+                flips = [-1.0 if value < 0.0 else 1.0 for value in scale]
+                sizes = [abs(value) for value in scale]
+                if any(abs(value - 1.0) > 1e-9 for value in sizes):
+                    target_comps['EditorNonUniformScaleComponent'] = scale_component(sizes, ctx)
+
+            _write_box_shape(target_comps, collider, go, ctx,
+                             on_object=(child_id is None or scale is not None), flips=flips)
             ctx.log(
                 f"  [Physics] ✓ BoxCollider [{global_idx}] → "
-                f"{'main entity' if global_idx == 0 else 'child entity'}"
+                f"{'main entity' if child_id is None else 'child entity'}"
             )
 
         ctx.stats["Colliders"] = ctx.stats.get("Colliders", 0) + len(my_colliders)
@@ -234,14 +274,32 @@ def box_dimensions(size) -> List[float]:
     return [max(abs(float(side)), MIN_BOX_SIDE) for side in size]
 
 def _write_box_shape(components: Dict, collider: Dict, go,
-                     ctx: ProcessingContext) -> None:
-    """Write EditorBoxShapeComponent + EditorShapeColliderComponent."""
+                     ctx: ProcessingContext, on_object: bool = True,
+                     flips: Optional[List[float]] = None) -> None:
+    """Write EditorBoxShapeComponent + EditorShapeColliderComponent.
+
+    ``on_object`` says the box sits on an entity that carries the object's
+    scale by axis: the object's own, or one that was given the same. When
+    that scale holds the mesh's stretch (``component_data["mesh_stretch"]``,
+    a scale that belongs to the model only), the engine stretches the box
+    with it; the box is written smaller by the same factors so it comes out
+    as Unity has it.
+
+    ``flips`` holds -1 for every axis (O3DE's) along which the object is
+    mirrored and the box's entity is not: the centre goes to the other side."""
     cx, cy, cz = collider.get('center', (0, 0, 0))
     offset     = [cx, cz, cy]           # Unity (x,y,z) → O3DE (x, z, y)
-    has_offset = any(abs(v) > 0.0001 for v in offset)
+    if flips:
+        offset = [value * flip for value, flip in zip(offset, flips)]
 
     sx, sy, sz = collider.get('size', (1, 1, 1))
     dims       = box_dimensions((sx, sz, sy))   # swap Y/Z axes
+
+    stretch = getattr(go, "component_data", {}).get("mesh_stretch") if on_object else None
+    if stretch:
+        offset = [value / factor for value, factor in zip(offset, stretch)]
+        dims   = [value / factor for value, factor in zip(dims, stretch)]
+    has_offset = any(abs(v) > 0.0001 for v in offset)
 
     box_cfg: Dict = {'IsFilled': False, 'Dimensions': dims}
     if has_offset:

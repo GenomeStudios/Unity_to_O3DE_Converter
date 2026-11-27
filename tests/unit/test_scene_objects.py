@@ -62,11 +62,12 @@ MeshRenderer:
 """
 
 
-def _instance(anchor: str, source_guid: str, name: str, scale: float = 0.0) -> str:
-    """A PrefabInstance at the top of a scene, renamed by the scene, and
-    scaled the same on all axes when ``scale`` is given."""
+def _instance(anchor: str, source_guid: str, name: str, scale: float = 0.0, parent: str = "0") -> str:
+    """A PrefabInstance at the top of a scene (or below the object whose
+    Transform is ``parent``), renamed by the scene, and scaled the same on
+    all axes when ``scale`` is given."""
     lines = [f"--- !u!1001 &{anchor}", "PrefabInstance:", "  m_Modification:",
-             "    m_TransformParent: {fileID: 0}", "    m_Modifications:"]
+             f"    m_TransformParent: {{fileID: {parent}}}", "    m_Modifications:"]
     overrides = [("100000", "m_Name", name), ("400000", "m_RootOrder", 0)]
     overrides += [("400000", f"m_LocalPosition.{axis}", value) for axis, value in zip("xyz", (1, 2, 3))]
     overrides += [("400000", f"m_LocalRotation.{axis}", value) for axis, value in zip("xyzw", (0, 0, 0, 1))]
@@ -177,6 +178,37 @@ def test_a_model_instanced_in_a_scene_becomes_entities_with_its_meshes():
         assert handle["Components"]["TransformComponent"]["Parent Entity"] == door["Id"]
         assert handle["Components"]["TransformComponent"]["Transform Data"]["Translate"] == [0.5, 0.0, 1.0]
         assert assets.asked_for == ["Front_door", "Handle"]
+
+
+GROUP = """--- !u!1 &200
+GameObject:
+  m_Component:
+  - component: {fileID: 500}
+  m_Name: Doors
+--- !u!4 &500
+Transform:
+  m_GameObject: {fileID: 200}
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 10, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_Children:
+  - {fileID: 81234567}
+  m_Father: {fileID: 0}
+"""
+
+
+def test_a_model_placed_below_another_object_of_the_scene_hangs_under_it():
+    """The meadow overview of the NatureManufacture pack groups its grass
+    models under an object. The group lists each placement by a transform
+    id of the scene's own, which names no object the converter knows; the
+    model's root names the group as its parent. Seventy such models were
+    never written."""
+    with tempfile.TemporaryDirectory() as folder:
+        level = _level(GROUP + _instance("7000", MODEL_GUID, "Front_door", parent="500"), _Assets(MODEL), Path(folder))
+        group, door = _named(level, "Doors"), _named(level, "Front_door")
+        assert door["Components"]["TransformComponent"]["Parent Entity"] == group["Id"]
+        assert door["Id"] in group["Components"]["EditorEntitySortComponent"]["Child Entity Order"]
+        assert _named(level, "Handle")["Components"]["TransformComponent"]["Parent Entity"] == door["Id"]
 
 
 # =============================================================================

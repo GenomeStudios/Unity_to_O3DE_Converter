@@ -77,6 +77,12 @@ def box_corners(center, size) -> np.ndarray:
     return center + signs * half
 
 
+def file_name_of(label: str) -> str:
+    """A level's name or a prefab's label as one file name without spaces
+    (the Editor splits its script's arguments at spaces)."""
+    return "".join(character if character.isalnum() or character in "-_." else "_" for character in label)
+
+
 def _load_json(path: Path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
@@ -211,6 +217,19 @@ class Trace:
         file_name = self.catalog["scenes"].get(name)
         return _load_json(self.folder / file_name) if file_name else None
 
-    def last_assetinfo(self, fbx_name: str) -> Optional[dict]:
-        """The write that is on disk for one FBX: the last one."""
-        return next((w for w in reversed(self.assetinfos) if w["fbx"] == fbx_name), None)
+    def assetinfo_writes(self, fbx_name: str, mesh_guid: str = "") -> List[dict]:
+        """Every write for one model file, oldest first. The file is known by
+        its guid, since two files in different folders may share a name; by
+        its name when the trace holds no guid for it (a built-in mesh)."""
+        by_guid = [w for w in self.assetinfos if mesh_guid and w.get("mesh_guid") == mesh_guid]
+        return by_guid or [w for w in self.assetinfos if w["fbx"] == fbx_name and not w.get("mesh_guid")] \
+            or ([] if mesh_guid else [w for w in self.assetinfos if w["fbx"] == fbx_name])
+
+    def last_assetinfo(self, fbx_name: str, mesh_guid: str = "") -> Optional[dict]:
+        """The write that is on disk for one model file: the last one."""
+        writes = self.assetinfo_writes(fbx_name, mesh_guid)
+        return writes[-1] if writes else None
+
+    def facts_of(self, fbx_name: str, mesh_guid: str = "") -> dict:
+        """What the trace read from one model file."""
+        return self.fbx_facts.get(mesh_guid) or self.fbx_facts.get(fbx_name) or {}

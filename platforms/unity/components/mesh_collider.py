@@ -15,7 +15,7 @@ Resolution order for the .pxmesh asset hint:
 from typing import Callable, Dict, List
 
 from .base import ComponentProcessor, ProcessingContext
-from .box_collider import _resolve_target, _apply_collision_config
+from .box_collider import _resolve_target, _apply_collision_config, object_scale, scale_component
 
 
 class MeshColliderProcessor(ComponentProcessor):
@@ -75,6 +75,11 @@ class MeshColliderProcessor(ComponentProcessor):
             target_comps, child_id = _resolve_target(global_idx, go, entity, ctx)
             if child_id:
                 child_ids.append(child_id)
+                # The engine does not pass the object's scale by axis down to
+                # this entity: it carries the same.
+                scale = object_scale(entity)
+                if scale:
+                    target_comps['EditorNonUniformScaleComponent'] = scale_component(scale, ctx)
 
             _write_mesh_collider(target_comps, collider, go, ctx)
             ctx.log(
@@ -106,6 +111,9 @@ def _write_mesh_collider(components: Dict, collider: Dict, go,
         '$type': 'EditorMeshColliderComponent',
         'Id':    ctx.generate_component_id(),
         'ColliderConfiguration': collider_cfg,
+        # Off, as for the shape colliders: left on, every collision mesh of a
+        # level is drawn over its model in the Editor.
+        'DebugDrawSettings':     {'LocallyEnabled': False},
     }
 
     # --- Resolve .pxmesh hint ---

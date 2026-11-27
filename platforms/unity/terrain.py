@@ -115,6 +115,7 @@ class TerrainProcessor:
                 terrain_asset,
                 want_heightmap=want_heightmap,
                 want_alphamaps=want_alphamaps,
+                find_asset=self.asset_db.resolve_guid,
             )
         except Exception as exc:
             msg = f"{terrain_asset.name}: parse failed: {exc}"

@@ -13,8 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tests.harness import run_module_tests
 from platforms.unity.model_import import (
     HASHED_ROOT_GAME_OBJECT, HASHED_ROOT_TRANSFORM, ModelMeta, ModelObject,
-    assign_materials, hashed_mesh_id, instance_object_id, mesh_id_of_node,
-    model_objects, node_for_mesh, read_model_meta, xxhash64,
+    assign_materials, hashed_mesh_id, hashed_object_ids, hashed_renderer_id, instance_object_id, mesh_id_of_node,
+    import_scale, model_objects, node_for_mesh, read_model_meta, xxhash64,
 )
 from platforms.unity.prefab import UnityParseContext, parse_unity_prefab
 
@@ -174,6 +174,34 @@ def test_two_objects_of_one_name_get_the_nodes_their_ids_name():
     assert (first, second) == ("Lamp_spot_ceilingpart", "Lamp_spot")
 
 
+def test_with_convert_units_off_unity_takes_one_unit_of_the_file_for_a_metre():
+    """`SM_river_stone_01.fbx` of the NatureManufacture pack: a centimetre
+    file, scale factor 0.1, "Convert Units" off. Unity makes it 0.1 m to the
+    unit; the engine, going by the file's unit, a hundredth of that."""
+    text = "fileFormatVersion: 2\nguid: 4c1854d3e81e0854492ad68b4ad26613\nModelImporter:\n  meshes:\n    globalScale: 0.1\n"
+    centimetres = _facts({"Stone": _node()}, unit=0.01)
+    assert import_scale(_meta(text + "    useFileScale: 1\n"), centimetres) == 0.1
+    assert abs(import_scale(_meta(text + "    useFileScale: 0\n"), centimetres) - 10.0) < 1e-9
+    assert _meta(text + "    useFileScale: 0\n").unsupported == []
+
+
+def test_the_id_of_a_node_that_carries_no_mesh_names_no_node():
+    """A file with an empty mesh (`flower_sunroot_01_detailed_1.002`, no
+    vertices): Unity gives it an id like any other, and a prefab shows it.
+    Read as a position it would be taken for the next node."""
+    meta = _meta("""fileFormatVersion: 2
+guid: 4c1854d3e81e0854492ad68b4ad26613
+ModelImporter:
+  fileIDToRecycleName:
+    4300000: Flower
+    4300002: Leftover
+    4300004: Flower_LOD1
+""")
+    facts = _facts({"Leftover": _node(mesh=False), "Flower_LOD1": _node(), "Flower_LOD0": _node()})
+    assert node_for_mesh("4300002", meta, facts, "Flower") is None
+    assert node_for_mesh("4300004", meta, facts, "Flower") == "Flower_LOD1"
+
+
 def test_an_id_that_cannot_be_placed_falls_back_in_order():
     two = _facts({"A": _node(), "B": _node()})
     one = _facts({"Only": _node(), "Group": _node(mesh=False)})
@@ -199,7 +227,30 @@ def test_one_top_node_is_the_root_and_is_named_after_the_file():
     assert _close(objects[1].position, (0.10, 0.05, 0.02))
     assert objects[0].mesh_file_id == hashed_mesh_id("Lockers_body") and objects[0].material_names == ["Lockers"]
     assert (objects[0].game_object_id, objects[0].transform_id) == (HASHED_ROOT_GAME_OBJECT, HASHED_ROOT_TRANSFORM)
-    assert (objects[1].game_object_id, objects[1].transform_id) == ("", "")     # not known without a table
+    # Without a table an object's ids are the hash of where it sits.
+    assert (objects[1].game_object_id, objects[1].transform_id) == hashed_object_ids(["Locker_door_A"])
+
+
+def test_an_objects_hashed_ids_are_those_unity_gives_it():
+    """The fire pit of the NatureManufacture pack: a root of Unity's own
+    with ``pit`` and ``stones`` below it. A prefab that places the model
+    names the three by these ids."""
+    assert hashed_object_ids([]) == (HASHED_ROOT_GAME_OBJECT, HASHED_ROOT_TRANSFORM)
+    assert hashed_object_ids(["pit"])[0] == "-2514649751388021329"
+    assert hashed_object_ids(["stones"])[0] == "-133806350096315675"
+
+    objects = model_objects(_facts({"pit": _node(), "stones": _node(), "ash": _node("pit")}), "fire_pit", ModelMeta())
+    ids = {model_object.name: model_object.game_object_id for model_object in objects}
+    assert ids == {"fire_pit": HASHED_ROOT_GAME_OBJECT, "pit": "-2514649751388021329",
+                   "stones": "-133806350096315675", "ash": hashed_object_ids(["pit", "ash"])[0]}
+    # In the prefab, the placement's id and the object's own give the id Unity uses there.
+    assert instance_object_id("6251434300010707833", ids["pit"]) == "854457973822105302"
+    # The prefab gives each part its material by an override that names the part's renderer.
+    assert hashed_renderer_id(["pit"]) == "-1023025516197406309"
+    assert hashed_renderer_id(["stones"]) == "-5387654234007473875"
+    renderers = {model_object.name: model_object.renderer_id for model_object in objects}
+    assert renderers == {"fire_pit": "", "pit": "-1023025516197406309",
+                         "stones": "-5387654234007473875", "ash": hashed_renderer_id(["pit", "ash"])}
 
 
 def test_several_top_nodes_get_a_root_of_unitys_own():

@@ -141,6 +141,7 @@ to-o3de_project_converter/
     stage_runner.py                   Stage runs shared by the GUI and the command line
     conversion_trace.py               How every emitted value was produced (optional)
     fbx_reader.py                     What a binary FBX says: axes, unit, node tree, materials
+    fbx_material_names.py             Materials of one name on one mesh, renamed in the converted copy
     matrix3.py                        The small 3x3 rotation arithmetic the converter needs
     converter_settings.json           App-level state (recent projects)
     Projects/                         Per-project .u2oproj.json files
@@ -151,12 +152,16 @@ to-o3de_project_converter/
         unity/                        Unity reference plugin
             bridge/                   Headless Unity runs: the truth dump
             model_import.py           What Unity makes of a model file: ids, objects, materials
-            builtin_meshes.py         Unity's built-in meshes, written out (the cube)
+            builtin_meshes.py         Unity's six built-in meshes, written out
+            mesh_asset.py             A mesh stored on its own in a Unity .asset, written as a model
+            shader_source.py          What a shader file declares: properties, culling, alpha cut
+            scale_carry.py            A scale by axis carried down to the objects below it
             scene_lighting.py         A scene's ambient colours
         README.md                     How to add a new platform
 
     targets/                          Output-target writers
         o3de/                         O3DE prefab + assetinfo writers
+            texture_settings.py       Texture settings beside a texture whose alpha is opacity
 
     components/                       Legacy back-compat shim
                                       (canonical home: platforms/unity/components/)
@@ -208,16 +213,31 @@ orchestration core and the source-engine-specific parsers. See
 | Metallic-gloss smoothness → roughness (texture-aware) | `roughness.lowerBound/upperBound` or `roughness.factor` | Working |
 | BoxCollider / SphereCollider / CapsuleCollider / MeshCollider | Editor*ShapeComponent + EditorShapeColliderComponent / EditorMeshColliderComponent | Working |
 | Rigidbody dynamic + static-with-collider | EditorRigidBodyComponent / EditorStaticRigidBodyComponent | Working |
-| Multiple colliders on one GO | Overflow → child entities `{Name}_Collider_N` | Working |
+| Multiple colliders on one GO | Overflow → child entities `{Name}_Collider_N`, numbered in the order of the object's component list | Working |
+| A scale by axis (or a mirror) on an object with objects below it | Carried down to each entity, as O3DE passes none of it on; a skew is reported | Working |
+| A collider on a mirrored or stretched object | An entity of its own without the mirror; a second collider carries the object's scale | Working |
+| Unity's built-in meshes (cube, quad, plane, cylinder, sphere, capsule), also as collision meshes | A model the converter writes (sphere and capsule on its own vertices) | Working |
+| A mesh stored in a Unity `.asset` | A model the converter writes | Working |
+| Several materials of one name on one FBX mesh | Renamed in the converted copy of the model, so each keeps a slot | Working |
 | Nested prefab instances | Nested O3DE instance references | Working |
 | Prefab override — transform | Tier 1 JSON patches | Working |
 | Prefab override — material slot (`m_Materials.Array.data[N]`) | Tier 3 `assetHint` patches via project entity-map records | Working |
-| Prefab override — `m_IsActive`, added/removed components | Logged to coverage, not emitted | Pending |
-| Lights — Directional / Point / Spot / Area | EditorDirectionalLightComponent / EditorAreaLightComponent (180° pitch correction for directional) | Working |
+| Prefab override — `m_IsActive` | Entities start inactive and hidden, with everything below them | Working |
+| Prefab override — another mesh (`m_Mesh`, a prefab variant) | Patch on the entity's model | Working |
+| A placement stretched by axis | On the placed prefab's root; not on the objects below it | Partial |
+| Prefab override — a light's range, intensity, colour, spot angles, shadows | Patches on the light's configuration | Working |
+| Prefab override — added/removed components | Logged to coverage, not emitted | Pending |
+| Lights — Directional / Point / Spot / Area | EditorDirectionalLightComponent / EditorAreaLightComponent (simple point, simple spot), Unity's range as an explicit radius | Working |
+| Spot light direction | The light's own entity turned when it holds only the light, else a child entity (option) | Working |
 | Scene → `<output>/<SceneName>/<SceneName>.prefab` | O3DE nested level convention | Working |
+| Output layout | One folder per kind of asset, or the source's own folder structure (option) | Working |
 | Unowned scene entities (physics + lights) | Same component pipeline as prefab processing | Working |
+| Scene objects and placements added below an object of a placed prefab | The level's own, parented by path into the instance | Working |
 | Terrain `.mat` → TerrainBaseMaterial | Per-material `.material` file emit | Working |
 | Terrain heightmap extraction | — | Pending (F-7) |
+| Terrain layers kept as `.terrainlayer` assets (Unity 2018.3 and later) | Read like the layers of an older terrain | Working |
+| LOD groups | The best level kept, the others dropped | Partial |
+| Skinned meshes, Animator, joints, particle systems, cameras, reflection probes | Logged to coverage, not emitted | Pending |
 | Mesh pivot / coordinate rebake | — | [Known issue](#known-issues) |
 
 ---

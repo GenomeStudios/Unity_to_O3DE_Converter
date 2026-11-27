@@ -4,9 +4,10 @@ BAKED MEASUREMENT LEVEL
 =============================================================================
 
 Makes the level the O3DE probe measures in: one instance of every converted
-prefab on a grid, each at identity rotation and scale, far enough apart that
-no two touch. The level is written as JSON from the project's default level;
-the Editor is not needed to make it.
+prefab, each at identity rotation and scale, in a cell of its own size, far
+enough apart that no two touch. The cells lie in rings around the origin, the
+smallest prefabs inside (see ``lay_out``). The level is written as JSON from
+the project's default level; the Editor is not needed to make it.
 
 The level is a product of its **recipe**: the prefabs, their grid cells, the
 base level and the version of this writer. The recipe sits beside the level
@@ -22,13 +23,15 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import shutil
 from pathlib import Path
 from typing import Dict, List
 
 # Raise when the level's layout or content changes: it is part of the recipe.
-WRITER_VERSION = 1
+WRITER_VERSION = 2
+
+# The side of the smallest cell, in metres. Cells double from there.
+SMALLEST_CELL = 4.0
 
 RECIPE_FILE = "parity_bake.json"
 BASE_LEVEL = "Levels/DefaultLevel/DefaultLevel.prefab"
@@ -43,44 +46,29 @@ CONTAINER_TRANSFORM = "/ContainerEntity/Components/TransformComponent"
 # RECIPE
 # =============================================================================
 
-def make_recipe(project_root: Path, prefab_files: List[Path], radii: Dict[str, float],
-                source_folder: str = "") -> dict:
-    """What the level is made from. ``radii`` gives each prefab's reach from
-    its root in metres, by file stem; the largest sets the grid spacing.
+def make_recipe(project_root: Path, sources: List[str], radii: Dict[str, float]) -> dict:
+    """What the level is made from.
 
-    ``source_folder`` is the folder part of each instance's ``Source``. The
-    engine wants one prefab named by one string everywhere it is nested, so
-    the level must name the prefabs the way they name each other (see
-    ``nested_source_folder``). Empty means the project-relative path."""
+    ``sources`` are the converted prefabs, each as the ``Source`` string
+    the converter itself writes where one prefab nests another. The engine
+    wants one prefab named by one string everywhere, so the level must name
+    the prefabs the way they name each other. ``radii`` gives each prefab's
+    reach from its root in metres, by source; it sets the size of the
+    prefab's cell."""
     project_root = Path(project_root)
-    if source_folder:
-        sources = sorted(f"{source_folder}/{Path(path).name}" for path in prefab_files)
-    else:
-        sources = sorted(Path(path).resolve().relative_to(project_root.resolve()).as_posix()
-                         for path in prefab_files)
-    largest = max([radii.get(Path(source).stem, 0.0) for source in sources] + [1.0])
-    spacing = float(math.ceil(2.0 * largest + 2.0))
-    columns = max(1, math.ceil(math.sqrt(len(sources))))
-    rows = max(1, math.ceil(len(sources) / columns))
+    # Smallest cells first (they go nearest the origin), then by name.
+    sources = sorted(sources, key=lambda source: (cell_side(radii.get(source, 0.0)), source))
+    centres = lay_out([cell_side(radii.get(source, 0.0)) for source in sources])
 
-    cells = []
-    for index, source in enumerate(sources):
-        column, row = index % columns, index // columns
-        cells.append({
-            "alias":  f"Instance_[{1000000 + index}]",
-            "source": source,
-            # Centred on the origin, to keep coordinates small.
-            "cell":   [(column - (columns - 1) / 2.0) * spacing,
-                       (row - (rows - 1) / 2.0) * spacing,
-                       0.0],
-        })
+    cells = [{"alias": f"Instance_[{1000000 + index}]", "source": source, "cell": centre}
+             for index, (source, centre) in enumerate(zip(sources, centres))]
 
     recipe = {
         "writer_version": WRITER_VERSION,
         "base_level":     BASE_LEVEL,
         "base_level_sha": _sha256((project_root / BASE_LEVEL).read_bytes()),
-        "spacing":        spacing,
-        "columns":        columns,
+        # How far the farthest cell's centre lies from the origin, in metres.
+        "reach":          max([max(abs(centre[0]), abs(centre[1])) for centre in centres] + [0.0]),
         "instances":      cells,
     }
     recipe["hash"] = _sha256(json.dumps(recipe, sort_keys=True).encode("utf-8"))
@@ -100,6 +88,62 @@ def nested_source_folder(prefab_files: List[Path]) -> str:
             if "/" in source:
                 return source.rsplit("/", 1)[0]
     return ""
+
+
+# =============================================================================
+# LAYOUT
+# The Editor holds positions as 32-bit numbers: a kilometre from the origin
+# they are a sixteenth of a millimetre apart, thirty kilometres out two
+# millimetres - more than the harness's tolerance. One spacing for all, set by
+# the largest prefab, puts a pack with a few landscape-sized prefabs that far
+# out. So every prefab gets a cell of its own size and the small ones, which
+# are the many, stay near the origin.
+# =============================================================================
+
+def cell_side(radius: float) -> float:
+    """The side of the square cell a prefab stands in, in metres: room for
+    twice its reach from its root and a gap of two, rounded up to the
+    smallest cell doubled as often as needed. Few sizes, so cells of one
+    size tile."""
+    side = SMALLEST_CELL
+    while side < 2.0 * radius + 2.0:
+        side *= 2.0
+    return side
+
+
+def lay_out(sides: List[float]) -> List[List[float]]:
+    """The centre of each cell, ``[x, y, 0]``, for cell sides given smallest
+    first.
+
+    The cells of one size tile the plane, with a cell centred on the origin.
+    Each size takes the free cells nearest the origin, ring by ring: the
+    smallest size fills a square around the origin, the next its cells
+    outside that square, and so on. A ring is closed off whole before the
+    next size starts, so cells of two sizes never overlap."""
+    centres: List[List[float]] = []
+    taken = 0.0                         # half the side of the square already used
+    index = 0
+    while index < len(sides):
+        side = sides[index]
+        count = sides.count(side)
+        ring = 0
+        placed = 0
+        while placed < count:
+            for column, row in _ring(ring):
+                inner_edge = max(abs(column), abs(row)) * side - side / 2.0
+                if placed < count and (taken == 0.0 or inner_edge >= taken):
+                    centres.append([column * side, row * side, 0.0])
+                    placed += 1
+            ring += 1
+        taken = (ring - 0.5) * side
+        index += count
+    return centres
+
+
+def _ring(ring: int) -> List[tuple]:
+    """The cells at ``ring`` steps from the middle cell, in a fixed order."""
+    span = range(-ring, ring + 1)
+    return [(column, row) for row in span for column in span if max(abs(column), abs(row)) == ring]
 
 
 def _sha256(data: bytes) -> str:

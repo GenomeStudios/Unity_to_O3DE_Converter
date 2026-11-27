@@ -63,8 +63,13 @@ def _model(object_id, name, kind="Mesh"):
     return {"name": "Model", "props": [_number(object_id), _text(f"{name}\x00\x01Model"), _text(kind)]}
 
 
-def _geometry(object_id, slots=None, compressed=False):
+def _geometry(object_id, slots=None, compressed=False, vertices=None):
+    """A geometry; ``vertices`` is the number of coordinates in its vertex
+    array, written only when given."""
     children = []
+    if vertices is not None:
+        payload = struct.pack(f"<{vertices}d", *([0.0] * vertices))
+        children.append({"name": "Vertices", "props": [b"d" + struct.pack("<III", vertices, 0, len(payload)) + payload]})
     if slots is not None:
         children.append({"name": "LayerElementMaterial", "props": [],
                          "children": [{"name": "Materials", "props": [_int_array(slots, compressed)]}]})
@@ -111,6 +116,28 @@ def test_a_group_node_is_part_of_the_path_and_carries_no_mesh():
     assert facts["nodes"]["Part"]["path"] == "RootNode.Group.Part"
     assert facts["nodes"]["Group"]["mesh"] is False and facts["nodes"]["Part"]["mesh"] is True
     assert mesh_node_names(facts) == ["Part"]
+
+
+def test_a_dot_in_a_nodes_name_is_an_underscore_in_its_path():
+    """Blender numbers its copies `leaf.002`. A dot parts the names of a
+    node path, so O3DE's importer turns it into an underscore; the node is
+    still known by its own name, as Unity names it."""
+    facts = _facts(
+        [_model(1, "Stem.001", "Null"), _model(2, "flower_detailed_1.002"), _geometry(20)],
+        [_link(1, 0), _link(2, 1), _link(20, 2)])
+    assert facts["nodes"]["flower_detailed_1.002"]["path"] == "RootNode.Stem_001.flower_detailed_1_002"
+    assert mesh_node_names(facts) == ["flower_detailed_1.002"]
+
+
+def test_a_node_whose_geometry_has_no_vertices_carries_no_mesh():
+    """`flower_sunroot_01_detailed_1.fbx` of the NatureManufacture pack holds
+    an empty mesh. It shows nothing in Unity, and O3DE fails the whole file
+    over a model made of it."""
+    facts = _facts(
+        [_model(1, "Leftover"), _model(2, "Flower"), _geometry(10, vertices=0), _geometry(20, vertices=9)],
+        [_link(1, 0), _link(2, 0), _link(10, 1), _link(20, 2)])
+    assert facts["nodes"]["Leftover"]["mesh"] is False and facts["nodes"]["Flower"]["mesh"] is True
+    assert mesh_node_names(facts) == ["Flower"]
 
 
 def test_a_mesh_node_is_one_with_a_geometry_connected():

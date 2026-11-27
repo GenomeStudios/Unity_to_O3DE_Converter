@@ -48,8 +48,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import matrix3
 from platforms.unity.components.base import ProcessingContext
 from platforms.unity.components.box_collider import refuses_non_uniform_scale
+from platforms.unity.components.light import (
+    PLACEMENT_DEFAULT, PLACEMENT_OPTION, SPOT_TURN_MATRIX, light_record, override_configuration,
+    turns_its_entity,
+)
 from platforms.unity.types import GameObject, Transform
 
 
@@ -142,6 +147,136 @@ def convert_to_o3de_coordinates(unity_transform: Transform
 UNIFORM_SCALE = "UniformScale"
 
 
+# =============================================================================
+# ACTIVE STATE
+# An object Unity has switched off does not show, and neither does anything
+# below it. In O3DE an entity starts inactive by ``IsRuntimeActive: false``
+# and is hidden in the Editor by its visibility component. The Editor hides
+# what is below a hidden entity; the runtime does not deactivate what is
+# below an inactive one, so every entity below is marked as well.
+# =============================================================================
+
+def inactive_objects(game_objects: Dict) -> set:
+    """The ids of the objects that do not show in Unity: switched off
+    themselves, or below an object that is."""
+    hidden: set = set()
+
+    def visit(go, parent_hidden: bool) -> None:
+        is_hidden = parent_hidden or not go.is_active
+        if is_hidden:
+            hidden.add(go.file_id)
+        for child_id in go.children_ids:
+            child = game_objects.get(child_id)
+            if child is not None and child.file_id not in seen:
+                seen.add(child.file_id)
+                visit(child, is_hidden)
+
+    seen: set = set()
+    for go in game_objects.values():
+        if go.parent_id is None or go.parent_id not in game_objects:
+            seen.add(go.file_id)
+            visit(go, False)
+    return hidden
+
+
+def mark_inactive(entity: Dict) -> None:
+    """Make one emitted entity start inactive and hidden in the Editor."""
+    entity["IsRuntimeActive"] = False
+    entity["Components"].setdefault("EditorVisibilityComponent", {
+        "$type": "EditorVisibilityComponent"})["VisibilityFlag"] = False
+
+
+def active_state_patches(target_go_id: str, active: bool, sidecar: Optional[Dict]) -> List[Dict]:
+    """The patches that switch an object inside a nested instance off or on,
+    with everything below it. ``target_go_id`` is the object's file id in
+    the source prefab; the prefab's root, or "", means the whole instance.
+
+    Switched on, the objects below come on too, except the ones the source
+    prefab itself has switched off and what is below those."""
+    sidecar = sidecar or {}
+    aliases = sidecar.get("entity_aliases", {})
+    parents = sidecar.get("parents", {})
+    switched_off = set(sidecar.get("inactive", []))
+    extras = sidecar.get("extra_entities", {})
+    root_id = next((go_id for go_id, alias in aliases.items() if alias == sidecar.get("root_entity")), "")
+    whole_instance = not target_go_id or target_go_id == root_id
+    if not whole_instance and target_go_id not in aliases:
+        return []
+
+    def shown(go_id: str) -> bool:
+        """Whether an object below the target ends up showing."""
+        if not active:
+            return False
+        while go_id and go_id != target_go_id and go_id != root_id:
+            if go_id in switched_off:
+                return False
+            go_id = parents.get(go_id, "")
+        return True
+
+    def below_target(go_id: str) -> bool:
+        while go_id:
+            if go_id == target_go_id:
+                return True
+            go_id = parents.get(go_id, "")
+        return False
+
+    patches: List[Dict] = []
+
+    def set_state(entity_path: str, state: bool) -> None:
+        patches.append({"op": "add", "path": f"{entity_path}/IsRuntimeActive", "value": state})
+        patches.append({"op": "add",
+                        "path": f"{entity_path}/Components/EditorVisibilityComponent/VisibilityFlag",
+                        "value": state})
+
+    if whole_instance:
+        set_state("/ContainerEntity", active)
+    for go_id, alias in aliases.items():
+        if whole_instance or below_target(go_id):
+            state = shown(go_id)
+            set_state(f"/Entities/{alias}", state)
+            for extra in extras.get(go_id, []):
+                set_state(f"/Entities/{extra}", state)
+    return patches
+
+
+def with_mesh_stretch(go: GameObject, o3de_transform: Transform, needs_nonuniform: bool):
+    """An object's converted transform with its mesh's own stretch worked
+    into the scale, and whether the scale now differs by axis.
+
+    The stretch is the part of the model's size that the mesh import rule
+    could not carry (``assetinfo_writer.source_mesh_stretch``), noted on the
+    object as ``component_data["mesh_stretch"]``. It is the model's, not the
+    object's: what hangs below the object is not stretched, and a non-uniform
+    scale is not passed down either, which is why the entity can carry it."""
+    stretch = go.component_data.get("mesh_stretch")
+    if not stretch:
+        return o3de_transform, needs_nonuniform
+    scale = tuple(own * factor for own, factor in zip(o3de_transform.scale, stretch))
+    return Transform(o3de_transform.position, o3de_transform.rotation, scale), True
+
+
+def with_light_turn(go: GameObject, o3de_transform: Transform, needs_nonuniform: bool,
+                    options: Optional[Dict]) -> Transform:
+    """An object's converted transform, turned when its entity is to carry a
+    spot light itself.
+
+    An O3DE spot shines along its entity's +Z, the converted Unity object
+    points its light along +Y. With the stage option ``spot_light_placement``
+    at ``turn_entity`` (the default) an object that holds only the light has
+    its own entity turned the quarter about X between the two, so no second
+    entity is made for the light; the turn is noted on the object as
+    ``component_data["light_turns_entity"]``, which the light processor and
+    the conversion trace read. Any other object keeps its transform, and its
+    spot goes on a child entity. So does one scaled differently by axis: the
+    turn would carry the scale onto other axes."""
+    placement = (options or {}).get(PLACEMENT_OPTION, PLACEMENT_DEFAULT)
+    if needs_nonuniform or not turns_its_entity(go, placement):
+        return o3de_transform
+    turned = matrix3.mat_mul(matrix3.quat_to_matrix(o3de_transform.rotation), SPOT_TURN_MATRIX)
+    go.component_data["light_turns_entity"] = True
+    return Transform(o3de_transform.position, tuple(matrix3.matrix_to_quat(turned)), o3de_transform.scale)
+
+
 def non_uniform_scale_component(component_id: int, scale) -> Dict:
     """An ``EditorNonUniformScaleComponent`` holding ``scale`` (O3DE axes).
     The engine reads the scale from ``NonUniformScale``
@@ -190,10 +325,12 @@ def create_o3de_prefab(worker, root_go: GameObject, all_game_objects: Dict,
                        fbx_material_labels: Dict[str, List[str]],
                        output_path: Path,
                        collider_pxmesh_mapping: Dict = None,
-                       collision_config_mapping: Dict = None) -> None:
-    """Write an O3DE ``.prefab`` JSON file + its
-    ``.entitymap.json`` sidecar from a parsed source scene-graph
-    rooted at ``root_go``."""
+                       collision_config_mapping: Dict = None,
+                       source_path: Optional[Path] = None) -> None:
+    """Write an O3DE ``.prefab`` JSON file and record its entity map, from
+    a parsed source scene-graph rooted at ``root_go``. ``source_path`` is
+    the Unity prefab it is made from; without it the entity map looks the
+    prefab up by the output file's name."""
     # Stashed on the worker so the per-entity ProcessingContext (built deep in
     # create_entity_recursive from worker.*) can read it without threading the
     # map through every recursive signature. {(guid, fileID): .pxmesh hint}.
@@ -201,6 +338,11 @@ def create_o3de_prefab(worker, root_go: GameObject, all_game_objects: Dict,
     # F-Collision: {file_id: {"layer": int|None, "group": uuid|None}} stamped
     # onto each collider's ColliderConfiguration. Same stash pattern.
     worker._collision_config_mapping = collision_config_mapping or {}
+    # The objects Unity has switched off, and the entities the processors
+    # make beside an object's own (a collider or a light on a child entity),
+    # both for this prefab only.
+    worker._inactive_ids = inactive_objects(all_game_objects)
+    worker._extra_entities = {}
     # ContainerEntity uses the root GameObject's name.
     prefab_data = {
         "ContainerEntity": create_container_entity(worker, root_go),
@@ -244,6 +386,8 @@ def create_o3de_prefab(worker, root_go: GameObject, all_game_objects: Dict,
         worker, output_path, root_entity, all_game_objects, entity_id_map,
         fbx_material_labels,
         transform_map=transform_map,
+        source_path=source_path,
+        with_model=set(mesh_mapping),
     )
 
 
@@ -257,7 +401,9 @@ def write_entity_map_sidecar(worker,
                               all_game_objects: Dict,
                               entity_id_map: Dict[str, str],
                               fbx_material_labels: Dict[str, List[str]],
-                              transform_map: Optional[Dict[str, str]] = None) -> None:
+                              transform_map: Optional[Dict[str, str]] = None,
+                              source_path: Optional[Path] = None,
+                              with_model: Optional[set] = None) -> None:
     """Build the per-prefab entity-map record and stash it on the worker.
 
     Two storage locations:
@@ -269,23 +415,29 @@ def write_entity_map_sidecar(worker,
 
     Replaces the old ``<output>/.ImporterData/<stem>.entitymap.json``
     sidecar file. See the worker's earlier docstring for the schema."""
-    # Recover the source Unity prefab path/guid from output_path.stem
-    # (the converter writes outputs named after the source prefab's stem).
-    source_path: Optional[Path] = None
-    source_guid: Optional[str]  = None
-    for guid, path in worker.asset_db.guid_to_path.items():
-        if path.suffix == '.prefab' and path.stem == prefab_output_path.stem:
-            source_path = path
-            source_guid = guid
-            break
+    # The Unity prefab this was made from. A caller that knows it says so:
+    # two prefabs of one name in different folders are different prefabs.
+    # Without it, the first prefab of the output file's name is taken (the
+    # converter names an output after its source).
+    source_guid: Optional[str] = None
+    if source_path is not None:
+        source_guid = worker.asset_db.path_to_guid(source_path)
+    else:
+        for guid, path in worker.asset_db.guid_to_path.items():
+            if path.suffix == '.prefab' and path.stem == prefab_output_path.stem:
+                source_path = path
+                source_guid = guid
+                break
 
     if source_guid:
         worker.asset_index["prefabs"][source_guid] = str(source_path) if source_path else ""
 
+    # Only objects that show a model have a material component an override
+    # could land on (see the material processor).
     material_slots = {
         go.file_id: list(go.material_guids)
         for go in all_game_objects.values()
-        if go.material_guids
+        if go.material_guids and (with_model is None or go.file_id in with_model)
     }
     material_slot_labels = {
         file_id: list(labels)
@@ -294,6 +446,10 @@ def write_entity_map_sidecar(worker,
     }
     go_names = {
         go.file_id: go.name for go in all_game_objects.values() if go.name
+    }
+    parents = {
+        go.file_id: go.parent_id for go in all_game_objects.values()
+        if go.parent_id and go.file_id in entity_id_map
     }
 
     try:
@@ -314,6 +470,42 @@ def write_entity_map_sidecar(worker,
         # engine refuses a non-uniform scale beside them, so a prefab that
         # nests this one stretched cannot hand it one.
         "root_refuses_non_uniform_scale": refuses_non_uniform_scale(root_go),
+        # The root's own scale as Unity stores it (Unity's axes). A placement
+        # that sets one axis keeps the others from here.
+        "root_scale":           [float(value) for value in root_go.transform.scale],
+        # Where the root stands in the prefab itself (Unity's values). A
+        # placement stands there when its own overrides name nothing
+        # (`platforms.unity.prefab.lost_root`).
+        "root_position":        [float(value) for value in root_go.transform.position],
+        "root_rotation":        [float(value) for value in root_go.transform.rotation],
+        # The root's mesh stretch, when it has one: a scale handed to the root
+        # by a prefab that nests this one has to keep it.
+        "root_mesh_stretch":    list(root_go.component_data.get("mesh_stretch") or []),
+        # {Unity MeshRenderer file id: its GameObject's file id}. A material
+        # override names the renderer, not the object.
+        "renderer_owners":      {go.component_ids["MeshRenderer"]: go.file_id
+                                 for go in all_game_objects.values()
+                                 if "MeshRenderer" in go.component_ids and go.file_id in entity_id_map},
+        # {Unity MeshFilter file id: its GameObject's file id}, for the
+        # objects that show a model. An override of a mesh names the filter.
+        "mesh_owners":          {go.component_ids["MeshFilter"]: go.file_id
+                                 for go in all_game_objects.values()
+                                 if "MeshFilter" in go.component_ids and go.file_id in entity_id_map
+                                 and (with_model is None or go.file_id in with_model)},
+        # {Unity Light file id: where its light was written and what an
+        # override starts from (`light_record`)}. An override of a light's
+        # range or colour names the Light.
+        "light_owners":         {go.component_ids["Light"]: light_record(go)
+                                 for go in all_game_objects.values()
+                                 if "Light" in go.component_ids and light_record(go)},
+        # For switching objects off and on from a prefab that nests this one:
+        # each object's parent, the objects this prefab has switched off, and
+        # the entities made beside an object's own.
+        "parents":              parents,
+        "inactive":             sorted(go.file_id for go in all_game_objects.values()
+                                       if not go.is_active and go.file_id in entity_id_map),
+        "extra_entities":       {go_id: list(ids) for go_id, ids in
+                                 (getattr(worker, "_extra_entities", None) or {}).items() if ids},
         "transform_owners":     {str(transform_id): str(owner)
                                  for transform_id, owner in (transform_map or {}).items()
                                  if str(owner) in entity_id_map},
@@ -412,10 +604,11 @@ def create_nested_prefab_instance(worker, go: GameObject, prefab_path: Path,
     """Emit a nested-prefab Instance entry with JSON-patch overrides.
 
     Tier 1 = Transform (translate/rotate/scale on ContainerEntity).
-    Tier 2 = m_IsActive (logged as unhandled — path TBD).
-    Tier 3 = m_Materials.Array.data[N] (patch the assetHint inside
-              the target entity's EditorMaterialComponent
-              materialsByLabel entry — label key = FBX-internal
+    Tier 2 = m_IsActive (the object and everything below it switched
+              off or on — ``active_state_patches``).
+    Tier 3 = m_Materials.Array.data[N] (the slot's entry added on the
+              entity of the renderer the override targets —
+              ``material_override_patches``; label key = FBX-internal
               material name at slot N).
 
     Source path is computed by walking up from ``prefab_path`` looking
@@ -430,7 +623,7 @@ def create_nested_prefab_instance(worker, go: GameObject, prefab_path: Path,
     # one prefab named by one string wherever it is nested, so this must be
     # the spelling the scene converter uses for the same file: its path from
     # the O3DE project root, case kept.
-    converted_prefab = worker.prefabs_dir / prefab_path.name
+    converted_prefab = worker.prefab_output_path(prefab_path)
     rel = _project_relative_path(converted_prefab)
     source_path = rel if rel else f"{worker.asset_hint_root}/prefabs/{prefab_path.name}"
     o3de_transform, _ = convert_to_o3de_coordinates(go.transform)
@@ -462,24 +655,11 @@ def create_nested_prefab_instance(worker, go: GameObject, prefab_path: Path,
                 "value": axis_val,
             })
 
-    # Scale: uniform → scalar patch on the container; non-uniform → a
-    # component on the instance's root entity (below, once its alias is known).
-    sx, sy, sz = o3de_transform.scale
-    non_uniform = False
-    if abs(sx - 1.0) > 0.0001 and abs(sx - sy) < 0.0001 and abs(sy - sz) < 0.0001:
-        patches.append({
-            "op":    "replace",
-            "path":  f"/ContainerEntity/Components/TransformComponent/Transform Data/{UNIFORM_SCALE}",
-            "value": sx,
-        })
-    elif (abs(sx - 1.0) > 0.0001 or abs(sy - 1.0) > 0.0001 or abs(sz - 1.0) > 0.0001):
-        non_uniform = True
+    # Scale: what the placement sets, on the instance's root entity.
+    sidecar = load_entity_map_sidecar(worker, prefab_path)
+    patches += instance_scale_patches(go, sidecar, generate_component_id(worker), worker.coverage.warn)
 
     # TIER 2 + TIER 3 — walk modifications by propertyPath.
-    sidecar = load_entity_map_sidecar(worker, prefab_path)
-    if non_uniform:
-        patches += instance_non_uniform_scale_patches(
-            (sx, sy, sz), sidecar, generate_component_id(worker), go.name, worker.coverage.warn)
     entity_aliases = (sidecar or {}).get("entity_aliases", {})
     material_slot_labels = (sidecar or {}).get("material_slot_labels", {})
 
@@ -489,8 +669,21 @@ def create_nested_prefab_instance(worker, go: GameObject, prefab_path: Path,
             f"non-transform overrides on nested instance '{go.name}' cannot be targeted."
         )
 
+    # An instance that is switched off where it is placed, or sits below
+    # an object that is: all of it off. (Its own overrides come after and
+    # may switch parts back on, as in Unity.)
+    if go.file_id in getattr(worker, "_inactive_ids", ()):
+        patches += active_state_patches("", False, sidecar)
+
     # Transform overrides on objects inside the instance.
     patches += child_transform_patches(go.prefab_modifications, sidecar, go.name, worker.coverage.warn)
+
+    # Overrides of the lights inside the instance.
+    patches += light_override_patches(go.prefab_modifications, sidecar, worker.coverage)
+
+    # Overrides of the meshes inside the instance.
+    patches += mesh_override_patches(go.prefab_modifications, sidecar,
+                                     getattr(worker, "model_hint_for", None), go.name, worker.coverage)
 
     # Material-slot overrides arrive as multiple property entries on the
     # same target. Collect them first to know the slot count per target.
@@ -503,6 +696,9 @@ def create_nested_prefab_instance(worker, go: GameObject, prefab_path: Path,
         target    = mod.get('target') or {}
         target_id = str(target.get('fileID', ''))
 
+        if overrides_a_light(mod, sidecar) or prop_path == 'm_Mesh':
+            continue
+
         # Transform/name overrides were already projected onto go.transform / go.name
         # and emitted above. Mark them as handled in the coverage tracker.
         if prop_path == 'm_Name' or prop_path.startswith(
@@ -513,13 +709,9 @@ def create_nested_prefab_instance(worker, go: GameObject, prefab_path: Path,
 
         # --- Tier 2: m_IsActive (on the GameObject) ---
         if prop_path == 'm_IsActive':
-            worker.coverage.record_modification(
-                prop_path, handled=False, example_value=value
-            )
-            worker.coverage.warn(
-                f"m_IsActive override on nested instance '{go.name}' (value={value}) "
-                f"not emitted — O3DE disabled-entity patch path needs confirmation."
-            )
+            state_patches = active_state_patches(target_id, str(value) != '0', sidecar)
+            patches.extend(state_patches)
+            worker.coverage.record_modification(prop_path, handled=bool(state_patches), example_value=value)
             continue
 
         # --- Tier 3: material slot override ---
@@ -542,63 +734,8 @@ def create_nested_prefab_instance(worker, go: GameObject, prefab_path: Path,
         )
 
     # Emit material slot patches now that we have all slots per target.
-    for target_id, slot_map in material_overrides.items():
-        entity_alias = entity_aliases.get(target_id)
-        if not entity_alias:
-            worker.coverage.warn(
-                f"Material override on nested instance '{go.name}' targets "
-                f"fileID={target_id} which is not in the source's entity map "
-                f"— renderer-component fileIDs aren't recorded yet. Skipped."
-            )
-            for slot_idx, mat_guid in slot_map.items():
-                worker.coverage.record_modification(
-                    f'm_Materials.Array.data[{slot_idx}]',
-                    handled=False, example_value=mat_guid,
-                )
-            continue
-
-        slot_labels = material_slot_labels.get(target_id, []) or []
-
-        for slot_idx, mat_guid in slot_map.items():
-            asset_hint = worker.asset_index["materials"].get(mat_guid)
-            if not asset_hint:
-                asset_hint = worker._process_material(mat_guid)
-            if not asset_hint:
-                worker.coverage.record_missing_material(mat_guid)
-                worker.coverage.record_modification(
-                    f'm_Materials.Array.data[{slot_idx}]',
-                    handled=False, example_value=mat_guid,
-                )
-                continue
-
-            label = (slot_labels[slot_idx]
-                     if slot_idx < len(slot_labels) else '')
-
-            if not label:
-                worker.coverage.warn(
-                    f"Material override on nested instance '{go.name}' "
-                    f"slot {slot_idx} — no FBX-internal label recorded "
-                    f"in sidecar (source prefab predates the label "
-                    f"refactor, or FBX parse failed at emit time). "
-                    f"Patch skipped — re-convert the source prefab to fix."
-                )
-                worker.coverage.record_modification(
-                    f'm_Materials.Array.data[{slot_idx}]',
-                    handled=False, example_value=mat_guid,
-                )
-                continue
-
-            patches.append({
-                "op":   "replace",
-                "path": (f"/Entities/{entity_alias}/Components/EditorMaterialComponent/"
-                         f"Controller/Configuration/materialsByLabel/{label}/"
-                         f"MaterialAsset/assetHint"),
-                "value": asset_hint,
-            })
-            worker.coverage.record_modification(
-                f'm_Materials.Array.data[{slot_idx}]',
-                handled=True, example_value=asset_hint,
-            )
+    patches += material_override_patches(
+        material_overrides, sidecar, worker.material_hint_for, go.name, worker.coverage)
 
     # Sibling fields (added / removed / added GOs) — record and skip.
     for _ in go.prefab_added_components:    worker.coverage.record_added_component()
@@ -615,6 +752,80 @@ def create_nested_prefab_instance(worker, go: GameObject, prefab_path: Path,
         "Source":  source_path,
         "Patches": patches,
     }
+
+
+def overridden_root_scale(modifications: List[Dict]) -> Dict[str, float]:
+    """The scale a placement sets on its instance's own root, by Unity axis
+    (``{"y": 3.0}``); empty when it sets none. Unity stores an axis only
+    when the placement changes it."""
+    from platforms.unity.prefab import root_override_target, targets_root
+
+    root_target = root_override_target(modifications)
+    overridden: Dict[str, float] = {}
+    for modification in modifications:
+        path = (modification.get('propertyPath') or '').strip()
+        if path.startswith('m_LocalScale.') and path[-1] in "xyz" and targets_root(modification, root_target):
+            try:
+                overridden[path[-1]] = float(modification.get('value'))
+            except (TypeError, ValueError):
+                pass
+    return overridden
+
+
+def instance_scale_patches(go: GameObject, sidecar: Optional[Dict], component_id: int, warn) -> List[Dict]:
+    """The patches for the scale a placement gives its prefab.
+
+    In Unity a placed prefab's root has the prefab root's own scale unless
+    the placement overrides it, and it overrides axis by axis: an axis it
+    does not name keeps the prefab's. The converted prefab's root entity
+    carries the root's own scale already (``create_entity_recursive``), so a
+    placement that names no axis writes nothing here.
+
+    One that does replaces the root entity's scale with the result. A scale
+    that is the same on all axes becomes the entity's ``UniformScale``; any
+    other an ``EditorNonUniformScaleComponent`` on it, with the uniform
+    scale set to one (``instance_non_uniform_scale_patches``). The container
+    entity gets no scale: it would multiply with the root's own, where Unity
+    replaces.
+
+    ``sidecar`` is the source prefab's entity map (its root entity, the
+    root's stored scale and mesh stretch). Without it only the container can
+    be reached, and a scale that is the same on all axes is written there."""
+    overridden = overridden_root_scale(go.prefab_modifications)
+    # What a scale by axis above the placement hands down to it (Unity's
+    # axes; `platforms.unity.scale_carry`). The engine passes none of it on.
+    inherited = go.component_data.get("inherited_scale")
+    if not overridden and not inherited:
+        return []
+    sidecar = sidecar or {}
+    stored = sidecar.get("root_scale") or [1.0, 1.0, 1.0]
+    unity = [overridden.get(axis, stored[index]) * (inherited[index] if inherited else 1.0)
+             for index, axis in enumerate("xyz")]
+    scale = (unity[0], unity[2], unity[1])                       # O3DE's axes
+    same_on_all_axes = max(scale) - min(scale) < 0.0001
+
+    root_alias = sidecar.get("root_entity")
+    if not root_alias:
+        if same_on_all_axes:
+            return [{"op": "replace",
+                     "path": f"/ContainerEntity/Components/TransformComponent/Transform Data/{UNIFORM_SCALE}",
+                     "value": scale[0]}]
+        return instance_non_uniform_scale_patches(scale, sidecar, component_id, go.name, warn)
+
+    components = f"/Entities/{root_alias}/Components"
+    uniform_path = f"{components}/TransformComponent/Transform Data/{UNIFORM_SCALE}"
+    stretched = any(abs(factor - 1.0) > 1e-9 for factor in (sidecar.get("root_mesh_stretch") or []))
+    if same_on_all_axes and not stretched:
+        patches = [{"op": "add", "path": uniform_path, "value": scale[0]}]
+        if max(stored) - min(stored) >= 0.0001:
+            # The prefab's root has a scale by axis of its own: taken back.
+            patches.append({"op": "add", "path": f"{components}/EditorNonUniformScaleComponent/NonUniformScale",
+                            "value": [1.0, 1.0, 1.0]})
+        return patches
+
+    by_axis = instance_non_uniform_scale_patches(scale, sidecar, component_id, go.name, warn)
+    # The root entity's own uniform scale would multiply with the component's.
+    return ([{"op": "add", "path": uniform_path, "value": 1.0}] + by_axis) if by_axis else []
 
 
 def instance_non_uniform_scale_patches(scale, sidecar: Optional[Dict], component_id: int,
@@ -642,11 +853,153 @@ def instance_non_uniform_scale_patches(scale, sidecar: Optional[Dict], component
         warn(f"Non-uniform scale on nested instance '{instance_name}' {tuple(scale)} is set on its root "
              f"only: O3DE does not pass a non-uniform scale down, so the objects below the root keep "
              f"their size and place.")
+    # The root's own mesh stretch stays in the scale it is handed.
+    stretch = (sidecar or {}).get("root_mesh_stretch") or [1.0, 1.0, 1.0]
     return [{
         "op":    "add",
         "path":  f"/Entities/{root_alias}/Components/EditorNonUniformScaleComponent",
-        "value": non_uniform_scale_component(component_id, scale),
+        "value": non_uniform_scale_component(
+            component_id, [own * factor for own, factor in zip(scale, stretch)]),
     }]
+
+
+def material_override_patches(material_overrides: Dict[str, Dict[int, str]], sidecar: Optional[Dict],
+                              hint_for_guid, instance_name: str, coverage) -> List[Dict]:
+    """The patches for an instance's material overrides.
+
+    ``material_overrides`` is ``{target file id: {slot: material guid}}`` as
+    Unity writes them: the target is the MeshRenderer inside the source
+    prefab, the slot its place in the renderer's material list.
+    ``sidecar`` is the source prefab's entity map, which says which entity
+    was made of the object that carries that renderer and how the model
+    names its material slots. ``hint_for_guid`` gives a converted material's
+    hint (converting it if need be), or None.
+
+    A slot is set by the model's label for it; slot 0 also sets the
+    entity's default slot, which is what shows when a label is not found.
+    The patch adds the slot's entry whole, so it lands whether the entity
+    had a material there or not. What cannot be placed is reported to
+    ``coverage``."""
+    sidecar = sidecar or {}
+    owners = sidecar.get("renderer_owners", {})
+    aliases = sidecar.get("entity_aliases", {})
+    labels = sidecar.get("material_slot_labels", {})
+    slots_of = sidecar.get("material_slots", {})
+
+    def not_placed(slot_map: Dict[int, str]) -> None:
+        for slot, guid in slot_map.items():
+            coverage.record_modification(f'm_Materials.Array.data[{slot}]', handled=False, example_value=guid)
+
+    patches: List[Dict] = []
+    for target_id, slot_map in material_overrides.items():
+        owner = owners.get(target_id, target_id)        # an older map knows objects only
+        alias = aliases.get(owner)
+        if not alias or not slots_of.get(owner):
+            coverage.warn(
+                f"Material override on instance '{instance_name}' targets fileID={target_id}, "
+                f"which is no renderer with materials in the source prefab's entity map — skipped.")
+            not_placed(slot_map)
+            continue
+
+        slot_labels = labels.get(owner, []) or []
+        base = f"/Entities/{alias}/Components/EditorMaterialComponent/Controller/Configuration"
+        for slot, guid in sorted(slot_map.items()):
+            hint = hint_for_guid(guid)
+            if not hint:
+                coverage.record_missing_material(guid)
+                not_placed({slot: guid})
+                continue
+            entry = {"MaterialAsset": {"assetHint": hint}}
+            label = slot_labels[slot] if slot < len(slot_labels) else ""
+            if not label and slot != 0:
+                coverage.warn(
+                    f"Material override on instance '{instance_name}' slot {slot}: the source "
+                    f"prefab's entity map names no label for that slot — skipped.")
+                not_placed({slot: guid})
+                continue
+            if label:
+                # A label goes into the path as one segment (JSON pointer escapes).
+                segment = label.replace("~", "~0").replace("/", "~1")
+                patches.append({"op": "add", "path": f"{base}/materialsByLabel/{segment}", "value": entry})
+            if slot == 0:
+                patches.append({"op": "add", "path": f"{base}/materials/{{}}", "value": entry})
+            coverage.record_modification(f'm_Materials.Array.data[{slot}]', handled=True, example_value=hint)
+    return patches
+
+
+def mesh_override_patches(modifications: List[Dict], sidecar: Optional[Dict], model_hint_for,
+                          instance_name: str, coverage) -> List[Dict]:
+    """The patches for an instance's overrides of the meshes inside it.
+
+    A prefab variant may show another mesh than the prefab it is made from
+    (the NatureManufacture pack's `prefab_grass_03_3` shows a lower level of
+    detail of the same model). Unity stores that as an override of
+    ``m_Mesh`` on the MeshFilter inside the source prefab. ``sidecar`` is
+    the source prefab's entity map, which says which entity was made of the
+    object that carries that filter; ``model_hint_for(guid, file id, owner)``
+    gives the model of a mesh reference, converting it if need be.
+
+    The patch sets the entity's model whole. Its material slots keep the
+    labels of the mesh it had: two meshes of one model file mostly share
+    them. What cannot be placed is reported to ``coverage``."""
+    sidecar = sidecar or {}
+    owners, aliases = sidecar.get("mesh_owners", {}), sidecar.get("entity_aliases", {})
+    patches: List[Dict] = []
+    for modification in modifications:
+        if (modification.get('propertyPath') or '').strip() != 'm_Mesh':
+            continue
+        reference = modification.get('objectReference') or {}
+        alias = aliases.get(owners.get(str((modification.get('target') or {}).get('fileID', ''))))
+        hint = (model_hint_for(reference.get('guid', ''), str(reference.get('fileID', '')), instance_name)
+                if alias and reference.get('guid') and model_hint_for else None)
+        if hint:
+            patches.append({
+                "op":    "add",
+                "path":  f"/Entities/{alias}/Components/AZ::Render::EditorMeshComponent"
+                         f"/Controller/Configuration/ModelAsset",
+                "value": {"assetHint": hint},
+            })
+        coverage.record_modification('m_Mesh', handled=bool(hint), example_value=reference.get('guid', ''))
+    return patches
+
+
+def light_override_patches(modifications: List[Dict], sidecar: Optional[Dict], coverage) -> List[Dict]:
+    """The patches for an instance's overrides of the lights inside it.
+
+    Unity writes one modification per property (``m_Range``, ``m_Intensity``,
+    ``m_Color.r``, ...), each naming the Light inside the source prefab.
+    ``sidecar`` is that prefab's entity map: its ``light_owners`` say which
+    entity and component each light was written on. What a property sets is
+    the light processor's knowledge (``override_configuration``); a value is
+    added whole, so it lands whether the prefab wrote one there or not.
+
+    Every modification that names a known light is reported to ``coverage``
+    here, used or not: the caller skips them (``overrides_a_light``)."""
+    owners = (sidecar or {}).get("light_owners", {})
+    by_light: Dict[str, Dict[str, object]] = {}
+    for modification in modifications:
+        if overrides_a_light(modification, sidecar):
+            target_id = str((modification.get('target') or {}).get('fileID', ''))
+            by_light.setdefault(target_id, {})[(modification.get('propertyPath') or '').strip()] = \
+                modification.get('value')
+
+    patches: List[Dict] = []
+    for target_id, properties in by_light.items():
+        record = owners[target_id]
+        values, used = override_configuration(record, properties)
+        base = f"/Entities/{record['entity']}/Components/{record['component']}/Controller/Configuration"
+        for key, value in values.items():
+            patches.append({"op": "add", "path": f"{base}/{key}", "value": value})
+        for path, value in properties.items():
+            coverage.record_modification(path, handled=path in used, example_value=value)
+    return patches
+
+
+def overrides_a_light(modification: Dict, sidecar: Optional[Dict]) -> bool:
+    """Whether a modification names a light the source prefab's entity map
+    knows (see ``light_override_patches``)."""
+    target_id = str((modification.get('target') or {}).get('fileID', ''))
+    return target_id in (sidecar or {}).get("light_owners", {})
 
 
 def child_transform_patches(modifications: List[Dict], sidecar: Optional[Dict],
@@ -797,27 +1150,31 @@ def create_entity_recursive(worker, go: GameObject, all_game_objects: Dict,
         else:
             parent_entity_id = ""
 
-    # Unity prefab roots carry dead transform data. See the original
-    # method comment for full reasoning — when this entity is the
-    # prefab's root (parent is ContainerEntity), force identity.
+    # Where a prefab's root stands is not the prefab's to say: whoever
+    # places it gives its position and rotation (Unity stores both on every
+    # placement), and the container entity carries them. So the root
+    # entity's own position and rotation are left out.
+    #
+    # Its scale is kept. A placement only stores a scale it changes; one
+    # that changes nothing has the prefab root's own (a rock saved at twice
+    # its model's size is that large wherever it is placed).
     is_prefab_root = (parent_entity_id == "ContainerEntity")
     transform_rule = "axis_swap"        # for the conversion trace
     if is_prefab_root and (
         any(abs(v) > 0.0001 for v in o3de_transform.position)
         or any(abs(v) > 0.0001 for v in quaternion_to_euler(o3de_transform.rotation))
-        or needs_nonuniform
-        or abs(o3de_transform.scale[0] - 1.0) > 0.0001
     ):
         worker.log(
-            f"  [Transform] Discarding non-identity root transform on "
-            f"'{go.name}' (pos={o3de_transform.position}, "
-            f"scale={o3de_transform.scale}) — Unity prefab root "
-            f"transforms are dead data, placement comes from the "
-            f"consumer's ContainerEntity patch."
+            f"  [Transform] Leaving out the root's position and rotation on "
+            f"'{go.name}' (pos={o3de_transform.position}) — a prefab is "
+            f"placed by whoever instances it, on the ContainerEntity."
         )
-        o3de_transform   = Transform((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), (1.0, 1.0, 1.0))
-        needs_nonuniform = False
+        o3de_transform   = Transform((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), o3de_transform.scale)
         transform_rule   = "root_discarded"
+
+    o3de_transform, needs_nonuniform = with_mesh_stretch(go, o3de_transform, needs_nonuniform)
+    o3de_transform = with_light_turn(go, o3de_transform, needs_nonuniform,
+                                     getattr(worker, "options", None))
 
     entity = {
         "Id":   entity_id,
@@ -880,12 +1237,8 @@ def create_entity_recursive(worker, go: GameObject, all_game_objects: Dict,
         entity["Components"]["EditorNonUniformScaleComponent"] = non_uniform_scale_component(
             generate_component_id(worker), o3de_transform.scale)
         # The engine applies this scale to the entity's own mesh and shapes
-        # only. Unity scales everything below as well.
-        if go.children_ids:
-            worker.coverage.warn(
-                f"'{go.name}' has a non-uniform scale {tuple(o3de_transform.scale)} and "
-                f"{len(go.children_ids)} child object(s): O3DE does not pass a non-uniform "
-                f"scale down, so the children keep their size and place.")
+        # only. Unity scales everything below as well: the parser has carried
+        # it down to the objects below already (`platforms.unity.scale_carry`).
 
     # Component Processors — emit phase (mesh, material, physics, …).
     # Each processor runs in WEIGHT order and may add child entities.
@@ -946,6 +1299,15 @@ def create_entity_recursive(worker, go: GameObject, all_game_objects: Dict,
                 child_order.append(child_entity_id)
 
     child_order.extend(collider_child_ids)
+
+    # The entities the processors made beside this one (a collider or a
+    # light on a child), for the entity map; and the object's active state.
+    if collider_child_ids:
+        getattr(worker, "_extra_entities", {}).setdefault(go.file_id, []).extend(collider_child_ids)
+    if go.file_id in getattr(worker, "_inactive_ids", ()):
+        mark_inactive(entity)
+        for child_id in collider_child_ids:
+            mark_inactive(entities_dict[child_id])
 
     if child_order:
         entity["Components"]["EditorEntitySortComponent"] = {

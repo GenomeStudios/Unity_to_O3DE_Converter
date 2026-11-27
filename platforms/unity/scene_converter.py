@@ -32,9 +32,41 @@ from typing import Any, Dict, List, Tuple, Optional, Set
 from platforms.unity.components import load_component_processors, build_dispatch_table
 from platforms.unity.components.base import ProcessingContext
 from integrated_asset_processor import CoverageTracker
-from platforms.unity.prefab import add_model_instance, root_override_target, targets_root
+from platforms.unity.prefab import (
+    add_model_instance, component_ranks, in_unity_order, lost_root, root_override_target, targets_root,
+)
 from platforms.unity.types import Transform, GameObject
 from targets.o3de.prefab_writer import UNIFORM_SCALE
+
+
+# =============================================================================
+# STRIPPED TRANSFORMS
+# =============================================================================
+
+# A transform of a placed prefab that the scene itself refers to, as the
+# parent of something added below the placement. The scene keeps only what
+# it is a copy of and which placement it belongs to. The two are spelled
+# m_CorrespondingSourceObject and m_PrefabInstance since Unity 2018.3,
+# m_PrefabParentObject and m_PrefabInternal before.
+STRIPPED_TRANSFORM = re.compile(r'--- !u!4 &(\d+) stripped\nTransform:\n(.*?)(?=--- !u!|\Z)', re.DOTALL)
+STRIPPED_SOURCE = re.compile(r'm_(?:CorrespondingSourceObject|PrefabParentObject): \{fileID: (\d+)')
+STRIPPED_PLACEMENT = re.compile(r'm_(?:PrefabInstance|PrefabInternal): \{fileID: (\d+)')
+
+
+def stripped_transforms(scene_text: str) -> Dict[str, Tuple[str, str]]:
+    """``{file id of a stripped transform: (file id of the placement it
+    belongs to, file id of the transform in the source prefab)}``."""
+    found: Dict[str, Tuple[str, str]] = {}
+    for anchor, body in STRIPPED_TRANSFORM.findall(scene_text):
+        source, placement = STRIPPED_SOURCE.search(body), STRIPPED_PLACEMENT.search(body)
+        if source and placement and placement.group(1) != '0':
+            found[anchor] = (placement.group(1), source.group(1))
+    return found
+
+
+def prefab_key(converted_prefab: Path) -> str:
+    """One spelling of a converted prefab's path, to look things up by."""
+    return os.path.normcase(os.path.abspath(str(converted_prefab)))
 
 
 class PrefabDatabase:
@@ -85,6 +117,13 @@ class PrefabDatabase:
             pass
         return None
     
+    def add_converted_prefab(self, unity_guid: str, converted_prefab: Path) -> None:
+        """A Unity prefab's converted file, where Stage 1 wrote it. Two
+        prefabs of one name in different folders are kept apart this way;
+        by name the second would take the first one's place."""
+        self.prefab_guids[unity_guid] = Path(converted_prefab)
+        self.guid_to_name[unity_guid] = Path(converted_prefab).stem
+
     def add_guid_mapping(self, unity_guid: str, prefab_name: str) -> None:
         """Manually add Unity GUID -> prefab name mapping"""
         if prefab_name in self.prefab_paths:
@@ -127,6 +166,7 @@ class UnitySceneConverter:
 
     def __init__(self, prefab_db: PrefabDatabase, log_callback=None, *,
                  entity_maps_by_stem: Optional[Dict[str, Dict]] = None,
+                 entity_maps_by_path: Optional[Dict[str, Dict]] = None,
                  asset_index: Optional[Dict] = None,
                  trace=None,
                  asset_processor=None):
@@ -138,6 +178,10 @@ class UnitySceneConverter:
         models, collision meshes, and a model file instanced straight in the
         scene becomes entities. Without it such objects are placed with
         their transforms, lights and primitive colliders only.
+
+        `entity_maps_by_path` holds each converted prefab's entity map
+        under `prefab_key(<converted file>)`; `entity_maps_by_stem` the same
+        maps under the file's name, for a caller that knows no more.
 
         `entity_maps_by_stem` and `asset_index` are sourced from the
         project file's `outputs.asset_processor` section by the tab
@@ -153,6 +197,9 @@ class UnitySceneConverter:
         # What the scene's own objects show, converted (see
         # `IntegratedAssetProcessor.convert_assets_of`). Filled per level.
         self._scene_assets: Dict[str, Any] = {}
+        # The scene's objects that Unity has switched off, or that sit below
+        # one that is. Filled per level.
+        self._inactive_ids: set = set()
         # Optional `conversion_trace.ConversionTrace`; None changes nothing.
         self.trace = trace
         self.scene_path = ""
@@ -178,6 +225,10 @@ class UnitySceneConverter:
 
         # Collected component blocks from the scene (anchor -> {type, data})
         self.components_data: Dict[str, Dict] = {}
+        # {component file id: its place in its object's m_Component list}
+        self.component_rank: Dict[str, int] = {}
+        # The scene's stripped transforms (`stripped_transforms`).
+        self.stripped_transforms: Dict[str, Tuple[str, str]] = {}
 
         # The scene's RenderSettings block: its ambient light (see
         # `platforms.unity.scene_lighting`). None until a scene is parsed.
@@ -192,6 +243,7 @@ class UnitySceneConverter:
         # output prefab stem (e.g. "Foo") so the lookup matches a Stage 2
         # prefab reference like `<output>/Prefabs/Foo.prefab`.
         self._entity_maps_by_stem: Dict[str, Dict] = dict(entity_maps_by_stem or {})
+        self._entity_maps_by_path: Dict[str, Dict] = dict(entity_maps_by_path or {})
         # Asset index shape: {materials: {guid: hint}, meshes: {guid: stem},
         # prefabs: {guid: source_path}}.
         self._asset_index: Dict = dict(asset_index or {})
@@ -206,10 +258,12 @@ class UnitySceneConverter:
         self.missing_prefabs.clear()
         self.prefab_instances.clear()
         self.components_data.clear()
+        self.component_rank.clear()
         self.render_settings = None
         
         with open(scene_path, 'r', encoding='utf-8') as f:
             content = f.read()
+        self.stripped_transforms = stripped_transforms(content)
         
         # First pass: Extract PrefabInstance blocks to get GUID mappings.
         # The doc body key is `PrefabInstance:` in the modern (Unity 2018.3+)
@@ -238,6 +292,7 @@ class UnitySceneConverter:
                 if 'Transform' in doc:
                     self._parse_transform(doc['Transform'], anchor, prefab_instance_guids)
                 elif 'GameObject' in doc:
+                    self.component_rank.update(component_ranks(doc['GameObject']))
                     self._parse_game_object(doc['GameObject'], anchor, prefab_instance_guids)
                 elif 'PrefabInstance' in doc:
                     self._parse_prefab_instance(doc['PrefabInstance'], anchor)
@@ -279,6 +334,11 @@ class UnitySceneConverter:
         self._dispatch_component_processors()
         self._resolve_prefab_references()
         self._process_prefab_instances()
+        self._hang_below_placements()
+        # A scale that differs by axis reaches nothing below its entity in
+        # O3DE: it is carried down to the objects below here.
+        from platforms.unity.scale_carry import carry_scales_down
+        carry_scales_down(self.game_objects, self.coverage.warn)
     
     def _parse_transform(self, transform_data: Dict, transform_anchor: str, prefab_instance_guids: Dict) -> None:
         """Parse Transform component"""
@@ -385,7 +445,8 @@ class UnitySceneConverter:
                 prefab_source_guid=prefab_guid if is_prefab else None,
                 prefab_name=name if is_prefab else None
             )
-    
+        self.game_objects[file_id].is_active = str(go_data.get('m_IsActive', 1)) != '0'
+
     def _parse_prefab_instance(self, prefab_data: Dict, anchor: str = "") -> None:
         """
         Parse PrefabInstance data — capture transform overrides for the existing
@@ -492,10 +553,21 @@ class UnitySceneConverter:
             for child_id in go.children_ids:
                 if child_id in self.game_objects:
                     self.game_objects[child_id].parent_id = file_id
-    
+
+        # An object that names a parent which does not list it: the root of
+        # a model file placed below another object of the scene. The parent
+        # lists the placement by a transform id of the scene's own, which
+        # names no object here. Without this the object is neither a root
+        # nor anyone's child, and is never written.
+        for file_id, go in self.game_objects.items():
+            parent = self.game_objects.get(go.parent_id) if go.parent_id else None
+            if parent is not None and file_id not in parent.children_ids:
+                parent.children_ids.append(file_id)
+
     def _dispatch_component_processors(self) -> None:
-        """Dispatch collected component blocks to processor parse() methods."""
-        for comp_info in self.components_data.values():
+        """Dispatch collected component blocks to processor parse() methods,
+        each object's in Unity's order (``prefab.in_unity_order``)."""
+        for comp_id, comp_info in in_unity_order(self.components_data, self.component_rank).items():
             comp_type = comp_info['type']
             comp_data = comp_info['data']
 
@@ -506,6 +578,7 @@ class UnitySceneConverter:
                 continue
 
             go = self.game_objects[go_id]
+            go.component_ids[comp_type] = str(comp_id)
             processor = self.component_dispatch.get(comp_type)
             if processor:
                 processor.parse(comp_type, comp_data, go, self.log)
@@ -570,6 +643,10 @@ class UnitySceneConverter:
                     go.parent_id = parent_go_id
                     if parent_go_id in self.game_objects:
                         self.game_objects[parent_go_id].children_ids.append(file_id)
+                elif instance['parent_fileID'] in self.stripped_transforms:
+                    # Placed below an object of another placement
+                    # (`_hang_below_placements` finds it).
+                    go.parent_id = instance['parent_fileID']
 
             self.game_objects[file_id] = go
 
@@ -583,15 +660,73 @@ class UnitySceneConverter:
                 self.missing_prefabs.add(name)
                 self.coverage.record_missing_prefab(instance['guid'])
     
+    # -------------------------------------------------------------------------
+    # WHAT A SCENE ADDS BELOW A PLACED PREFAB
+    # A rock dropped under a placed rock, a lamp hung on a placed wall: the
+    # scene's own object, parented to an object inside the placement. Unity
+    # names that parent by a stripped transform.
+    # -------------------------------------------------------------------------
+
+    def _hang_below_placements(self) -> None:
+        """Give every object and placement that hangs below an object of a
+        placed prefab its parent: the placement, with the transform it hangs
+        under inside it noted as ``component_data["parent_in_placement"]``
+        (that transform's file id in the source prefab). Before this they
+        named a parent the scene has no object for, and were never written."""
+        placement_of = {go.component_data.get('unity_prefab_instance_file_id'): go
+                        for go in self.game_objects.values() if go.is_prefab_instance}
+        for go in list(self.game_objects.values()):
+            stripped = self.stripped_transforms.get(str(go.parent_id or ''))
+            if stripped is None:
+                continue
+            placement = placement_of.get(stripped[0])
+            if placement is None:
+                self.coverage.warn(f"'{go.name}' hangs below a placed prefab the scene does not hold; "
+                                   f"it is written at the top of the level.")
+                go.parent_id = None
+                continue
+            go.parent_id = placement.file_id
+            go.component_data["parent_in_placement"] = stripped[1]
+            if go.file_id not in placement.children_ids:
+                placement.children_ids.append(go.file_id)
+
+    def _create_objects_below_placement(self, placement: GameObject, instance_id: str,
+                                        all_game_objects: Dict, entities_dict: Dict, instances_dict: Dict,
+                                        entity_id_map: Dict, output_base: Path) -> None:
+        """Write what the scene hangs below an object of this placed prefab.
+
+        Each is the level's own entity (or placement) and names its parent
+        inside the placement by path, ``Instance_[n]/Entity_[m]``: the engine
+        reads an entity reference relative to the prefab that holds it
+        (``InstanceEntityIdMapper::MapJsonToId``). An object whose parent
+        has no entity in the converted prefab hangs under the prefab's root."""
+        sidecar = self._load_entity_map_sidecar(self.prefab_references[placement.file_id]) or {}
+        for child_id in placement.children_ids:
+            child = all_game_objects.get(child_id)
+            if child is None or "parent_in_placement" not in child.component_data:
+                continue
+            owner = (sidecar.get("transform_owners") or {}).get(str(child.component_data["parent_in_placement"]))
+            alias = (sidecar.get("entity_aliases") or {}).get(owner)
+            if not alias:
+                alias = sidecar.get("root_entity") or "ContainerEntity"
+                self.coverage.warn(f"'{child.name}' hangs below an object of '{placement.name}' that has no "
+                                   f"entity of its own; it is put under the prefab's root.")
+            self._create_entity_recursive(child, all_game_objects, entities_dict, instances_dict,
+                                          entity_id_map, output_base, f"{instance_id}/{alias}")
+
     def convert_to_o3de_coordinates(self, unity_transform: Transform) -> Tuple[Transform, bool]:
         """Delegate to the canonical O3DE-target coordinate converter."""
         from targets.o3de.prefab_writer import convert_to_o3de_coordinates
         return convert_to_o3de_coordinates(unity_transform)
     
-    def create_o3de_level(self, output_path: str, output_base: Path) -> Tuple[int, int, int]:
-        """Create O3DE level file in JSON format"""
+    def create_o3de_level(self, output_path: str, output_base: Path,
+                          level_name: Optional[str] = None) -> Tuple[int, int, int]:
+        """Create O3DE level file in JSON format. ``level_name`` is what the
+        level is known by (``stage_runner.level_name_for``): the file's name
+        when it is not given."""
         if self.trace is not None:
-            self.trace.begin_scene(Path(output_path).stem, Path(self.scene_path), Path(output_path))
+            self.trace.begin_scene(level_name or Path(output_path).stem,
+                                   Path(self.scene_path), Path(output_path))
         level_data = {
             "ContainerEntity": self._create_level_container(),
             "Entities": {},
@@ -610,6 +745,9 @@ class UnitySceneConverter:
             self._scene_assets = self.asset_processor.convert_assets_of(
                 own_objects, Path(self.scene_path).name)
 
+        from targets.o3de.prefab_writer import inactive_objects
+        self._inactive_ids = inactive_objects(self.game_objects)
+
         prefab_ref_count = 0
         blank_entity_count = 0
         
@@ -627,6 +765,9 @@ class UnitySceneConverter:
                 if self.trace is not None:
                     self.trace.record_instance(root_go, instance_id, prefab_path,
                                                level_data["Instances"][instance_id])
+                self._create_objects_below_placement(
+                    root_go, instance_id, self.game_objects, level_data["Entities"],
+                    level_data["Instances"], entity_id_map, output_base)
                 
                 child_order.append(f"{instance_id}/ContainerEntity")
                 prefab_ref_count += 1
@@ -656,6 +797,16 @@ class UnitySceneConverter:
         
         return total_entities + total_instances, total_instances, total_entities
     
+    def _material_hint(self, asset_index: Optional[Dict], material_guid: str) -> Optional[str]:
+        """The hint of a converted material: from Stage 1's index, else
+        converted now by the stage's own worker. A material that only a
+        scene's overrides use (a carpet laid over a common floor) is in no
+        prefab, so Stage 1 never met it."""
+        hint = ((asset_index or {}).get('materials') or {}).get(material_guid)
+        if not hint and self.asset_processor is not None:
+            hint = self.asset_processor.material_hint_for(material_guid)
+        return hint
+
     # -------------------------------------------------------------------------
     # SCENE LIGHTING
     # -------------------------------------------------------------------------
@@ -738,6 +889,22 @@ class UnitySceneConverter:
             }
         }
     
+    def _drop_lost_root_overrides(self, go: GameObject, sidecar: Optional[Dict]) -> None:
+        """Put a placement whose overrides name a root its prefab no longer
+        has (``prefab.lost_root``) where Unity puts it: where the prefab's
+        own root stands, with those overrides dropped."""
+        if not lost_root(go.prefab_modifications, sidecar, go.prefab_source_guid):
+            return
+        root = root_override_target(go.prefab_modifications)
+        go.prefab_modifications = [mod for mod in go.prefab_modifications if not targets_root(mod, root)]
+        go.transform = Transform(tuple(sidecar.get("root_position") or (0.0, 0.0, 0.0)),
+                                 tuple(sidecar.get("root_rotation") or (0.0, 0.0, 0.0, 1.0)),
+                                 (1.0, 1.0, 1.0))
+        self.coverage.warn(
+            f"The placement '{go.name}' was saved against an earlier form of its prefab: its position "
+            f"and rotation name an object the prefab no longer has. Unity drops them and so does the "
+            f"converter; it stands where the prefab's own root stands.")
+
     def _convert_to_assets_path(self, prefab_path: Path) -> str:
         """Return the O3DE prefab Source path for ``prefab_path``.
 
@@ -775,15 +942,18 @@ class UnitySceneConverter:
 
         Same tiered scheme as Stage 1's nested-instance emitter:
           Tier 1  Transform — translate, rotate, scale on the ContainerEntity
-          Tier 2  m_IsActive — logged to coverage (schema TBD)
-          Tier 3  m_Materials.Array.data[N] — patch the assetHint in the
-                  target entity's EditorMaterialComponent materialsByLabel
-                  entry. Label key = FBX-internal material name at slot N
-                  (read from the source prefab's sidecar
-                  `material_slot_labels`).
+          Tier 2  m_IsActive — the object and everything below it switched
+                  off or on (`prefab_writer.active_state_patches`)
+          Tier 3  m_Materials.Array.data[N] — the slot's entry added on the
+                  entity of the renderer the override targets
+                  (`prefab_writer.material_override_patches`). Label key =
+                  FBX-internal material name at slot N (read from the
+                  source prefab's sidecar `material_slot_labels`).
         Unhandled propertyPaths are recorded into self.coverage.
         """
         source_path = self._convert_to_assets_path(prefab_path)
+        sidecar = self._load_entity_map_sidecar(prefab_path)
+        self._drop_lost_root_overrides(go, sidecar)
         o3de_transform, _ = self.convert_to_o3de_coordinates(go.transform)
         euler             = self._quaternion_to_euler(o3de_transform.rotation)
 
@@ -812,24 +982,11 @@ class UnitySceneConverter:
                     "value": axis_val,
                 })
 
-        sx, sy, sz = o3de_transform.scale
-        non_uniform = False
-        if abs(sx - 1.0) > 0.0001 and abs(sx - sy) < 0.0001 and abs(sy - sz) < 0.0001:
-            patches.append({
-                "op":   "replace",
-                "path": f"/ContainerEntity/Components/TransformComponent/Transform Data/{UNIFORM_SCALE}",
-                "value": sx,
-            })
-        elif (abs(sx - 1.0) > 0.0001 or abs(sy - 1.0) > 0.0001 or abs(sz - 1.0) > 0.0001):
-            non_uniform = True
+        # Scale: what the placement sets, on the instance's root entity.
+        from targets.o3de.prefab_writer import instance_scale_patches
+        patches += instance_scale_patches(go, sidecar, self._generate_component_id(), self.coverage.warn)
 
         # ---- Tier 2 + 3: walk modifications by propertyPath ----
-        sidecar = self._load_entity_map_sidecar(prefab_path)
-        if non_uniform:
-            # A component on the instance's root entity; see the helper.
-            from targets.o3de.prefab_writer import instance_non_uniform_scale_patches
-            patches += instance_non_uniform_scale_patches(
-                (sx, sy, sz), sidecar, self._generate_component_id(), go.name, self.coverage.warn)
         entity_aliases       = (sidecar or {}).get("entity_aliases", {})
         material_slot_labels = (sidecar or {}).get("material_slot_labels", {})
 
@@ -839,9 +996,23 @@ class UnitySceneConverter:
                 f"non-transform overrides on scene instance '{go.name}' cannot be targeted."
             )
 
+        # An instance below a switched-off object of the scene: all of it off.
+        if go.file_id in self._inactive_ids:
+            from targets.o3de.prefab_writer import active_state_patches
+            patches += active_state_patches("", False, sidecar)
+
         # Transform overrides on objects inside the instance.
-        from targets.o3de.prefab_writer import child_transform_patches
+        from targets.o3de.prefab_writer import (
+            child_transform_patches, light_override_patches, mesh_override_patches, overrides_a_light)
         patches += child_transform_patches(go.prefab_modifications, sidecar, go.name, self.coverage.warn)
+
+        # Overrides of the lights inside the instance.
+        patches += light_override_patches(go.prefab_modifications, sidecar, self.coverage)
+
+        # Overrides of the meshes inside the instance.
+        patches += mesh_override_patches(go.prefab_modifications, sidecar,
+                                         getattr(self.asset_processor, "model_hint_for", None),
+                                         go.name, self.coverage)
 
         material_overrides: Dict[str, Dict[int, str]] = {}
 
@@ -852,6 +1023,9 @@ class UnitySceneConverter:
             target    = mod.get('target') or {}
             target_id = str(target.get('fileID', ''))
 
+            if overrides_a_light(mod, sidecar) or prop_path == 'm_Mesh':
+                continue
+
             if prop_path == 'm_Name' or prop_path.startswith(
                 ('m_LocalPosition.', 'm_LocalRotation.', 'm_LocalScale.')
             ):
@@ -859,11 +1033,10 @@ class UnitySceneConverter:
                 continue
 
             if prop_path == 'm_IsActive':
-                self.coverage.record_modification(prop_path, handled=False, example_value=value)
-                self.coverage.warn(
-                    f"m_IsActive override on scene instance '{go.name}' (value={value}) "
-                    f"not emitted — O3DE disabled-entity patch path needs confirmation."
-                )
+                from targets.o3de.prefab_writer import active_state_patches
+                state_patches = active_state_patches(target_id, str(value) != '0', sidecar)
+                patches.extend(state_patches)
+                self.coverage.record_modification(prop_path, handled=bool(state_patches), example_value=value)
                 continue
 
             m = re.match(r'^m_Materials\.Array\.data\[(\d+)\]$', prop_path)
@@ -883,68 +1056,13 @@ class UnitySceneConverter:
                 example_value=value if value not in (None, '') else objref,
             )
 
-        # Emit material slot patches.
+        # Emit material slot patches: each override onto the renderer it
+        # targets, its material converted now if no prefab brought it in.
+        from targets.o3de.prefab_writer import material_override_patches
         asset_index = self._get_asset_index(prefab_path)
-        for target_id, slot_map in material_overrides.items():
-            entity_alias = entity_aliases.get(target_id)
-            if not entity_alias:
-                self.coverage.warn(
-                    f"Material override on scene instance '{go.name}' targets "
-                    f"fileID={target_id} not in source's entity map — skipped."
-                )
-                for slot_idx, mat_guid in slot_map.items():
-                    self.coverage.record_modification(
-                        f'm_Materials.Array.data[{slot_idx}]',
-                        handled=False, example_value=mat_guid,
-                    )
-                continue
-
-            # FBX-internal material names per slot index for this target,
-            # recorded by the source prefab's converter run. Only valid keys
-            # for the base prefab's materialsByLabel.
-            slot_labels = material_slot_labels.get(target_id, []) or []
-
-            for slot_idx, mat_guid in slot_map.items():
-                asset_hint = (asset_index or {}).get('materials', {}).get(mat_guid)
-                if not asset_hint:
-                    self.coverage.record_missing_material(mat_guid)
-                    self.coverage.record_modification(
-                        f'm_Materials.Array.data[{slot_idx}]',
-                        handled=False, example_value=mat_guid,
-                    )
-                    continue
-
-                # Label = FBX-internal material name at this ordinal position
-                # (the only key that matches the base prefab's
-                # materialsByLabel entry at runtime).
-                label = (slot_labels[slot_idx]
-                         if slot_idx < len(slot_labels) else '')
-
-                if not label:
-                    self.coverage.warn(
-                        f"Material override on scene instance '{go.name}' "
-                        f"slot {slot_idx} — no FBX-internal label recorded "
-                        f"in sidecar (source prefab predates the label "
-                        f"refactor, or FBX parse failed at emit time). "
-                        f"Patch skipped — re-convert the source prefab to fix."
-                    )
-                    self.coverage.record_modification(
-                        f'm_Materials.Array.data[{slot_idx}]',
-                        handled=False, example_value=mat_guid,
-                    )
-                    continue
-
-                patches.append({
-                    "op":   "replace",
-                    "path": (f"/Entities/{entity_alias}/Components/EditorMaterialComponent/"
-                             f"Controller/Configuration/materialsByLabel/{label}/"
-                             f"MaterialAsset/assetHint"),
-                    "value": asset_hint,
-                })
-                self.coverage.record_modification(
-                    f'm_Materials.Array.data[{slot_idx}]',
-                    handled=True, example_value=asset_hint,
-                )
+        patches += material_override_patches(
+            material_overrides, sidecar, lambda guid: self._material_hint(asset_index, guid),
+            go.name, self.coverage)
 
         # Sibling-field accounting.
         for _ in go.prefab_added_components:    self.coverage.record_added_component()
@@ -974,8 +1092,12 @@ class UnitySceneConverter:
         construction time. Replaces the old
         `<output>/.ImporterData/<stem>.entitymap.json` sidecar read.
         Returns None when no record exists for that stem (i.e. Stage 1
-        hasn't processed the prefab in the active project)."""
-        return self._entity_maps_by_stem.get(prefab_path.stem)
+        hasn't processed the prefab in the active project).
+
+        The map is looked up by the converted file itself first: two
+        prefabs of one name in different folders have different maps."""
+        return (self._entity_maps_by_path.get(prefab_key(prefab_path))
+                or self._entity_maps_by_stem.get(prefab_path.stem))
 
     def _get_asset_index(self, hint_path: Path) -> Dict:
         """Return the project's asset index (materials / meshes / prefabs
@@ -1080,12 +1202,18 @@ class UnitySceneConverter:
             if self.trace is not None:
                 self.trace.record_instance(go, instance_id, prefab_path,
                                            instances_dict[instance_id])
+            self._create_objects_below_placement(go, instance_id, all_game_objects, entities_dict,
+                                                 instances_dict, entity_id_map, output_base)
             return f"{instance_id}/ContainerEntity"
         
         entity_id = self._generate_entity_id()
         entity_id_map[go.file_id] = entity_id
         
         o3de_transform, needs_nonuniform = self.convert_to_o3de_coordinates(go.transform)
+        from targets.o3de.prefab_writer import with_light_turn, with_mesh_stretch
+        o3de_transform, needs_nonuniform = with_mesh_stretch(go, o3de_transform, needs_nonuniform)
+        o3de_transform = with_light_turn(go, o3de_transform, needs_nonuniform,
+                                         getattr(self.asset_processor, "options", None))
         
         entity = {
             "Id": entity_id,
@@ -1202,6 +1330,14 @@ class UnitySceneConverter:
                     child_order.append(child_entity_id)
 
         child_order.extend(collider_child_ids)
+
+        # An object Unity has switched off: its entity and the ones made
+        # beside it start inactive and hidden.
+        if go.file_id in self._inactive_ids:
+            from targets.o3de.prefab_writer import mark_inactive
+            mark_inactive(entity)
+            for child_id in collider_child_ids:
+                mark_inactive(entities_dict[child_id])
 
         if child_order:
             entity["Components"]["EditorEntitySortComponent"] = {

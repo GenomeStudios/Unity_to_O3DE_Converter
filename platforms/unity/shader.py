@@ -61,7 +61,9 @@ def resolve_shader_name(asset_db, shader_guid: str, shader_fileid: int = 0,
         shader_path = asset_db.resolve_guid(shader_guid)
         if shader_path and shader_path.suffix in (".shader", ".shadergraph"):
             try:
-                with open(shader_path, "r", encoding="utf-8", errors="replace") as f:
+                # "utf-8-sig": a pack's shader file may start with a byte
+                # order mark, behind which the name would not be found.
+                with open(shader_path, "r", encoding="utf-8-sig", errors="replace") as f:
                     for _ in range(80):
                         line = f.readline()
                         if not line:

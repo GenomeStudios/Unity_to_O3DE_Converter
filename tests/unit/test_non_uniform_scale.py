@@ -84,7 +84,6 @@ def test_a_stretched_object_gets_the_component_with_its_axes_swapped():
         assert components["EditorNonUniformScaleComponent"]["NonUniformScale"] == [1.821, 0.5, 4.182]
         assert "Scale" not in components["EditorNonUniformScaleComponent"]
         assert "Scale" not in components["TransformComponent"].get("Transform Data", {})
-        assert "EditorNonUniformScaleComponent" not in by_name["Bolt"]["Components"]
 
 
 def test_the_trace_holds_the_scale_that_was_written():
@@ -95,12 +94,16 @@ def test_the_trace_holds_the_scale_that_was_written():
         assert uncovered_in_output(trace) == []
 
 
-def test_a_stretched_object_with_children_is_reported():
+def test_what_hangs_below_a_stretched_object_is_stretched_with_it():
+    """Unity scales everything below an object with it; the engine passes a
+    scale by axis to nothing below its entity. The converter carries it
+    down: the bolt in the frame is as wide as Unity shows it, and nothing
+    is left to report."""
     with tempfile.TemporaryDirectory() as tmp:
-        processor, _, _ = _convert(Path(tmp))
-        warnings = processor.coverage.warnings
-        assert any("'Frame'" in line and "does not pass a non-uniform scale down" in line for line in warnings), warnings
-        assert not any("'Ramp'" in line for line in warnings), warnings
+        processor, _, by_name = _convert(Path(tmp))
+        assert by_name["Frame"]["Components"]["EditorNonUniformScaleComponent"]["NonUniformScale"] == [2.0, 1.0, 1.0]
+        assert by_name["Bolt"]["Components"]["EditorNonUniformScaleComponent"]["NonUniformScale"] == [2.0, 1.0, 1.0]
+        assert not any("'Frame'" in line or "'Bolt'" in line for line in processor.coverage.warnings)
 
 
 # =============================================================================

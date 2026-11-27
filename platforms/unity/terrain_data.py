@@ -18,6 +18,18 @@ in the binary-serialized ``TerrainData`` asset:
     SplatDatabase.m_AlphaTextures[] -> embedded RGBA splatmaps (layer weights)
     Heightmap.{m_Heights,m_Scale,m_Width,m_Height} -> the terrain surface
 
+That is the form of a terrain saved before Unity 2018.3. Since then (and in
+every terrain a later Unity has opened and upgraded):
+
+    SplatDatabase.m_TerrainLayers[] -> each layer is a ``TerrainLayer`` asset
+                                  of its own, a ``.terrainlayer`` file, which
+                                  holds the textures, tiling, metallic and
+                                  smoothness. Unity writes the upgraded ones
+                                  into ``Assets/_TerrainAutoUpgrade``.
+    Heightmap.m_Resolution     -> one number for both sides of the grid
+
+Both forms are read.
+
 Parsing is delegated to UnityPy, which reads the SerializedFile via the type
 tree embedded in the asset. UnityPy is an OPTIONAL dependency: it is imported
 lazily so the rest of the converter runs without it, and is only required when
@@ -25,9 +37,10 @@ a Unity terrain is actually parsed. Use ``unitypy_available()`` to flag it as a
 missing component in the Unity platform's dependency check.
 """
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, Dict, List, Optional
 
 
 # =============================================================================
@@ -173,11 +186,17 @@ def scan_for_terrains(assets_root: Path) -> List[Path]:
 
 def parse_terrain_data(path: Path,
                        want_heightmap: bool = True,
-                       want_alphamaps: bool = True) -> TerrainData:
+                       want_alphamaps: bool = True,
+                       find_asset: Optional[Callable[[str], Optional[Path]]] = None) -> TerrainData:
     """
     Parse a Unity ``TerrainData`` ``.asset``. Layers are always read (cheap);
     the heightmap grid and embedded splatmaps are only decoded when requested,
     so a materials-only run never pays for them.
+
+    ``find_asset`` gives the file of an asset by its guid, for a terrain
+    whose layers are assets of their own. A layer it does not find is looked
+    for among the ``.terrainlayer`` files of the Unity project the terrain
+    lies in (``terrain_layer_files``).
     """
     UnityPy = _require_unitypy()
     path = Path(path)
@@ -195,7 +214,14 @@ def parse_terrain_data(path: Path,
 
     # ── Splat layers ───────────────────────────────────────────────────────
     splat_db = tree.get("m_SplatDatabase", {})
-    for i, splat in enumerate(splat_db.get("m_Splats", [])):
+    # Since Unity 2018.3: each layer an asset of its own.
+    for i, reference in enumerate(splat_db.get("m_TerrainLayers") or []):
+        guid = _pptr_guid(reference, externals)
+        layer_file = (find_asset(guid) if find_asset and guid else None) or \
+            (terrain_layer_files(path).get(guid) if guid else None)
+        terrain.layers.append(read_terrain_layer(i, layer_file))
+    # Before: the layers inside the terrain itself.
+    for i, splat in enumerate(splat_db.get("m_Splats") or []):
         spec = splat.get("specularMetallic") or {}
         terrain.layers.append(SplatLayer(
             index=i,
@@ -214,9 +240,11 @@ def parse_terrain_data(path: Path,
     if want_heightmap:
         hm = tree.get("m_Heightmap", {})
         scale = hm.get("m_Scale", {}) or {}
+        # One resolution for both sides since Unity 2019.3.
+        resolution = int(hm.get("m_Resolution", 0) or 0)
         terrain.heightmap = HeightmapData(
-            width=int(hm.get("m_Width", 0) or 0),
-            height=int(hm.get("m_Height", 0) or 0),
+            width=int(hm.get("m_Width", 0) or 0) or resolution,
+            height=int(hm.get("m_Height", 0) or 0) or resolution,
             scale_x=float(scale.get("x", 1.0)),
             scale_y=float(scale.get("y", 1.0)),
             scale_z=float(scale.get("z", 1.0)),
@@ -232,6 +260,67 @@ def parse_terrain_data(path: Path,
                 terrain.alphamaps.append(AlphamapData(index=i, image=img))
 
     return terrain
+
+
+# =============================================================================
+# TERRAIN LAYERS  (a layer as an asset of its own)
+# =============================================================================
+
+# {a Unity project's Assets folder: {guid: its .terrainlayer file}}
+_layer_files_of: Dict[Path, Dict[str, Path]] = {}
+
+
+def terrain_layer_files(terrain_asset: Path) -> Dict[str, Path]:
+    """``{guid: file}`` of every ``.terrainlayer`` file in the Unity project
+    a terrain lies in: the nearest folder called ``Assets`` above it, searched
+    once. Empty when the terrain lies in no such folder.
+
+    A terrain's layers need not lie beside it: the ones Unity makes when it
+    upgrades an older terrain go to ``Assets/_TerrainAutoUpgrade``, outside
+    any pack's own folder."""
+    assets = next((folder for folder in Path(terrain_asset).resolve().parents if folder.name == "Assets"), None)
+    if assets is None:
+        return {}
+    if assets not in _layer_files_of:
+        found: Dict[str, Path] = {}
+        for meta in assets.rglob("*.terrainlayer.meta"):
+            guid = re.search(r"^guid: ([0-9a-f]{32})", meta.read_text(encoding="utf-8", errors="ignore"), re.M)
+            if guid:
+                found[guid.group(1)] = meta.with_suffix("")
+        _layer_files_of[assets] = found
+    return _layer_files_of[assets]
+
+
+def read_terrain_layer(index: int, layer_file: Optional[Path]) -> SplatLayer:
+    """The layer a ``.terrainlayer`` file holds, read from its text form. A
+    file that is missing, or is not text, gives a layer without textures."""
+    try:
+        text = Path(layer_file).read_text(encoding="utf-8") if layer_file else ""
+    except (OSError, UnicodeDecodeError):
+        text = ""
+
+    def guid_of(key: str) -> Optional[str]:
+        found = re.search(rf"^\s*{key}: \{{fileID: \d+, guid: ([0-9a-f]{{32}})", text, re.M)
+        return found.group(1) if found else None
+
+    def number(key: str, default: float) -> float:
+        found = re.search(rf"^\s*{key}: (-?[\d.eE+-]+)\s*$", text, re.M)
+        return float(found.group(1)) if found else default
+
+    def pair(key: str, default: float) -> tuple:
+        found = re.search(rf"^\s*{key}: \{{x: (-?[\d.eE+-]+), y: (-?[\d.eE+-]+)\}}", text, re.M)
+        return (float(found.group(1)), float(found.group(2))) if found else (default, default)
+
+    tile_size, tile_offset = pair("m_TileSize", 1.0), pair("m_TileOffset", 0.0)
+    return SplatLayer(
+        index=index,
+        albedo_guid=guid_of("m_DiffuseTexture"),
+        normal_guid=guid_of("m_NormalMapTexture"),
+        tile_size_x=tile_size[0], tile_size_y=tile_size[1],
+        tile_offset_x=tile_offset[0], tile_offset_y=tile_offset[1],
+        metallic=number("m_Metallic", 0.0),
+        smoothness=number("m_Smoothness", 0.0),
+    )
 
 
 # =============================================================================

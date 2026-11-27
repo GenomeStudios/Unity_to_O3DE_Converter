@@ -44,7 +44,8 @@ import numpy as np
 import compare as cmp
 import level_bake
 import views
-from records import (O3deRecord, Trace, box_corners, latest_truth, matrix_from_rows,
+from platforms.unity.model_import import instance_object_id
+from records import (O3deRecord, Trace, box_corners, file_name_of, latest_truth, matrix_from_rows,
                      matrix_from_trs, transform_points)
 
 STATUS_ORDER = ["fail", "unmatched", "uncooked", "unmeasured", "lod_stripped", "pass"]
@@ -79,13 +80,24 @@ class Cycle:
             self.entities[(path, entity["prefab"]["alias"])] = entity
             self.children[entity["parent"]].append(entity)
 
-        self.cell_of = {Path(cell["source"]).stem: cell for cell in self.recipe.get("instances", [])}
+        # The baked level's cells, by the converted prefab each one holds,
+        # and the converted prefab of each Unity prefab (by guid: names repeat).
+        self.cells = {cell["source"]: cell for cell in self.recipe.get("instances", [])}
+        self.converted = bed.converted()
         self.failed_sources = {Path(source).name.lower(): reasons
                                for source, reasons in (self.cook.get("failed") or {}).items()}
         self._import_cache: Dict[Tuple[str, str], dict] = {}
         # Geometry of the prefab being compared, in the prefab frame, for its
         # sheet of views. None when no sheet is wanted.
         self.drawables: Optional[List[dict]] = None
+
+    def scene_file(self, entry: dict) -> Path:
+        """The Unity scene file of a scene the truth dump holds."""
+        return Path(self.truth.catalog.get("projectPath", "")) / entry["assetPath"]
+
+    def cell_for(self, entry: dict) -> Optional[dict]:
+        """The cell of the baked level that holds a Unity prefab's converted one."""
+        return self.cells.get(self.converted.get(entry["guid"], ""))
 
     def draw(self, side: str, kind: str, points: np.ndarray, edges: np.ndarray) -> None:
         if self.drawables is not None:
@@ -221,7 +233,8 @@ def mesh_element(cycle: Cycle, item: dict, entity: dict, traced: dict, frame_uni
                  frame_o3de: np.ndarray) -> dict:
     truth_key = cycle.truth.mesh_key(item["mesh"])
     element = {"kind": "mesh", "mesh": item["mesh"]["name"], "fbx": Path(item["mesh"]["assetPath"]).name}
-    facts = _fbx_context(cycle, element["fbx"], item["mesh"]["name"])
+    mesh_guid = item["mesh"].get("guid", "")
+    facts = _fbx_context(cycle, element["fbx"], item["mesh"]["name"], mesh_guid)
     element["fbx_facts"] = facts
 
     # A file whose job failed in the Asset Processor did not cook, whatever
@@ -269,7 +282,7 @@ def mesh_element(cycle: Cycle, item: dict, entity: dict, traced: dict, frame_uni
         unity_mapped = cmp.unity_points_to_o3de(unity_local)
         residual = cmp.find_residual(model_local, unity_mapped, cmp.noise_gate(unity_mapped, cycle.tolerance_m))
         kind = cmp.residual_class(residual, cycle.tolerance_m)
-        rule = _visual_rule(cycle, element["fbx"], item["mesh"]["name"])
+        rule = _visual_rule(cycle, element["fbx"], item["mesh"]["name"], mesh_guid)
         cycle._import_cache[cache_key] = {
             "mesh": item["mesh"]["name"], "fbx": element["fbx"], "model": mesh["asset"], "facts": facts,
             "class": kind + explain_shift(residual, rule, cycle.tolerance_m),
@@ -302,11 +315,11 @@ def mesh_element(cycle: Cycle, item: dict, entity: dict, traced: dict, frame_uni
     return element
 
 
-def _visual_rule(cycle: Cycle, fbx_name: str, mesh_name: str) -> dict:
+def _visual_rule(cycle: Cycle, fbx_name: str, mesh_name: str, mesh_guid: str = "") -> dict:
     """The coordinate rule the converter wrote for one mesh node, from the
     last assetinfo write of its file: ``{"translation", "rotation",
     "translation_source"}``, empty when it wrote none."""
-    write = cycle.trace.last_assetinfo(fbx_name) or {}
+    write = cycle.trace.last_assetinfo(fbx_name, mesh_guid) or {}
     for group in write.get("groups", []):
         if group["kind"] == "visual" and group["node_paths"] and \
                 group["node_paths"][0].split(".")[-1] == mesh_name:
@@ -336,16 +349,16 @@ def explain_shift(residual: dict, rule: dict, tolerance_m: float, slack_m: float
     return f" (differs from the rule's {source} translation)"
 
 
-def _fbx_context(cycle: Cycle, fbx_name: str, mesh_name: str) -> dict:
+def _fbx_context(cycle: Cycle, fbx_name: str, mesh_name: str, mesh_guid: str = "") -> dict:
     """What the trace knows about the file a mesh comes from."""
-    facts = cycle.trace.fbx_facts.get(fbx_name) or {}
-    write = cycle.trace.last_assetinfo(fbx_name) or {}
+    facts = cycle.trace.facts_of(fbx_name, mesh_guid)
+    write = cycle.trace.last_assetinfo(fbx_name, mesh_guid) or {}
     node = (facts.get("nodes") or {}).get(mesh_name, {})
     return {
         "up_axis":    {1: "Y-up", 2: "Z-up"}.get(write.get("up_axis"), "unknown up"),
         "mesh_nodes": len(facts.get("geometries") or []),
         "node":       "sub node" if node.get("parent") else "root node",
-        "writes":     sum(1 for w in cycle.trace.assetinfos if w["fbx"] == fbx_name),
+        "writes":     len(cycle.trace.assetinfo_writes(fbx_name, mesh_guid)),
     }
 
 
@@ -395,32 +408,62 @@ def unity_collider_geometry(cycle: Cycle, collider: dict, frame_unity: np.ndarra
     return None
 
 
-def o3de_shapes(cycle: Cycle, entity: dict, traced: dict, container_inverse: np.ndarray) -> List[np.ndarray]:
-    """The collider shapes made for one Unity object, as points in the
-    prefab frame: the entity's own, then those of the collider child
-    entities the converter added for it, in the order it added them."""
-    owners = [entity]
-    child_ids = {child["entity_id"] for child in traced.get("child_entities", [])}
-    ordered = sorted((child for child in cycle.children.get(entity["id"], [])
-                      if child["prefab"]["alias"] in child_ids),
-                     key=lambda child: child["prefab"]["alias"])
-    owners += ordered
+# The entity the converter makes for a collider that cannot sit on its
+# object's own: "<object>_Collider_<n>", n the collider's place in Unity's list.
+COLLIDER_ENTITY = re.compile(r"_Collider_(\d+)$")
 
-    shapes = []
-    for owner in owners:
+NO_POINTS = np.empty((0, 3))
+
+
+def o3de_shapes(cycle: Cycle, entity: dict, traced: dict, container_inverse: np.ndarray,
+                count: int) -> Tuple[List[np.ndarray], int]:
+    """The collider shape made for each of a Unity object's ``count``
+    colliders, as points in the prefab frame, by the collider's place in
+    Unity's list (no points where none was made); and how many shapes are
+    left over.
+
+    A collider with an entity of its own says which one it is by that
+    entity's name. The shapes on the object's own entity belong, in order,
+    to the colliders that have no such entity. (Going by the order of the
+    entities instead pairs the wrong ones as soon as a collider has no shape
+    at all: a mesh collider whose mesh the Unity project has lost.)"""
+    def points_of(owner: dict) -> List[np.ndarray]:
+        found = []
         for shape in owner["colliders"]:
             pose = matrix_from_rows(shape["bodyWorld"]) @ matrix_from_trs(
                 shape["localPosition"], shape["localRotation"], 1.0)
             points = transform_points(container_inverse @ pose, cycle.record.collider_positions(shape["key"]))
             cycle.draw("o3de", "collider", points,
                        views.triangle_edges(cycle.record.collider_indices(shape["key"])))
-            shapes.append(points)
-    return shapes
+            found.append(points)
+        return found
+
+    by_place: Dict[int, np.ndarray] = {}
+    left_over = 0
+    child_ids = {child["entity_id"] for child in traced.get("child_entities", [])}
+    for child in cycle.children.get(entity["id"], []):
+        if child["prefab"]["alias"] not in child_ids:
+            continue
+        numbered = COLLIDER_ENTITY.search(child["name"])
+        shapes = points_of(child)
+        if not shapes:
+            continue
+        if numbered and int(numbered.group(1)) < count and int(numbered.group(1)) not in by_place:
+            by_place[int(numbered.group(1))] = np.concatenate(shapes)
+        else:
+            left_over += len(shapes)
+
+    own = points_of(entity)
+    free = [place for place in range(count) if place not in by_place]
+    for place, shape in zip(free, own):
+        by_place[place] = shape
+    left_over += max(0, len(own) - len(free))
+    return [by_place.get(place, NO_POINTS) for place in range(count)], left_over
 
 
 def collider_elements(cycle: Cycle, item: dict, entity: dict, traced: dict,
                       frame_unity: np.ndarray, container_inverse: np.ndarray) -> List[dict]:
-    shapes = o3de_shapes(cycle, entity, traced, container_inverse)
+    shapes, left_over = o3de_shapes(cycle, entity, traced, container_inverse, len(item["colliders"]))
     elements = []
     for index, collider in enumerate(item["colliders"]):
         element = {"kind": "collider", "collider": collider["type"], "index": index}
@@ -429,7 +472,7 @@ def collider_elements(cycle: Cycle, item: dict, entity: dict, traced: dict,
             elements.append({**element, "status": "unmeasured"})
             continue
         element["collider"] = geometry["kind"]
-        if index >= len(shapes) or len(shapes[index]) == 0:
+        if len(shapes[index]) == 0:
             elements.append({**element, "status": "fail", "residual": "no collider shape in O3DE",
                              "signature": f"collider {geometry['kind']}: no shape in O3DE"})
             continue
@@ -485,9 +528,9 @@ def collider_elements(cycle: Cycle, item: dict, entity: dict, traced: dict,
         elements.append({**element, "status": "fail", "residual": text,
                          "signature": f"collider {geometry['kind']}: {kind_class}"})
 
-    if len(shapes) > len(item["colliders"]):
+    if left_over:
         elements.append({"kind": "collider", "collider": "extra", "status": "fail",
-                         "residual": f"{len(shapes) - len(item['colliders'])} more shape(s) in O3DE than colliders in Unity",
+                         "residual": f"{left_over} more shape(s) in O3DE than colliders in Unity",
                          "signature": "collider: more shapes in O3DE than in Unity"})
     return elements
 
@@ -541,16 +584,16 @@ def _collect_hints(value, hints: List[str]) -> None:
 
 def compare_prefab(cycle: Cycle, entry: dict) -> dict:
     hierarchy = cycle.truth.hierarchy(entry)
-    name = Path(entry["assetPath"]).stem
+    name = cycle.bed.label(entry["assetPath"])
     result = {"name": name, "guid": entry["guid"], "assetPath": entry["assetPath"],
               "objects": [], "notes": []}
     objects = hierarchy["objects"]
 
-    cook_errors = cycle.failed_sources.get(f"{name}.prefab".lower())
+    cook_errors = cycle.failed_sources.get(Path(entry["assetPath"]).name.lower())
     if cook_errors is not None:
         result["notes"].append("its prefab job failed in the Asset Processor: " + (cook_errors[0] if cook_errors else ""))
 
-    cell = cycle.cell_of.get(name)
+    cell = cycle.cell_for(entry)
     container = cycle.entities.get((cell["alias"], "ContainerEntity")) if cell else None
     if not objects or cycle.trace.prefab(entry["guid"]) is None or container is None:
         reason = ("it is empty in Unity" if not objects else
@@ -588,8 +631,9 @@ def compare_prefab(cycle: Cycle, entry: dict) -> dict:
         frame_o3de = container_inverse @ entity_matrix(entity)
 
         record["entity"] = entity["prefab"]["alias"]
-        record["elements"].append(transform_element(cycle, cmp.unity_matrix_to_o3de(frame_unity), frame_o3de, traced))
-        if item["hasMesh"] and item["hasRenderer"]:
+        record["elements"].append(transform_element(
+            cycle, cmp.unity_matrix_to_o3de(frame_unity), own_transform(frame_o3de, traced), traced))
+        if item["hasMesh"] and item["hasRenderer"] and shows_a_mesh(cycle, item):
             record["elements"].append(mesh_element(cycle, item, entity, traced, frame_unity, frame_o3de))
             record["elements"].append(material_element(item, traced))
         if item["colliders"]:
@@ -601,6 +645,14 @@ def compare_prefab(cycle: Cycle, entry: dict) -> dict:
     return result
 
 
+def shows_a_mesh(cycle: Cycle, item: dict) -> bool:
+    """Whether an object's mesh has anything to show. A model file may hold
+    a mesh without vertices; Unity shows nothing for it, the converter emits
+    nothing for it, and there is nothing to measure."""
+    record = cycle.truth.meshes.get(cycle.truth.mesh_key(item["mesh"]))
+    return record is None or record.get("vertexCount", 0) > 0
+
+
 # =============================================================================
 # ONE SCENE
 # Where each placed prefab instance stands in the converted level.
@@ -610,8 +662,8 @@ def compare_scene(cycle: Cycle, entry: dict) -> Optional[dict]:
     """Compare the world placement of every prefab instance of a Unity scene
     with its container entity in the converted level. None when the level
     was not probed."""
-    name = Path(entry["assetPath"]).stem
-    folder = cycle.bed.probe_dir / f"scene_{name}" / "o3de"
+    name = cycle.bed.level_name(cycle.scene_file(entry))
+    folder = cycle.bed.probe_dir / f"scene_{file_name_of(cycle.bed.level_path(cycle.scene_file(entry)))}" / "o3de"
     traced = cycle.trace.scene(name)
     if not (folder / "record.json").is_file() or traced is None:
         return None
@@ -628,6 +680,7 @@ def compare_scene(cycle: Cycle, entry: dict) -> Optional[dict]:
     own = {entity["prefab"]["alias"]: entity for entity in record.entities
            if "/" not in entity["prefab"]["instancePath"] and not entity["prefab"]["isContainer"]}
     own_aliases = {entity["go_file_id"]: entity["entity_id"] for entity in traced["entities"]}
+    own_traces = {entity["go_file_id"]: entity for entity in traced["entities"]}
 
     rows = []
     for item in objects:
@@ -640,7 +693,8 @@ def compare_scene(cycle: Cycle, entry: dict) -> Optional[dict]:
                             "residual": "the converter made no entity for it"})
             else:
                 expected = cmp.unity_matrix_to_o3de(matrix_from_rows(item["matrix"]))
-                element = transform_element(cycle, expected, entity_matrix(entity), {"rule": "scene object"})
+                measured = own_transform(entity_matrix(entity), own_traces.get(link["fileId"]))
+                element = transform_element(cycle, expected, measured, {"rule": "scene object"})
                 row.update({key: element[key] for key in ("status", "delta") if key in element})
                 if element["status"] == "fail":
                     row["signature"] = element["signature"].replace("transform:", "scene:")
@@ -656,7 +710,25 @@ def compare_scene(cycle: Cycle, entry: dict) -> Optional[dict]:
         row = {"name": item["name"], "path": item["path"], "source": Path(item["instanceSourcePath"]).stem}
         alias = aliases.get(link["instanceFileId"])
         container = containers.get(alias) if alias else None
-        if container is None:
+        # A model file placed in the scene is no prefab: the converter makes
+        # its objects entities of the level itself, under the ids Unity
+        # gives them there.
+        model_object = instance_object_id(link["instanceFileId"], link["fileId"]) if alias is None else ""
+        model_entity = own.get(own_aliases.get(model_object, ""))
+        if model_entity is not None:
+            expected = cmp.unity_matrix_to_o3de(matrix_from_rows(item["matrix"]))
+            measured = own_transform(entity_matrix(model_entity), own_traces.get(model_object))
+            element = transform_element(cycle, expected, measured, {"rule": "scene model"})
+            row.update({key: element[key] for key in ("status", "delta") if key in element})
+            if element["status"] == "fail":
+                row["signature"] = element["signature"].replace("transform:", "scene:")
+                row["residual"] = element["residual"]
+        elif container is None and not item["instanceSourcePath"]:
+            # Unity shows a placeholder here: the project has lost the prefab,
+            # and there is nothing a level could hold for it.
+            row.update({"status": "unmeasured",
+                        "residual": "the Unity project has lost the prefab this placement names"})
+        elif container is None:
             row.update({"status": "unmatched", "signature": "scene: instance not in the level",
                         "residual": "the converter placed no instance for it" if alias is None
                                     else "its instance is not in the level"})
@@ -665,7 +737,10 @@ def compare_scene(cycle: Cycle, entry: dict) -> Optional[dict]:
             # Measured at the placed prefab's own root, which carries a
             # non-uniform scale of the placement (see instance_roots).
             placed = roots.get(alias, container)
-            element = transform_element(cycle, expected, entity_matrix(placed), {"rule": "scene instance"})
+            measured = entity_matrix(placed)
+            if placed is not container:
+                measured = own_transform(measured, prefab_root_trace(cycle, item.get("instanceSourceGuid", "")))
+            element = transform_element(cycle, expected, measured, {"rule": "scene instance"})
             row.update({key: element[key] for key in ("status", "delta") if key in element})
             if element["status"] == "fail":
                 row["signature"] = element["signature"].replace("transform:", "scene:")
@@ -680,6 +755,49 @@ def compare_scene(cycle: Cycle, entry: dict) -> Optional[dict]:
     return {"name": name, "level_probe": record.done,
             "counts": {status: statuses.count(status) for status in STATUS_ORDER if status in statuses},
             "instances": rows}
+
+
+# The quarter turn about X the converter gives an entity that carries its
+# spot light itself (platforms.unity.components.light.SPOT_TURN_MATRIX).
+LIGHT_TURN = np.array([[1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, -1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]])
+
+
+def own_transform(matrix: np.ndarray, traced: Optional[dict]) -> np.ndarray:
+    """An entity's matrix as the object's own transform: without what the
+    converter put on the entity for its mesh or its light."""
+    return without_light_turn(without_mesh_stretch(matrix, traced), traced)
+
+
+def without_light_turn(matrix: np.ndarray, traced: Optional[dict]) -> np.ndarray:
+    """An entity's matrix with the turn for its spot light taken out.
+
+    An O3DE spot shines along its entity's +Z, the converted Unity object
+    points along +Y. An object that holds only the light has its own entity
+    turned between the two (the trace's ``light_turn``); the transform row
+    is about the object's transform, which is the one before the turn."""
+    if not (traced or {}).get("light_turn"):
+        return matrix
+    return matrix @ LIGHT_TURN.T
+
+
+def without_mesh_stretch(matrix: np.ndarray, traced: Optional[dict]) -> np.ndarray:
+    """An entity's matrix with its mesh's own stretch taken out of the scale.
+
+    A model whose size differs by axis in a way the import rule cannot hold
+    gets the rest as part of its entity's non-uniform scale (the trace's
+    ``mesh_stretch``). That part belongs to the mesh, and the mesh row
+    measures it; the transform row is about the object's own transform."""
+    stretch = (traced or {}).get("mesh_stretch")
+    if not stretch:
+        return matrix
+    return matrix @ np.diag([1.0 / factor for factor in stretch] + [1.0])
+
+
+def prefab_root_trace(cycle: Cycle, prefab_guid: str) -> Optional[dict]:
+    """The trace record of a converted prefab's root entity."""
+    traced = cycle.trace.prefab(prefab_guid) if prefab_guid else None
+    return next((entity for entity in (traced or {}).get("entities", [])
+                 if entity.get("parent_entity_id") == "ContainerEntity"), None)
 
 
 def instance_roots(record, containers: Dict[str, dict]) -> Dict[str, dict]:
@@ -965,9 +1083,10 @@ def run_compare(bed, arguments) -> int:
         cycle.drawables = []
         prefab = compare_prefab(cycle, entry)
         summary = ", ".join(f"{count} {status}" for status, count in prefab.get("counts", {}).items())
-        views.write_sheet(sheets / f"{prefab['name']}.png", prefab["name"], prefab["status"],
+        sheet = f"sheets/{file_name_of(prefab['name'])}.png"
+        views.write_sheet(bed.report_dir / sheet, prefab["name"], prefab["status"],
                           summary or "; ".join(prefab["notes"]), cycle.drawables)
-        prefab["sheet"] = f"sheets/{prefab['name']}.png"
+        prefab["sheet"] = sheet
         prefabs.append(prefab)
     cycle.drawables = None
     prefabs.sort(key=lambda prefab: (STATUS_ORDER.index(prefab["status"]), prefab["name"]))
