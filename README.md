@@ -229,7 +229,7 @@ orchestration core and the source-engine-specific parsers. See
 | Prefab override — added/removed components | Logged to coverage, not emitted | Pending |
 | Lights — Directional / Point / Spot / Area | EditorDirectionalLightComponent / EditorAreaLightComponent (simple point, simple spot), Unity's range as an explicit radius | Working |
 | Spot light direction | The light's own entity turned when it holds only the light, else a child entity (option) | Working |
-| Scene → `<output>/<SceneName>/<SceneName>.prefab` | O3DE nested level convention | Working |
+| Scene → `<output>/<SceneName>/<SceneName>.prefab` | O3DE nested level convention; the name holds only letters, digits, `_` and `-` (the Editor's Open Level dialog takes no other character, so a space becomes `_`) | Working |
 | Output layout | One folder per kind of asset, or the source's own folder structure (option) | Working |
 | Unowned scene entities (physics + lights) | Same component pipeline as prefab processing | Working |
 | Scene objects and placements added below an object of a placed prefab | The level's own, parented by path into the instance | Working |

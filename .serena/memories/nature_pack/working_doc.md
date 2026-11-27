@@ -13,6 +13,15 @@ IDs: P plan, D decision, Q open question, I stage (increments I.na), T proof, F 
 
 ## Log (newest first)
 
+## 2026-11-26 - the person back: the NatureManufacture levels did not open (F.10)
+
+The person reported that the pack's scenes could not be loaded "due to unexpected characters".
+
+- F.10 Symptom: the Editor's Open Level dialog refused all four levels of the pack. Cause: their paths held spaces (`Advanced Rock Pack/Demo and Maps/Overview Map`); the dialog's name field takes letters, digits, `_`, `-`, `.` and `/` only, and is checked on Open (plan D.6, corrected). Fix: `stage_runner.level_name_part`, `level_name_for` and `level_names_for`; the level's file named after its folder; `parity.Bed.level_name` and the probe step follow. Ran: 13 unit tests (`test_output_layout`, three new), suite 66 of 66.
+- The four scenes were converted again (scene stage alone, from the last run's bookkeeping) while the person's Editor and Asset Processor were open; the Asset Processor cooked the four renamed levels and dropped the old products. The old level folders, which held nothing but the superseded files, were removed.
+- Not run: a harness cycle of the bed (it refuses while the Editor is open). The bed's bookkeeping and its last report still name the levels as they were; the next cycle converts and measures under the new names.
+- Why the harness missed it: it opens a level by script, which the dialog's rule does not bind. Worth a check of its own in the harness: every level path against the dialog's pattern.
+
 ## 2026-11-26 - the unattended run: I.4g to I.4k, I.5, I.6, I.7 ran
 
 The person was away. Three more chains of all five beds ran after the baseline entry below; nothing was committed anywhere.

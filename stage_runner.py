@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -192,20 +193,65 @@ def converted_prefab_dirs(project) -> list:
     return [str(Path(output) if settings.get(MIRROR_OPTION) else Path(output) / "Prefabs")]
 
 
+# =============================================================================
+# LEVEL NAMES
+# =============================================================================
+
+# What a level's path may be made of. The Editor's Open Level dialog takes
+# no other character: its name field carries a validator, and the dialog
+# checks it on Open as on Save ("The level name ... contains illegal
+# characters"; ``CLevelFileDialog::OnOK``). A space is refused. A level
+# opened by script is not held to this, so a harness that opens levels that
+# way does not see it.
+_NOT_FOR_A_LEVEL_NAME = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def level_name_part(name: str) -> str:
+    """One folder or file name of a level's path, with every character the
+    Editor's Open Level dialog refuses turned into an underscore:
+    ``Demo and Maps`` is ``Demo_and_Maps``."""
+    return _NOT_FOR_A_LEVEL_NAME.sub("_", name) or "_"
+
+
 def level_name_for(scene_path: Path, asset_stage: Optional[dict]) -> str:
     """The name a scene's level is known by: its folder below the levels
     output, and what the Editor opens it by.
 
-    It is the scene file's name. With mirrored folders the scene's folders
-    below the source root come first (``Pack/Demo Scenes/Overview``), so two
-    scenes of one name become two levels."""
+    It is the scene file's name, made a name the Editor opens
+    (``level_name_part``). With mirrored folders the scene's folders below
+    the source root come first (``Pack/Demo_Scenes/Overview``), so two
+    scenes of one name become two levels. The level's file is named after
+    the last part.
+
+    This is the rule for one scene on its own; ``level_names_for`` gives the
+    names of a run's scenes, told apart where the rule makes two the same."""
     from integrated_asset_processor import MIRROR_OPTION, mirrored_folder
 
     stem = Path(scene_path).stem
     options = (asset_stage or {}).get("options") or {}
     if not options.get(MIRROR_OPTION):
-        return stem
-    return (mirrored_folder(Path(asset_stage["source_path"]), Path(scene_path)) / stem).as_posix()
+        return level_name_part(stem)
+    folders = mirrored_folder(Path(asset_stage["source_path"]), Path(scene_path)).parts
+    return "/".join(level_name_part(part) for part in list(folders) + [stem])
+
+
+def level_names_for(scene_paths: List[Path], asset_stage: Optional[dict]) -> Dict[Path, str]:
+    """``{scene: its level's name}`` for the scenes of one run.
+
+    Two scenes whose names differ only in characters a level's name cannot
+    hold (``Overview Map`` and ``Overview_Map``) would be one level: the
+    later one, in the order of their paths, gets a number (``Overview_Map_2``)."""
+    names: Dict[Path, str] = {}
+    taken = set()
+    for scene_path in sorted(Path(scene) for scene in scene_paths):
+        name = level_name_for(scene_path, asset_stage)
+        number = 2
+        while name.lower() in taken:
+            name = f"{level_name_for(scene_path, asset_stage)}_{number}"
+            number += 1
+        taken.add(name.lower())
+        names[scene_path] = name
+    return names
 
 
 def asset_stage_arguments(project, convert_smoothness_to_roughness: bool) -> Optional[dict]:
@@ -320,12 +366,14 @@ def run_scene_converter(scenes: list, output_dir: str, prefab_dirs: list,
     # is global to the run rather than per-scene; this is one source).
     last_coverage: dict = {}
 
+    level_names = level_names_for(scenes, asset_stage)
+
     for i, scene_path in enumerate(scenes, 1):
-        scene_stem    = scene_path.stem
-        level_name    = level_name_for(scene_path, asset_stage)
+        level_name    = level_names[Path(scene_path)]
         scene_out_dir = Path(output_dir) / level_name
         scene_out_dir.mkdir(parents=True, exist_ok=True)
-        level_prefab  = scene_out_dir / f"{scene_stem}.prefab"
+        # A level's file is named after its folder: the Editor looks for it so.
+        level_prefab  = scene_out_dir / f"{Path(level_name).name}.prefab"
 
         log(f"\n[{i}/{len(scenes)}] {scene_path.name}  →  {level_name}/")
         try:

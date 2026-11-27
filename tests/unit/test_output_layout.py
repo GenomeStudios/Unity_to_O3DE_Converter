@@ -18,6 +18,7 @@ flat they land on one another. With the stage option
 
 import json
 import random
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -27,7 +28,7 @@ from tests.harness import run_module_tests
 from integrated_asset_processor import (
     IntegratedAssetProcessor, MIRROR_OPTION, OUTSIDE_SOURCE_FOLDER, mirrored_folder,
 )
-from stage_runner import level_name_for, run_scene_converter
+from stage_runner import level_name_for, level_name_part, level_names_for, run_scene_converter
 
 HEADER = "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n"
 META = "fileFormatVersion: 2\nguid: {guid}\n"
@@ -251,10 +252,53 @@ def _asset_stage(source: Path, output: Path, mirror: bool) -> dict:
 
 def test_a_level_keeps_its_scenes_folders_when_the_output_mirrors_the_source():
     source = Path("U:/Game/Assets/Vendor")
-    scene = source / "Forest" / "Demo Scenes" / "Overview Scene.unity"
-    assert level_name_for(scene, _asset_stage(source, Path("O:/out"), mirror=True)) == "Forest/Demo Scenes/Overview Scene"
-    assert level_name_for(scene, _asset_stage(source, Path("O:/out"), mirror=False)) == "Overview Scene"
-    assert level_name_for(scene, None) == "Overview Scene"
+    scene = source / "Forest" / "Demo" / "Overview.unity"
+    assert level_name_for(scene, _asset_stage(source, Path("O:/out"), mirror=True)) == "Forest/Demo/Overview"
+    assert level_name_for(scene, _asset_stage(source, Path("O:/out"), mirror=False)) == "Overview"
+    assert level_name_for(scene, None) == "Overview"
+
+
+def test_a_levels_name_holds_only_what_the_editors_open_level_dialog_takes():
+    """The dialog's name field takes letters, digits, ``_`` and ``-``, and
+    refuses a level whose path holds anything else: a space, as in every
+    scene of the NatureManufacture pack ("contains illegal characters")."""
+    assert level_name_part("Demo and Maps") == "Demo_and_Maps"
+    assert level_name_part("Overview-Map_2") == "Overview-Map_2"
+    assert level_name_part("Caf\u00e9 (night) v1.2") == "Caf___night__v1_2"
+    assert level_name_part("") == "_"
+
+    source = Path("U:/Game/Assets/Vendor")
+    scene = source / "Advanced Rock Pack" / "Demo and Maps" / "Overview Map.unity"
+    mirrored = level_name_for(scene, _asset_stage(source, Path("O:/out"), mirror=True))
+    assert mirrored == "Advanced_Rock_Pack/Demo_and_Maps/Overview_Map"
+    assert level_name_for(scene, _asset_stage(source, Path("O:/out"), mirror=False)) == "Overview_Map"
+    assert re.fullmatch(r"[a-zA-Z0-9_\-./]*", mirrored), "the dialog's own pattern"
+
+
+def test_two_scenes_that_would_get_one_level_name_are_told_apart():
+    scenes = [Path("U:/Game/Assets/Vendor/Demo/Overview_Map.unity"), Path("U:/Game/Assets/Vendor/Demo/Overview Map.unity"),
+              Path("U:/Game/Assets/Vendor/Demo/Cave.unity")]
+    names = level_names_for(scenes, None)
+    assert names[scenes[2]] == "Cave"
+    assert sorted(names[scene] for scene in scenes[:2]) == ["Overview_Map", "Overview_Map_2"]
+    assert level_names_for(list(reversed(scenes)), None) == names, "whatever order the scenes are given in"
+
+
+def test_a_levels_file_is_named_after_its_folder():
+    """The Editor opens ``Levels/<path>/<name>/<name>.prefab``."""
+    with tempfile.TemporaryDirectory() as folder:
+        tmp = Path(folder)
+        worker, source, output = _project(tmp, mirror=True)
+        scene = source / "Forest" / "Demo Scenes" / "Overview Scene.unity"
+        scene.parent.mkdir(parents=True, exist_ok=True)
+        scene.write_text(HEADER + _placed("9000", PACKS["Forest"]["prefab"]), encoding="utf-8")
+
+        levels = tmp / "o3de" / "Levels"
+        run = run_scene_converter([scene], str(levels), [str(output)], worker.to_outputs(), lambda line: None,
+                                  asset_stage=_asset_stage(source, output, mirror=True))
+        assert run.errors == 0 and list(run.outputs["scenes"]) == ["Forest/Demo_Scenes/Overview_Scene.unity"]
+        assert (levels / "Forest" / "Demo_Scenes" / "Overview_Scene" / "Overview_Scene.prefab").is_file()
+        assert not any(" " in path.name for path in levels.rglob("*")), "no space anywhere below Levels"
 
 
 def test_two_scenes_of_one_name_place_their_own_packs_prefab():

@@ -30,7 +30,9 @@ A bed's Unity project is the one its scope lies in; each is opened with the Edit
 
 A bed whose conversion project sets `mirror_source_folders` keeps the source's folders in its output: file names
 repeat there, so the report calls a prefab by its path below the scope, and a scene's level lies below the scene's
-folders (`Levels/<folders>/<scene>/<scene>.prefab`). The harness joins everything by guid and place, in both
+folders (`Levels/<folders>/<scene>/<scene>.prefab`, every character but letters, digits, `_` and `-` turned into
+an underscore: the Editor's Open Level dialog takes no other, a space included). The harness opens a level by
+script, which that dialog's rule does not bind. The harness joins everything by guid and place, in both
 layouts: the baked level names each converted prefab by the `Source` string the converter itself uses, read from
 the bookkeeping the convert step leaves in the run folder.
 

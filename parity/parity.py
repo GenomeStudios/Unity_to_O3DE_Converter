@@ -119,8 +119,11 @@ class Bed:
         return sources
 
     def level_name(self, scene_file: Path) -> str:
-        """The name of the level a marked scene is converted into."""
-        return stage_runner.level_name_for(Path(scene_file), self.asset_stage)
+        """The name of the level a marked scene is converted into: the name
+        the scene stage gives it among the bed's scenes
+        (``stage_runner.level_names_for``)."""
+        names = stage_runner.level_names_for(converter_cli.marked_scenes(self.project), self.asset_stage)
+        return names.get(Path(scene_file)) or stage_runner.level_name_for(Path(scene_file), self.asset_stage)
 
     def level_path(self, scene_file: Path) -> str:
         """A converted level as the Editor opens it: its path below the
@@ -265,7 +268,7 @@ def step_probe(bed: Bed, arguments) -> int:
     # The levels the scene converter made, for the placement of their instances.
     for scene in converter_cli.marked_scenes(bed.project):
         level = bed.level_path(scene)
-        if not (bed.o3de_root / "Levels" / level / f"{scene.stem}.prefab").is_file():
+        if not (bed.o3de_root / "Levels" / level / f"{Path(level).name}.prefab").is_file():
             continue
         scene_dir = run_dir / f"scene_{file_name_of(level)}"
         # Of a converted level only its lighting is read back, not every component.
